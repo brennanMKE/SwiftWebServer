@@ -1,0 +1,7 @@
+lsof -i :8080
+
+curl http://localhost:8080/
+curl http://localhost:8080/index.html
+
+kill -9 <pid>
+kill -2 <pid>
