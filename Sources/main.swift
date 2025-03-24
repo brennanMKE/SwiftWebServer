@@ -2,15 +2,16 @@ import Foundation
 import Network
 import os.log
 
+// subsystem:HTTPServer
 let logger = Logger(subsystem: "HTTPServer", category: "HTTPServer")
 
-let server: HTTPServer
-
 do {
-    server = try HTTPServer(port: 8080, publicDirectory: "Public")
+    let server = try HTTPServer(publicDirectory: "Public")
+    HTTPServer.installSignalHandlers(server: server)
     Task {
         try await server.run()
-        logger.info("Shutting down HTTP server")
+        logger.log("Shutting down HTTP server")
+        try await Task.sleep(for: .milliseconds(250))
         exit(EXIT_SUCCESS)
     }
 } catch {
@@ -18,16 +19,5 @@ do {
     exit(EXIT_FAILURE)
 }
 
-signal(SIGINT) { _ in
-    logger.info("interrupt")
-    server.interrupt()
-}
-
-signal(SIGTERM) { _ in
-    logger.info("terminate")
-    server.terminate()
-}
-
 // Keep the process alive
 dispatchMain()
-

@@ -5,3 +5,14 @@ curl http://localhost:8080/index.html
 
 kill -9 <pid>
 kill -2 <pid>
+
+swift build -c release
+swift run
+swift run -c release
+swift run -c debug
+swift build --product YourApp
+
+find . -name "*.swift" -print0 | xargs -0 cat | wc -l
+
+curl -I http://localhost:8080/index.html \
+  -H "If-Modified-Since: Wed, 20 Mar 2024 17:00:00 GMT"
