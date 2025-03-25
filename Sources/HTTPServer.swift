@@ -28,9 +28,9 @@ final class HTTPServer: Sendable {
     }
 
     private static func loadConfig(at rootURL: URL) throws -> HTTPConfig {
-        let configURL = rootURL.appendingPathComponent("http.config")
+        let configURL = rootURL.appendingPathComponent("http-config.json")
         guard FileManager.default.fileExists(atPath: configURL.path()) else {
-            logger.error("http.config not found at \(configURL.absoluteString)")
+            logger.error("http-config.json not found at \(configURL.absoluteString)")
             throw HTTPServerError.configNotFound
         }
         let data = try Data(contentsOf: configURL)

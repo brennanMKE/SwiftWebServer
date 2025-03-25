@@ -1,4 +1,4 @@
-// Reads in http.config
+// Reads in http-config.json
 
 import Foundation
 
