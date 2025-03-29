@@ -3,6 +3,12 @@ lsof -i :8080
 curl http://localhost:8080/
 curl http://localhost:8080/index.html
 
+# Test HEAD requests
+curl -I http://localhost:8080/
+curl -I http://localhost:8080/index.html
+curl -I http://localhost:8080/swift.png
+curl -I http://localhost:8080/Tab1/index.html
+
 kill -9 <pid>
 kill -2 <pid>
 

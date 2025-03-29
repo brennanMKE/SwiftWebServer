@@ -7,6 +7,14 @@ struct HTTPRequest {
     let query: String?           // raw query string, if any
     let headers: [String: String]
 
+    var includeBody: Bool {
+        method == "GET"
+    }
+
+    var isSupportedMethod: Bool {
+        method == "GET" || method == "HEAD"
+    }
+
     func header(named name: String) -> String? {
         headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
     }

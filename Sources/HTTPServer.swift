@@ -104,7 +104,7 @@ final class HTTPServer: Sendable {
     }
 
     private func respond(to request: HTTPRequest) async -> Data {
-        guard request.method == "GET" else {
+        guard request.isSupportedMethod else {
             return HTTPResponse(status: .methodNotAllowed).data
         }
 
@@ -144,8 +144,9 @@ final class HTTPServer: Sendable {
            let sinceDate = formatter.date(from: ifModifiedSince),
            modDate <= sinceDate {
             return HTTPResponse(
-                status: .notFound, // <-- should be .notModified, but not defined yet
-                extraHeaders: ["Last-Modified": lastModified]
+                status: .notModified,
+                extraHeaders: ["Last-Modified": lastModified],
+                includeBody: request.includeBody
             ).data
         }
 
@@ -163,7 +164,8 @@ final class HTTPServer: Sendable {
             status: .ok,
             body: data,
             contentType: mimeType(for: fileURL),
-            extraHeaders: extraHeaders
+            extraHeaders: extraHeaders,
+            includeBody: request.includeBody
         ).data
     }
 

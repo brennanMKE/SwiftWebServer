@@ -9,7 +9,7 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .executable(
-            name: "webserver", // ← this sets the binary name
+            name: "webserver",
             targets: ["SwiftWebServer"]
         ),
     ],

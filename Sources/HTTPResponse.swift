@@ -27,13 +27,16 @@ struct HTTPResponse {
     let body: Data
     let contentType: String
     let extraHeaders: [String: String]
+    let includeBody: Bool
 
     init(status: Status,
          body: Data = Data(),
          contentType: String = "text/plain",
-         extraHeaders: [String: String] = [:]) {
+         extraHeaders: [String: String] = [:],
+         includeBody: Bool = true) {
         self.status = status
         self.extraHeaders = extraHeaders
+        self.includeBody = includeBody
 
         if status == .ok {
             self.body = body
@@ -56,7 +59,9 @@ struct HTTPResponse {
         response += "Connection: close\r\n\r\n"
 
         var responseData = Data(response.utf8)
-        responseData.append(body)
+        if includeBody {
+            responseData.append(body)
+        }
         return responseData
     }
 }
