@@ -9,6 +9,19 @@ curl -I http://localhost:8080/index.html
 curl -I http://localhost:8080/swift.png
 curl -I http://localhost:8080/Tab1/index.html
 
+# Test ETag support
+# First request to get the ETag
+curl -I http://localhost:8080/index.html
+
+# Second request using the ETag from the first response
+curl -I http://localhost:8080/index.html \
+  -H "If-None-Match: W/\"-1723683917197248970\""
+
+# Test both Last-Modified and ETag
+curl -I http://localhost:8080/index.html \
+  -H "If-Modified-Since: Mon, 24 Mar 2025 07:21:01 GMT" \
+  -H "If-None-Match: W/\"-1723683917197248970\""
+
 kill -9 <pid>
 kill -2 <pid>
 

@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import CryptoKit
 
 enum HTTPServerError: Error {
     case configNotFound
@@ -138,6 +139,25 @@ final class HTTPServer: Sendable {
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "E, dd MMM yyyy HH:mm:ss z"
         let lastModified = formatter.string(from: modDate)
+        let etag = generateETag(for: data, modDate: modDate)
+
+        // Handle If-None-Match header
+        if let ifNoneMatch = request.header(named: "If-None-Match") {
+            // Remove quotes and W/ prefix if present
+            let cleanIfNoneMatch = ifNoneMatch.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            let cleanETag = etag.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            
+            if cleanIfNoneMatch == cleanETag {
+                return HTTPResponse(
+                    status: .notModified,
+                    extraHeaders: [
+                        "Last-Modified": lastModified,
+                        "ETag": etag
+                    ],
+                    includeBody: request.includeBody
+                ).data
+            }
+        }
 
         // Handle If-Modified-Since header
         if let ifModifiedSince = request.header(named: "If-Modified-Since"),
@@ -145,7 +165,10 @@ final class HTTPServer: Sendable {
            modDate <= sinceDate {
             return HTTPResponse(
                 status: .notModified,
-                extraHeaders: ["Last-Modified": lastModified],
+                extraHeaders: [
+                    "Last-Modified": lastModified,
+                    "ETag": etag
+                ],
                 includeBody: request.includeBody
             ).data
         }
@@ -154,10 +177,14 @@ final class HTTPServer: Sendable {
         if config.caching.enabled {
             extraHeaders = [
                 "Last-Modified": lastModified,
+                "ETag": etag,
                 "Cache-Control": "public, max-age=\(config.caching.maxAge)"
             ]
         } else {
-            extraHeaders = ["Last-Modified": lastModified]
+            extraHeaders = [
+                "Last-Modified": lastModified,
+                "ETag": etag
+            ]
         }
 
         return HTTPResponse(
@@ -177,6 +204,27 @@ final class HTTPServer: Sendable {
             }
         }
         return config.defaultMimeType
+    }
+
+    private func generateETag(for data: Data, modDate: Date) -> String {
+        // Create a hash of the file content and modification date
+        var hasher = SHA256()
+        
+        // Add file content to hash
+        hasher.update(data: data)
+        
+        // Add modification date to hash
+        let dateData = withUnsafeBytes(of: modDate.timeIntervalSince1970) { Data($0) }
+        hasher.update(data: dateData)
+        
+        // Get the final hash
+        let hash = hasher.finalize()
+        
+        // Convert to hex string
+        let hexString = hash.map { String(format: "%02x", $0) }.joined()
+        
+        // Return a weak ETag (W/) to indicate it's not byte-for-byte identical
+        return "W/\"\(hexString)\""
     }
 
     static func installSignalHandlers(server: HTTPServer) {

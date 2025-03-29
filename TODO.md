@@ -1,7 +1,7 @@
 # To Do List
 
 * ✅ HEAD requests
-* ETag support
+* ✅ ETag support
 * Web Sockets
 * Virtual Hosting
 * Authentication
