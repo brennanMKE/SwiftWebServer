@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import os.log
+import SwiftWebServerCore
 
 // subsystem:HTTPServer
 let logger = Logger(subsystem: "HTTPServer", category: "HTTPServer")
@@ -21,7 +22,7 @@ do {
     let server = try HTTPServer(publicDirectory: publicDirectory)
     HTTPServer.installSignalHandlers(server: server)
     Task {
-        try await server.run()
+        try await server.start()
         logger.log("Shutting down HTTP server")
         try await Task.sleep(for: .milliseconds(250))
         exit(EXIT_SUCCESS)

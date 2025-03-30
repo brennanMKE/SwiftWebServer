@@ -8,15 +8,23 @@ let package = Package(
     name: "SwiftWebServer",
     platforms: [.macOS(.v15)],
     products: [
+        .library(
+            name: "SwiftWebServerCore",
+            targets: ["SwiftWebServerCore"]),
         .executable(
-            name: "webserver",
-            targets: ["SwiftWebServer"]
-        ),
+            name: "SwiftWebServer",
+            targets: ["SwiftWebServer"])
     ],
+    dependencies: [],
     targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
+        .target(
+            name: "SwiftWebServerCore",
+            dependencies: []),
         .executableTarget(
-            name: "SwiftWebServer"),
+            name: "SwiftWebServer",
+            dependencies: ["SwiftWebServerCore"]),
+        .testTarget(
+            name: "SwiftWebServerFunctionalTests",
+            dependencies: ["SwiftWebServerCore"])
     ]
 )

@@ -1,12 +1,14 @@
 import Foundation
 import Network
 import CryptoKit
+import Dispatch
+import os.log
 
 enum HTTPServerError: Error {
     case configNotFound
 }
 
-final class HTTPServer: Sendable {
+public final class HTTPServer: Sendable {
     let port: NWEndpoint.Port
     let publicDirectory: URL
     private let config: HTTPConfig
@@ -14,9 +16,9 @@ final class HTTPServer: Sendable {
 
     let exitHandler = ExitHandler()
 
-    init(publicDirectory: String) throws {
-        let rootPath = ProcessInfo.processInfo.environment["ROOT_PATH"] ?? FileManager.default.currentDirectoryPath
-        let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).appending(path: publicDirectory)
+    public init(publicDirectory: String) throws {
+        let currentDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let rootURL = URL(fileURLWithPath: publicDirectory, relativeTo: currentDir).standardizedFileURL
         let config = try HTTPServer.loadConfig(at: rootURL)
         self.config = config
 
@@ -28,17 +30,37 @@ final class HTTPServer: Sendable {
         logger.log("Listening on port http://localhost:\(config.port)/")
     }
 
+    public func start() async throws {
+        logger.log("Listening on port \(self.port.rawValue)")
+
+        listener.newConnectionHandler = { connection in
+            connection.start(queue: .global())
+            self.handle(connection)
+        }
+
+        listener.start(queue: .global())
+        try await exitHandler.wait()
+        listener.cancel()
+    }
+
+    public func stop() async {
+        logger.log("Stopping server...")
+        listener.cancel()
+    }
+
+    // MARK: - Private -
+
     private static func loadConfig(at rootURL: URL) throws -> HTTPConfig {
         let configURL = rootURL.appendingPathComponent("http-config.json")
         guard FileManager.default.fileExists(atPath: configURL.path()) else {
-            logger.error("http-config.json not found at \(configURL.absoluteString)")
+            logger.error("http-config.json not found at \(configURL.path(), privacy: .public)")
             throw HTTPServerError.configNotFound
         }
         let data = try Data(contentsOf: configURL)
         return try JSONDecoder().decode(HTTPConfig.self, from: data)
     }
 
-    func monitorListener() {
+    private func monitorListener() {
         listener.stateUpdateHandler = { newState in
             switch newState {
             case .failed(let error):
@@ -52,19 +74,6 @@ final class HTTPServer: Sendable {
                 break
             }
         }
-    }
-
-    func run() async throws {
-        logger.log("Listening on port \(self.port.rawValue)")
-
-        listener.newConnectionHandler = { connection in
-            connection.start(queue: .global())
-            self.handle(connection)
-        }
-
-        listener.start(queue: .global())
-        try await exitHandler.wait()
-        listener.cancel()
     }
 
     private func handle(_ connection: NWConnection) {
@@ -96,6 +105,33 @@ final class HTTPServer: Sendable {
                 }
 
                 logger.log("OK - \(request.method) \(request.path)")
+                
+                // Check for WebSocket upgrade request
+                if request.isWebSocketUpgrade {
+                    if WebSocketUpgrade.validateUpgradeRequest(request) {
+                        let response = WebSocketUpgrade.createUpgradeResponse(request)
+                        connection.send(content: response.data, completion: .contentProcessed { error in
+                            if let error = error {
+                                logger.error("Failed to send WebSocket upgrade response: \(error)")
+                                connection.cancel()
+                                return
+                            }
+                            
+                            let webSocket = WebSocketConnection(connection: connection)
+                            Task {
+                                await webSocket.start()
+                            }
+                        })
+                    } else {
+                        let response = HTTPResponse(status: .badRequest)
+                        connection.send(content: response.data, completion: .contentProcessed { _ in
+                            connection.cancel()
+                        })
+                    }
+                    return
+                }
+                
+                // Handle regular HTTP request
                 let response = await self.respond(to: request)
                 connection.send(content: response, completion: .contentProcessed { _ in
                     connection.cancel()
@@ -150,11 +186,10 @@ final class HTTPServer: Sendable {
             if cleanIfNoneMatch == cleanETag {
                 return HTTPResponse(
                     status: .notModified,
-                    extraHeaders: [
+                    headers: [
                         "Last-Modified": lastModified,
                         "ETag": etag
-                    ],
-                    includeBody: request.includeBody
+                    ]
                 ).data
             }
         }
@@ -165,11 +200,9 @@ final class HTTPServer: Sendable {
            modDate <= sinceDate {
             return HTTPResponse(
                 status: .notModified,
-                extraHeaders: [
-                    "Last-Modified": lastModified,
-                    "ETag": etag
-                ],
-                includeBody: request.includeBody
+                headers: [
+                    "Last-Modified": lastModified
+                ]
             ).data
         }
 
@@ -189,10 +222,10 @@ final class HTTPServer: Sendable {
 
         return HTTPResponse(
             status: .ok,
-            body: data,
-            contentType: mimeType(for: fileURL),
-            extraHeaders: extraHeaders,
-            includeBody: request.includeBody
+            headers: extraHeaders.merging([
+                "Content-Type": mimeType(for: fileURL)
+            ]) { current, _ in current },
+            body: data
         ).data
     }
 
@@ -227,39 +260,28 @@ final class HTTPServer: Sendable {
         return "W/\"\(hexString)\""
     }
 
-    static func installSignalHandlers(server: HTTPServer) {
+    public static func installSignalHandlers(server: HTTPServer) {
         let signals = [SIGINT, SIGTERM]
-
-        logger.log("Installing signal handlers: \(signals)")
-
+        
         for sig in signals {
-            signal(sig, SIG_IGN) // ignore default C handler
-
+            signal(sig, SIG_IGN) // Ignore default handler
+            
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler {
                 Task {
-                    switch sig {
-                    case SIGINT:
-                        logger.warning("Received SIGINT")
-                        await server.interrupt()
-                    case SIGTERM:
-                        logger.warning("Received SIGTERM")
-                        await server.terminate()
-                    default:
-                        logger.warning("Received \(sig)")
-                        break
-                    }
+                    await server.stop()
+                    exit(EXIT_SUCCESS)
                 }
             }
             source.resume()
         }
     }
 
-    func interrupt() async {
+    private func interrupt() async {
         await exitHandler.interrupt()
     }
 
-    func terminate() async {
+    private func terminate() async {
         await exitHandler.terminate()
     }
 }

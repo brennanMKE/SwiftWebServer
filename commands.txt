@@ -15,21 +15,27 @@ curl -I http://localhost:8080/index.html
 
 # Second request using the ETag from the first response
 curl -I http://localhost:8080/index.html \
-  -H "If-None-Match: W/\"-1723683917197248970\""
+  -H "If-None-Match: W/\"423e899f1d200983ffd599936f77473b9cb338f1b8b5c0990885243a1279ac32\""
 
 # Test both Last-Modified and ETag
 curl -I http://localhost:8080/index.html \
   -H "If-Modified-Since: Mon, 24 Mar 2025 07:21:01 GMT" \
-  -H "If-None-Match: W/\"-1723683917197248970\""
+  -H "If-None-Match: W/\"423e899f1d200983ffd599936f77473b9cb338f1b8b5c0990885243a1279ac32\""
 
 kill -9 <pid>
 kill -2 <pid>
 
 swift build -c release
 swift run
-swift run -c release
-swift run -c debug
+swift run -c release --target SwiftWebServer
+swift run -c debug --target SwiftWebServer
 swift build --product YourApp
+
+swift run -c release --product webserver
+
+swift build --target SwiftWebServer
+swift build --target SwiftWebServerCore
+swift build --target SwiftWebServerFunctionalTests
 
 find . -name "*.swift" -print0 | xargs -0 cat | wc -l
 

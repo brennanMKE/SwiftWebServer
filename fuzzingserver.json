@@ -1,0 +1,13 @@
+{
+    "url": "ws://127.0.0.1:9001/ws",
+    "outdir": "./reports/clients",
+    "cases": ["*"],
+    "exclude-cases": [
+        "9.*",
+        "12.*",
+        "13.*"
+    ],
+    "exclude-agent-cases": {},
+    "webport": 9000,
+    "websocket-port": 9001
+} 
