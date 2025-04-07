@@ -32,7 +32,7 @@ public struct HTTPRequest: Sendable {
     public func header(named name: String) -> String? {
         headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
     }
-    
+
     public static func parse(from data: Data) -> HTTPRequest? {
         guard let raw = String(data: data, encoding: .utf8) else { return nil }
 

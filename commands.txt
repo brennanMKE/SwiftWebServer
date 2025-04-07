@@ -1,4 +1,6 @@
 lsof -i :8080
+lsof -i :9000
+lsof -i :9001
 
 curl http://localhost:8080/
 curl http://localhost:8080/index.html
@@ -25,10 +27,11 @@ curl -I http://localhost:8080/index.html \
 kill -9 <pid>
 kill -2 <pid>
 
+swift build -c debug
 swift build -c release
 swift run
-swift run -c release --target SwiftWebServer
-swift run -c debug --target SwiftWebServer
+swift run -c release SwiftWebServer
+swift run -c debug SwiftWebServer
 swift build --product YourApp
 
 swift run -c release --product webserver
@@ -36,6 +39,8 @@ swift run -c release --product webserver
 swift build --target SwiftWebServer
 swift build --target SwiftWebServerCore
 swift build --target SwiftWebServerFunctionalTests
+
+swift run -c debug SwiftWebSocketsTestSuite
 
 find . -name "*.swift" -print0 | xargs -0 cat | wc -l
 

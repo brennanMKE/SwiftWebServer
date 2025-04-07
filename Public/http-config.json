@@ -1,23 +1,121 @@
 {
   "port": 8080,
+  "maxConnections": 100,
+  "maxRequestSize": 10485760,
+  "keepAliveTimeout": 5,
+  "enableCompression": false,
+  "enableETags": true,
   "defaultIndex": "index.html",
   "defaultMimeType": "application/octet-stream",
   "caching": {
     "enabled": true,
-    "maxAge": 300
+    "maxAge": 3600
   },
   "mimeTypes": [
-    { "pathExtensions": ["html", "htm"], "contentType": "text/html" },
-    { "pathExtensions": ["css"], "contentType": "text/css" },
-    { "pathExtensions": ["js"], "contentType": "application/javascript" },
-    { "pathExtensions": ["png"], "contentType": "image/png" },
-    { "pathExtensions": ["jpg", "jpeg"], "contentType": "image/jpeg" },
-    { "pathExtensions": ["gif"], "contentType": "image/gif" },
-    { "pathExtensions": ["json"], "contentType": "application/json" },
-    { "pathExtensions": ["txt"], "contentType": "text/plain" },
-    { "pathExtensions": ["ico"], "contentType": "image/x-icon" }
+    {
+      "contentType": "text/html",
+      "pathExtensions": ["html", "htm"]
+    },
+    {
+      "contentType": "text/css",
+      "pathExtensions": ["css"]
+    },
+    {
+      "contentType": "text/javascript",
+      "pathExtensions": ["js"]
+    },
+    {
+      "contentType": "image/jpeg",
+      "pathExtensions": ["jpg", "jpeg"]
+    },
+    {
+      "contentType": "image/png",
+      "pathExtensions": ["png"]
+    },
+    {
+      "contentType": "image/gif",
+      "pathExtensions": ["gif"]
+    },
+    {
+      "contentType": "image/svg+xml",
+      "pathExtensions": ["svg"]
+    },
+    {
+      "contentType": "image/webp",
+      "pathExtensions": ["webp"]
+    },
+    {
+      "contentType": "image/avif",
+      "pathExtensions": ["avif"]
+    },
+    {
+      "contentType": "image/heic",
+      "pathExtensions": ["heic"]
+    },
+    {
+      "contentType": "image/heif",
+      "pathExtensions": ["heif"]
+    },
+    {
+      "contentType": "image/x-icon",
+      "pathExtensions": ["ico"]
+    },
+    {
+      "contentType": "application/json",
+      "pathExtensions": ["json"]
+    },
+    {
+      "contentType": "text/plain",
+      "pathExtensions": ["txt"]
+    },
+    {
+      "contentType": "application/xml",
+      "pathExtensions": ["xml"]
+    },
+    {
+      "contentType": "application/pdf",
+      "pathExtensions": ["pdf"]
+    },
+    {
+      "contentType": "font/woff2",
+      "pathExtensions": ["woff2"]
+    },
+    {
+      "contentType": "font/woff",
+      "pathExtensions": ["woff"]
+    },
+    {
+      "contentType": "font/ttf",
+      "pathExtensions": ["ttf"]
+    },
+    {
+      "contentType": "font/otf",
+      "pathExtensions": ["otf"]
+    },
+    {
+      "contentType": "video/mp4",
+      "pathExtensions": ["mp4"]
+    },
+    {
+      "contentType": "video/webm",
+      "pathExtensions": ["webm"]
+    },
+    {
+      "contentType": "audio/mpeg",
+      "pathExtensions": ["mp3"]
+    },
+    {
+      "contentType": "audio/wav",
+      "pathExtensions": ["wav"]
+    },
+    {
+      "contentType": "audio/ogg",
+      "pathExtensions": ["ogg"]
+    }
   ],
   "blockList": [
-    "/http-config.json"
+    "http-config.json",
+    ".git",
+    ".DS_Store"
   ]
 }

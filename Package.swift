@@ -23,8 +23,8 @@ let package = Package(
         .executableTarget(
             name: "SwiftWebServer",
             dependencies: ["SwiftWebServerCore"]),
-        .testTarget(
-            name: "SwiftWebServerFunctionalTests",
+        .executableTarget(
+            name: "SwiftWebSocketsTestSuite",
             dependencies: ["SwiftWebServerCore"])
     ]
 )
