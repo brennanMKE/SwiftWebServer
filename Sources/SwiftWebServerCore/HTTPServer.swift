@@ -176,9 +176,8 @@ public final class HTTPServer: Sendable {
                 // Handle regular HTTP request
                 logger.debug("Processing regular HTTP request for path: \(request.path)")
                 let response = await self.respond(to: request)
-                let httpResponse = HTTPResponse(status: .ok, headers: [:], body: response)
-                logger.debug("Sending response for \(request.path) with status: \(httpResponse.statusText) and headers: \(httpResponse.headers)")
-                connection.send(content: httpResponse.data, completion: .contentProcessed { _ in
+                logger.debug("Sending response for \(request.path) with status: \(response.statusText) and headers: \(response.headers)")
+                connection.send(content: response.data, completion: .contentProcessed { _ in
                     logger.debug("Connection closed after response")
                     connection.cancel()
                 })
@@ -188,17 +187,17 @@ public final class HTTPServer: Sendable {
         }
     }
 
-    private func respond(to request: HTTPRequest) async -> Data {
+    private func respond(to request: HTTPRequest) async -> HTTPResponse {
         logger.debug("Responding to request: \(request.method) \(request.path)")
 
         guard request.isSupportedMethod else {
             logger.error("Unsupported method: \(request.method)")
-            return HTTPResponse(status: .methodNotAllowed).data
+            return HTTPResponse(status: .methodNotAllowed)
         }
 
         if config.blockList.contains(request.path) {
             logger.error("Blocked path: \(request.path)")
-            return HTTPResponse(status: .forbidden).data
+            return HTTPResponse(status: .forbidden)
         }
 
         let relativePath = request.path.removingPercentEncoding ?? request.path
@@ -208,7 +207,7 @@ public final class HTTPServer: Sendable {
 
         guard fileURL.path.hasPrefix(publicDirectory.path) else {
             logger.error("Path traversal attempt detected: \(fileURL.path)")
-            return HTTPResponse(status: .forbidden).data
+            return HTTPResponse(status: .forbidden)
         }
 
         var isDir: ObjCBool = false
@@ -224,7 +223,7 @@ public final class HTTPServer: Sendable {
               let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
               let modDate = attributes[.modificationDate] as? Date else {
             logger.error("File not found or unable to read: \(fileURL.path)")
-            return HTTPResponse(status: .notFound).data
+            return HTTPResponse(status: .notFound)
         }
 
         logger.debug("File found: \(fileURL.path), size: \(data.count) bytes, last modified: \(modDate)")
@@ -249,7 +248,7 @@ public final class HTTPServer: Sendable {
                         "Last-Modified": lastModified,
                         "ETag": etag
                     ]
-                ).data
+                )
             }
         }
 
@@ -262,7 +261,7 @@ public final class HTTPServer: Sendable {
                 headers: [
                     "Last-Modified": lastModified
                 ]
-            ).data
+            )
         }
 
         let extraHeaders: [String : String]
@@ -279,13 +278,15 @@ public final class HTTPServer: Sendable {
             ]
         }
 
+        logger.debug("Response headers for \(request.path): \(extraHeaders)")
+
         return HTTPResponse(
             status: .ok,
             headers: extraHeaders.merging([
                 "Content-Type": mimeType(for: fileURL)
             ]) { current, _ in current },
             body: data
-        ).data
+        )
     }
 
     private func mimeType(for url: URL) -> String {
