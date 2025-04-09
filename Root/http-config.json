@@ -1,4 +1,5 @@
 {
+  "path": "Public",
   "port": 8080,
   "maxConnections": 100,
   "maxRequestSize": 10485760,
