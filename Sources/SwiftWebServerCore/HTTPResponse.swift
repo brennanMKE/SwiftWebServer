@@ -1,31 +1,22 @@
 import Foundation
 
 public struct HTTPResponse: Sendable {
-    public let status: Status
+    public let status: HTTPStatus
     public let headers: [String: String]
     public let body: Data?
 
-    public init(status: Status, headers: [String: String] = [:], body: Data? = nil) {
+    public init(status: HTTPStatus, headers: [String: String] = [:], body: Data? = nil) {
         self.status = status
         self.headers = headers
-        self.body = body
-    }
-
-    public var statusText: String {
-        switch status {
-        case .ok: return "OK"
-        case .notFound: return "Not Found"
-        case .badRequest: return "Bad Request"
-        case .internalServerError: return "Internal Server Error"
-        case .switchingProtocols: return "Switching Protocols"
-        case .notModified: return "Not Modified"
-        case .forbidden: return "Forbidden"
-        case .methodNotAllowed: return "Method Not Allowed"
+        if status == .ok {
+            self.body = body
+        } else {
+            self.body = HTTPPage.default.page(for: status).data(using: .utf8)
         }
     }
 
     public var statusLine: String {
-        "HTTP/1.1 \(status.rawValue) \(statusText)"
+        "HTTP/1.1 \(status.rawValue) \(status.statusText)"
     }
 
     public var data: Data {
@@ -50,15 +41,4 @@ public struct HTTPResponse: Sendable {
 
         return responseData
     }
-}
-
-public enum Status: Int, Sendable {
-    case ok = 200
-    case notModified = 304
-    case badRequest = 400
-    case forbidden = 403
-    case notFound = 404
-    case methodNotAllowed = 405
-    case internalServerError = 500
-    case switchingProtocols = 101
 }

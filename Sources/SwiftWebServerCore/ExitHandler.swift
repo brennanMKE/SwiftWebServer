@@ -17,7 +17,11 @@ actor ExitHandler {
             continuation.resume()
         }
     }
-    
+
+    func cancel() {
+        terminate(error: CancellationError())
+    }
+
     func interrupt() {
         logger.log(#function)
         guard let continuation else { return }

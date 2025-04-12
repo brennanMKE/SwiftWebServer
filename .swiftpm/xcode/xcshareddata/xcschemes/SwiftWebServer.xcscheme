@@ -54,7 +54,7 @@
       <EnvironmentVariables>
          <EnvironmentVariable
             key = "ROOT_PATH"
-            value = "/Users/brennan/Developer/brennanMKE/SwiftWebServer"
+            value = "/Users/brennan/Developer/brennanMKE/SwiftWebServer/Root"
             isEnabled = "YES">
          </EnvironmentVariable>
       </EnvironmentVariables>

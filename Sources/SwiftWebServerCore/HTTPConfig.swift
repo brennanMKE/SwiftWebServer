@@ -23,6 +23,7 @@ public struct MimeType: Codable, Sendable {
 }
 
 public struct HTTPConfig: Codable, Sendable {
+    public let path: String
     public let port: UInt16
     public let maxConnections: Int
     public let keepAliveTimeout: TimeInterval
@@ -36,6 +37,7 @@ public struct HTTPConfig: Codable, Sendable {
     public let blockList: [String]
     
     public init(
+        path: String = "Public",
         port: UInt16 = 8080,
         maxConnections: Int = 100,
         keepAliveTimeout: TimeInterval = 5,
@@ -48,6 +50,7 @@ public struct HTTPConfig: Codable, Sendable {
         mimeTypes: [MimeType] = [],
         blockList: [String] = []
     ) {
+        self.path = path
         self.port = port
         self.maxConnections = maxConnections
         self.keepAliveTimeout = keepAliveTimeout
@@ -59,5 +62,11 @@ public struct HTTPConfig: Codable, Sendable {
         self.defaultMimeType = defaultMimeType
         self.mimeTypes = mimeTypes
         self.blockList = blockList
+    }
+
+    public init(configURL: URL) throws {
+        let data = try Data(contentsOf: configURL)
+        let config = try JSONDecoder().decode(HTTPConfig.self, from: data)
+        self = config
     }
 }

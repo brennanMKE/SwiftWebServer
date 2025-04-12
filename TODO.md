@@ -1,8 +1,11 @@
 # To Do List
 
+* ✅ GET requests
 * ✅ HEAD requests
 * ✅ ETag support
-* Web Sockets
+* Middleware
+* Web Sockets (implemented with middleware)
+* Extension support for XCP (ExtensionKit?)
 * Virtual Hosting
 * Authentication
   * JWTs with HMACs
