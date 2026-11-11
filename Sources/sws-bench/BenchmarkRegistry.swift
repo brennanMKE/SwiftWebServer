@@ -8,6 +8,7 @@
 func registerAllBenchmarks() {
     registerHarnessBenchmarks()
     registerFieldsBenchmarks()   // M1.2: FieldsBench.swift
+    registerParserBenchmarks()   // M1.3: ParserBench.swift
     registerSerializerBenchmarks()   // M1.4: SerializerBench.swift
     registerSelfTimedSuites()
 }
