@@ -21,11 +21,16 @@ public struct HTTP1Configuration: Sendable, Hashable {
     public var maxDrainSize: Int
     /// Chunk-size, extension and trailer limits for chunked request bodies.
     public var chunkedLimits: ChunkedDecoderLimits
+    /// Header, idle, body, send and linger limits (#0082).
+    public var timeouts: HTTP1Timeouts
+    /// The most input bytes a lingering close reads and discards before closing.
+    public var maxLingerSize: Int
 
     public static let defaultReceiveSize = 16 * 1024
     public static let defaultFlushThreshold = 64 * 1024
     public static let defaultMaxBodySize = 10 * 1024 * 1024
     public static let defaultMaxDrainSize = 64 * 1024
+    public static let defaultMaxLingerSize = 1024 * 1024
 
     public init(
         parserLimits: HTTP1ParserLimits = HTTP1ParserLimits(),
@@ -33,16 +38,21 @@ public struct HTTP1Configuration: Sendable, Hashable {
         flushThreshold: Int = HTTP1Configuration.defaultFlushThreshold,
         maxBodySize: Int = HTTP1Configuration.defaultMaxBodySize,
         maxDrainSize: Int = HTTP1Configuration.defaultMaxDrainSize,
-        chunkedLimits: ChunkedDecoderLimits = ChunkedDecoderLimits()
+        chunkedLimits: ChunkedDecoderLimits = ChunkedDecoderLimits(),
+        timeouts: HTTP1Timeouts = HTTP1Timeouts(),
+        maxLingerSize: Int = HTTP1Configuration.defaultMaxLingerSize
     ) {
         precondition(receiveSize > 0 && flushThreshold > 0, "HTTP1Configuration sizes must be positive")
-        precondition(maxBodySize >= 0 && maxDrainSize >= 0, "HTTP1Configuration body limits must not be negative")
+        precondition(maxBodySize >= 0 && maxDrainSize >= 0 && maxLingerSize >= 0,
+                     "HTTP1Configuration limits must not be negative")
         self.parserLimits = parserLimits
         self.receiveSize = receiveSize
         self.flushThreshold = flushThreshold
         self.maxBodySize = maxBodySize
         self.maxDrainSize = maxDrainSize
         self.chunkedLimits = chunkedLimits
+        self.timeouts = timeouts
+        self.maxLingerSize = maxLingerSize
     }
 }
 
@@ -92,12 +102,31 @@ public struct HTTP1Configuration: Sendable, Hashable {
 /// - HEAD, `204` and `304` responses never carry body bytes, whatever the body kind; the
 ///   serializer keeps their headers (#0016, #0018) and the writer or file is not run.
 ///
+/// ## Timeouts and draining (#0082)
+///
+/// `run` supervises the loop with two more child tasks of one task group per connection (never
+/// a task per request): a timer, and a waiter on the shutdown signal. They share one atomic
+/// word with the loop (``HTTP1Watchdog``) that says which phase it is in and until when; see
+/// ``HTTP1Timeouts`` for the limits.
+///
+/// - An incomplete head or a stalled body past its limit gets `408 Request Timeout` and
+///   `connection: close`, sent by the supervisor while the loop still waits in `receive`
+///   (cancelling a TCP receive cancels the whole connection), then a lingering close.
+/// - The idle limit closes silently; a send past its limit resets the connection.
+/// - When the server drains, a connection between requests (idle, or part of a head) closes
+///   at once. An exchange in flight finishes and its response says `connection: close`;
+///   pipelined requests not yet started get no response.
+/// - Lingering close: when the connection closes with request bytes possibly unread (an error
+///   response, an unread body, dropped pipelined requests, a `408`), the output is half-closed
+///   and input is discarded for at most ``HTTP1Timeouts/linger`` (and
+///   ``HTTP1Configuration/maxLingerSize`` bytes), so the client reads the response rather
+///   than a reset.
+///
 /// ## Hooks
 ///
 /// - `.tunnel` responses (#0108): the head (`101` from the handler) is flushed, then the byte
-///   stream is handed to the closure, replaying any bytes buffered after the request.
-/// - Draining (#0082): a connection checks the shutdown signal once per batch and then answers
-///   with `connection: close`; a connection idle in `receive` is cancelled at the drain deadline.
+///   stream is handed to the closure, replaying any bytes buffered after the request. No
+///   HTTP/1.1 limit applies to a tunnel.
 public struct HTTP1: ConnectionProtocol {
     public var configuration: HTTP1Configuration
 
@@ -126,10 +155,140 @@ public struct HTTP1: ConnectionProtocol {
     }
 
     public func run<T: ByteStreamTransport, H: HTTPHandler>(_ t: T, handler: H, context: ConnectionContext) async {
-        var driver = HTTP1ConnectionDriver(transport: t, handler: handler, context: context,
-                                           configuration: configuration)
-        let ending = await driver.run()
-        await t.close(ending.closeReason)
+        let reason = await Self.supervise(t, handler: handler, context: context, configuration: configuration)
+        await t.close(reason)
+    }
+
+    enum SupervisorEvent: Sendable {
+        case driverEnded(HTTP1Ending)
+        /// The timer's expired word, or `nil` when it stopped.
+        case timer(UInt64?)
+        case shutdown
+        /// The supervisor's `408` was sent (true), or the send failed.
+        case errorSent(Bool)
+    }
+
+    /// Runs the connection loop under its timer and the shutdown signal; returns how to close
+    /// the transport.
+    static func supervise<T: ByteStreamTransport, H: HTTPHandler>(
+        _ t: T, handler: H, context: ConnectionContext, configuration: HTTP1Configuration
+    ) async -> CloseReason {
+        let watchdog = HTTP1Watchdog()
+        let ticks = HTTP1TimeoutTicks(configuration.timeouts)
+        let tick = ticks.shortest
+        let shutdown = context.shutdown
+        return await withTaskGroup(of: SupervisorEvent.self) { group in
+            group.addTask {
+                var driver = HTTP1ConnectionDriver(transport: t, handler: handler, context: context,
+                                                   configuration: configuration, watchdog: watchdog)
+                let ending = await driver.run()
+                // Taken over: keep reading and discarding until the supervisor is done, so its
+                // `408` is not followed by a reset.
+                if watchdog.isOwned { await driver.discardInput() }
+                return .driverEnded(ending)
+            }
+            var timerRunning = tick != 0
+            if timerRunning {
+                group.addTask { .timer(await watchdog.runTimer(tick: tick)) }
+            }
+            group.addTask {
+                await shutdown.wait()
+                return .shutdown
+            }
+
+            var driverEnding: HTTP1Ending?
+            // Set once the supervisor decided the ending; a nil verdict keeps the driver's.
+            var decided = false
+            var verdict: CloseReason?
+            var sendingError = false
+            while let event = await group.next() {
+                switch event {
+                case .driverEnded(let ending):
+                    driverEnding = ending
+
+                case .timer(let word):
+                    timerRunning = false
+                    guard let word else { break }
+                    decided = true
+                    let phase = HTTP1Watchdog.phase(of: word)
+                    if HTTP1Watchdog.isOwned(word) {
+                        // The supervisor's own send or linger ran out.
+                        if phase == .send { verdict = .abort }
+                        group.cancelAll()
+                        break
+                    }
+                    switch phase {
+                    case .head, .body:
+                        // The loop waits in receive and sends nothing more: answer for it.
+                        verdict = .timeout
+                        sendingError = true
+                        watchdog.own(.send, deadline: watchdog.deadline(after: ticks.send))
+                        if ticks.send != 0 {
+                            timerRunning = true
+                            group.addTask { .timer(await watchdog.runTimer(tick: tick)) }
+                        }
+                        let response = timeoutResponse()
+                        group.addTask {
+                            do {
+                                try await t.send(response, endOfStream: true)
+                                return .errorSent(true)
+                            } catch {
+                                return .errorSent(false)
+                            }
+                        }
+                    case .idle:
+                        verdict = .timeout
+                        group.cancelAll()
+                    case .send:
+                        verdict = .abort
+                        group.cancelAll()
+                    case .linger, .none, .done:
+                        // The loop's own lingering close ran out: its ending stands.
+                        group.cancelAll()
+                    }
+
+                case .shutdown:
+                    // Between requests: close now. In flight: the loop finishes the exchange.
+                    if shutdown.isTriggered && !decided && watchdog.takeOverIfBetweenRequests() {
+                        decided = true
+                        verdict = .shutdown
+                        group.cancelAll()
+                    }
+
+                case .errorSent(let sent):
+                    sendingError = false
+                    if !sent {
+                        verdict = .abort
+                        group.cancelAll()
+                    } else if driverEnding == nil && ticks.linger != 0 {
+                        // Lingering close: the loop discards input until the client closes.
+                        watchdog.own(.linger, deadline: watchdog.deadline(after: ticks.linger))
+                        if !timerRunning {
+                            timerRunning = true
+                            group.addTask { .timer(await watchdog.runTimer(tick: tick)) }
+                        }
+                    } else {
+                        group.cancelAll()
+                    }
+                }
+                // Done once the loop ended, no `408` is in flight, and a takeover (if any) was
+                // decided here (the timer's event can arrive after the loop noticed it).
+                if let driverEnding, !sendingError, decided || !watchdog.isOwned {
+                    group.cancelAll()
+                    return verdict ?? driverEnding.closeReason
+                }
+            }
+            return verdict ?? driverEnding?.closeReason ?? .abort
+        }
+    }
+
+    /// `408 Request Timeout` with `connection: close`.
+    static func timeoutResponse() -> ByteBuffer {
+        var serializer = HTTP1Serializer()
+        var output = ByteBuffer(capacity: 160)
+        serializer.write(HTTPResponse(status: .requestTimeout), into: &output,
+                         context: HTTP1ResponseContext(requestMethod: .get, persistence: .close))
+        return output
     }
 }
 
@@ -138,21 +297,34 @@ enum HTTP1Ending: Equatable {
     case closed(CloseReason)
     /// The tunnel closure owned the transport; it closes it (and the server closes it again).
     case tunnelled
+    /// The supervisor took over (a timeout or a drain); it decides how the connection ends.
+    case preempted
 
     var closeReason: CloseReason {
-        if case .closed(let reason) = self { return reason }
-        return .normal
+        switch self {
+        case .closed(let reason): reason
+        case .tunnelled: .normal
+        case .preempted: .abort
+        }
     }
 }
 
 /// The per-connection loop of ``HTTP1``: all connection state as stored properties of one
 /// local value, mutated in place (no actor, no allocation per request).
 struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandler> {
+    /// Largest piece of a `.file` body handed to one `sendFile`, so the send limit bounds a
+    /// stall rather than the whole file.
+    static var fileSlice: Int64 { 1024 * 1024 }
+    /// Largest piece of the output buffer handed to one `send` (see ``sendLeadingSlices()``).
+    static var sendSlice: Int { 1024 * 1024 }
+
     let transport: Transport
     let handler: Handler
     let shutdown: ShutdownSignal
     let requestContext: RequestContext
     let configuration: HTTP1Configuration
+    let watchdog: HTTP1Watchdog
+    let ticks: HTTP1TimeoutTicks
     /// The receive buffer is `storage.buffer`: requests borrow their bytes from it directly.
     let storage: HTTPRequestStorage
     var parser: HTTP1Parser
@@ -163,13 +335,26 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
     var bodyReader: HTTP1RequestBodyReader<Transport>?
     /// Created on the first `.stream` response, then reused.
     var bodyWriter: HTTP1ResponseBodyWriter<Transport>?
+    /// True from the first byte of a head until it is complete; `headDeadline` is its limit.
+    var headStarted = false
+    var headDeadline: UInt64 = 0
+    /// Request bytes may be left unread at close (an error response, an unread body, dropped
+    /// pipelined requests): close lingering.
+    var unreadInput = false
+    /// The client finished sending.
+    var peerEnded = false
+    /// The output was half-closed.
+    var outputShut = false
 
-    init(transport: Transport, handler: Handler, context: ConnectionContext, configuration: HTTP1Configuration) {
+    init(transport: Transport, handler: Handler, context: ConnectionContext, configuration: HTTP1Configuration,
+         watchdog: HTTP1Watchdog = HTTP1Watchdog()) {
         self.transport = transport
         self.handler = handler
         self.shutdown = context.shutdown
         self.requestContext = RequestContext(connection: context.info)
         self.configuration = configuration
+        self.watchdog = watchdog
+        self.ticks = HTTP1TimeoutTicks(configuration.timeouts)
         storage = HTTPRequestStorage(bufferCapacity: configuration.receiveSize, fieldCapacity: 32)
         parser = HTTP1Parser(limits: configuration.parserLimits)
         serializer = HTTP1Serializer()
@@ -177,13 +362,30 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         connection = HTTP1Connection(maxBodySize: configuration.maxBodySize)
     }
 
-    /// Runs the connection; returns how it ended. The caller closes the transport.
+    /// Runs the connection, closing lingering if request bytes may be unread; returns how it
+    /// ended. The caller closes the transport.
     mutating func run() async -> HTTP1Ending {
+        let ending = await serve()
+        if case .closed(let reason) = ending, !reason.isAbortive, !peerEnded,
+           unreadInput || !storage.buffer.isEmpty {
+            await linger()
+        }
+        return ending
+    }
+
+    /// The request loop.
+    mutating func serve() async -> HTTP1Ending {
         while true {
+            compactReceiveBuffer()
+            // Publish the phase, then look at the drain signal (this order pairs with the
+            // supervisor's: it sets the signal, then reads the phase).
+            let entered = headStarted
+                ? watchdog.enter(.head, deadline: headDeadline)
+                : watchdog.enter(.idle, deadline: watchdog.deadline(after: ticks.idle))
+            guard entered else { return .preempted }
             if shutdown.isTriggered && !connection.isDraining {
                 if case .close(let reason) = connection.handle(.shutdown) { return .closed(reason) }
             }
-            compactReceiveBuffer()
 
             // Suspension 1: one receive per batch.
             let received: Int
@@ -192,15 +394,17 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
             } catch {
                 return ending(connection.handle(.receiveFailed))
             }
+            guard watchdog.enter(.none) else { return .preempted }
             if received == 0 {
+                peerEnded = true
                 return ending(connection.handle(.endOfStream))
             }
 
             if let ending = await answerBufferedRequests() { return ending }
 
-            // Suspension 2: one send per pipelined batch.
+            // Suspension 2: one send per pipelined batch. The next phase is set at the top.
             if !output.isEmpty {
-                if let ending = await flush(endOfStream: false) { return ending }
+                if let ending = await flush(endOfStream: false, resetPhase: false) { return ending }
             }
         }
     }
@@ -214,18 +418,33 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         while true {
             switch parser.parseHead(into: storage) {
             case .needMoreBytes:
-                _ = connection.handle(.needMoreBytes(headStarted: parser.isInProgress))
+                let inProgress = parser.isInProgress
+                _ = connection.handle(.needMoreBytes(headStarted: inProgress))
+                if inProgress && !headStarted {
+                    headStarted = true
+                    headDeadline = watchdog.deadline(after: ticks.header)
+                }
                 return nil
 
             case .error(let error):
+                headStarted = false
+                unreadInput = true
                 return await perform(connection.handle(.parseError(error)))
 
             case .complete:
+                headStarted = false
+                if shutdown.isTriggered && !connection.isDraining {
+                    // Draining: a request not started yet gets no response.
+                    storage.endRequest()
+                    unreadInput = true
+                    return await perform(connection.handle(.shutdown))
+                }
                 let head = parser.head
                 let summary = HTTP1Connection.RequestSummary(head: head, fields: storage.fieldsView)
                 let action = connection.handle(.head(summary))
                 guard case .callHandler = action else {
                     storage.endRequest()
+                    if summary.hasBody { unreadInput = true }
                     return await perform(action)
                 }
                 var request = head.request(in: storage)
@@ -235,8 +454,9 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
                     reader = bodyReader
                     var expectsContinue = false
                     if case .handling(let exchange) = connection.state { expectsContinue = exchange.expectsContinue }
-                    // `100 Continue` goes straight to the transport: earlier responses first.
-                    if expectsContinue && !output.isEmpty {
+                    // Earlier responses go out first: before `100 Continue`, and before a
+                    // body stall can be answered with `408`.
+                    if !output.isEmpty {
                         if let ending = await flush(endOfStream: false) {
                             storage.endRequest()
                             return ending
@@ -254,6 +474,7 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
                     if Task.isCancelled { return ending(connection.handle(.receiveFailed)) }
                     if let reader {
                         if reader.transportFailed { return ending(connection.handle(.receiveFailed)) }
+                        if !reader.isFinished { unreadInput = true }
                         if let failure = Self.bodyFailure(reader.failure ?? (error as? HTTPRequestBodyError)) {
                             return await perform(connection.handle(.bodyFailed(failure)))
                         }
@@ -282,6 +503,7 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
                                             receiveSize: configuration.receiveSize,
                                             maxBodySize: configuration.maxBodySize,
                                             chunkedLimits: configuration.chunkedLimits)
+        reader.watch(watchdog, bodyTicks: ticks.body, sendTicks: ticks.send)
         bodyReader = reader
         return reader
     }
@@ -301,11 +523,15 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         if reader.transportFailed { return ending(connection.handle(.receiveFailed)) }
         if reader.isFinished { return nil }
         let drainable = reader.canDrain(limit: configuration.maxDrainSize)
-        guard case .drainBody = connection.handle(.bodyUnread(drainable: drainable)) else { return nil }
+        guard case .drainBody = connection.handle(.bodyUnread(drainable: drainable)) else {
+            unreadInput = true
+            return nil
+        }
         switch await reader.drain(limit: configuration.maxDrainSize) {
         case .complete:
             _ = connection.handle(.bodyDrained(complete: true))
         case .incomplete:
+            unreadInput = true
             _ = connection.handle(.bodyDrained(complete: false))
         case .transportFailed:
             return ending(connection.handle(.receiveFailed))
@@ -330,6 +556,8 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         case .stream(let length, _):
             kind = length == nil ? .unknownLength : .delimited
         }
+        // Draining started while the handler ran: this response is the last one.
+        if shutdown.isTriggered && !connection.isDraining { _ = connection.handle(.shutdown) }
         guard case .writeResponse(let context) = connection.handle(.response(kind)) else {
             preconditionFailure("HTTP1Connection answers a response with writeResponse")
         }
@@ -340,12 +568,8 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         case .contentLength(let length):
             switch response.body {
             case .file(let region):
-                if let ending = await flush(endOfStream: false) { return ending }
-                do {
-                    try await transport.sendFile(region)
-                } catch {
-                    return ending(connection.handle(.sendFailed))
-                }
+                if let ending = await flush(endOfStream: false, resetPhase: false) { return ending }
+                if let ending = await sendFile(region) { return ending }
             case .stream(_, let writer):
                 if let ending = await sendStream(writer, framing: .contentLength(length)) { return ending }
             default:
@@ -365,7 +589,9 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         let next = connection.handle(.responseWritten)
         if case .startTunnel = next {
             guard case .tunnel(let body) = response.body else { preconditionFailure("tunnel without closure") }
-            if let ending = await flush(endOfStream: false) { return ending }
+            if let ending = await flush(endOfStream: false, resetPhase: false) { return ending }
+            // No HTTP/1.1 limit applies to the tunnel; the timer stops.
+            guard watchdog.enter(.done) else { return .preempted }
             await startTunnel(body)
             return .tunnelled
         }
@@ -376,6 +602,26 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
             return nil
         }
         return await perform(next)
+    }
+
+    /// Sends a file region in slices of at most ``fileSlice`` bytes, each under the send limit.
+    mutating func sendFile(_ region: FileRegion) async -> HTTP1Ending? {
+        var offset = region.offset
+        var remaining = region.length
+        repeat {
+            let length = ticks.send == 0 ? remaining : min(remaining, Self.fileSlice)
+            guard watchdog.enter(.send, deadline: watchdog.deadline(after: ticks.send)) else { return .preempted }
+            do {
+                try await transport.sendFile(length == region.length ? region
+                                             : FileRegion(file: region.file, offset: offset, length: length))
+            } catch {
+                return ending(connection.handle(.sendFailed))
+            }
+            offset += length
+            remaining -= length
+        } while remaining > 0
+        guard watchdog.enter(.none) else { return .preempted }
+        return nil
     }
 
     /// Sends the head, then runs a `.stream` writer; every write is one send. Returns an ending
@@ -389,6 +635,7 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
             writer = existing
         } else {
             writer = HTTP1ResponseBodyWriter(transport: transport)
+            writer.watch(watchdog, sendTicks: ticks.send)
             bodyWriter = writer
         }
         var failed = false
@@ -426,12 +673,21 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
             return .closed(.protocolError)
         }
         if reason.isAbortive { return .closed(reason) }
-        if let ending = await flush(endOfStream: true) { return ending }
+        if let ending = await flush(endOfStream: true, resetPhase: false) { return ending }
         return .closed(reason)
     }
 
-    /// Sends ``output`` and clears it. Returns an ending if the send failed.
-    mutating func flush(endOfStream: Bool) async -> HTTP1Ending? {
+    /// Sends ``output`` under the send limit and clears it. Returns an ending if the send
+    /// failed or the supervisor took over. With `resetPhase`, the phase goes back to `none`
+    /// (more work follows: a handler, another request); without, the caller sets the next.
+    mutating func flush(endOfStream: Bool, resetPhase: Bool = true) async -> HTTP1Ending? {
+        if ticks.send != 0 && output.readableBytes > Self.sendSlice {
+            if let ending = await sendLeadingSlices() { return ending }
+        }
+        guard watchdog.enter(.send, deadline: watchdog.deadline(after: ticks.send)) else {
+            output.clear()
+            return .preempted
+        }
         do {
             try await transport.send(output, endOfStream: endOfStream)
         } catch {
@@ -439,7 +695,64 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
             return ending(connection.handle(.sendFailed))
         }
         output.clear()
+        if endOfStream { outputShut = true }
+        if resetPhase {
+            guard watchdog.enter(.none) else { return .preempted }
+        }
         return nil
+    }
+
+    /// Sends all but the last ``sendSlice`` bytes of a large output (a big `.bytes` body) in
+    /// slices, each under its own send limit, so the limit bounds a stalled client rather than
+    /// a slow download. Copies each slice; only outputs over a slice take this path.
+    mutating func sendLeadingSlices() async -> HTTP1Ending? {
+        var slice = ByteBuffer(capacity: Self.sendSlice)
+        while output.readableBytes > Self.sendSlice {
+            slice.clear()
+            slice.append(ByteView(offset: output.readerIndex, length: Self.sendSlice), from: output)
+            guard watchdog.enter(.send, deadline: watchdog.deadline(after: ticks.send)) else {
+                output.clear()
+                return .preempted
+            }
+            do {
+                try await transport.send(slice, endOfStream: false)
+            } catch {
+                output.clear()
+                return ending(connection.handle(.sendFailed))
+            }
+            output.moveReaderIndex(forwardBy: Self.sendSlice)
+        }
+        return nil
+    }
+
+    /// Lingering close: half-closes the output (if not yet), then reads and discards input
+    /// until the client closes, ``HTTP1Configuration/maxLingerSize`` bytes, or the linger
+    /// limit (enforced by the supervisor's timer).
+    mutating func linger() async {
+        guard ticks.linger != 0,
+              watchdog.enter(.linger, deadline: watchdog.deadline(after: ticks.linger)) else { return }
+        if !outputShut {
+            do {
+                try await transport.send(ByteBuffer(), endOfStream: true)
+            } catch {
+                return
+            }
+            outputShut = true
+        }
+        await discardInput()
+    }
+
+    /// Reads and discards input until end of stream, an error (or cancellation), or
+    /// ``HTTP1Configuration/maxLingerSize`` bytes.
+    mutating func discardInput() async {
+        var discarded = 0
+        while discarded <= configuration.maxLingerSize {
+            storage.buffer.clear()
+            guard let count = try? await transport.receive(into: &storage.buffer, maxLength: configuration.receiveSize),
+                  count > 0 else { break }
+            discarded &+= count
+        }
+        storage.buffer.clear()
     }
 
     /// Hands the byte stream to a tunnel closure, first replaying bytes the client sent after

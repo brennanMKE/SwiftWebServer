@@ -271,6 +271,10 @@ extension InMemoryMultiplexedTransport {
 
 // MARK: - Stream
 
+/// The in-memory stream's `reset(applicationError:)` and `stopSending(applicationError:)`
+/// already have QUIC semantics (#0101).
+extension InMemoryMultiplexedTransport.Stream: ResettableStream {}
+
 extension InMemoryMultiplexedTransport {
     /// One endpoint of a QUIC-like stream: a ``ByteStreamTransport`` with an RFC 9000 stream ID.
     public final class Stream: ByteStreamTransport, StreamIdentified, Sendable {

@@ -490,6 +490,8 @@ func pattern(_ count: Int) -> String {
             #expect(responses.map(\.status) == [200])
             #expect(responses.first?.text == "ignored")
             #expect(responses.first?.header("connection") == "close")
+            // The server lingers (the body may still come) until the client closes (#0082).
+            try await client.send(ByteBuffer(), endOfStream: true)
             try await group.waitForAll()
         }
     }

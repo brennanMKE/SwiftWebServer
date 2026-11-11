@@ -66,6 +66,11 @@ public final class HTTP1RequestBodyReader<Transport: ByteStreamTransport>: HTTPR
     var raw = ByteBuffer()
     var trailerSection = ByteBuffer()
     var trailerFields: HTTPFields?
+    /// The connection's watchdog (#0082): each receive runs under the body limit, the
+    /// `100 Continue` send under the send limit. `nil` when used without a supervisor.
+    var watchdog: HTTP1Watchdog?
+    var bodyTicks: UInt64 = 0
+    var sendTicks: UInt64 = 0
 
     public init(transport: Transport, storage: HTTPRequestStorage, receiveSize: Int,
                 maxBodySize: Int, chunkedLimits: ChunkedDecoderLimits) {
@@ -77,6 +82,13 @@ public final class HTTP1RequestBodyReader<Transport: ByteStreamTransport>: HTTPR
     }
 
     // MARK: Runner side
+
+    /// Puts body receives and the `100 Continue` send under the connection's limits.
+    func watch(_ watchdog: HTTP1Watchdog, bodyTicks: UInt64, sendTicks: UInt64) {
+        self.watchdog = watchdog
+        self.bodyTicks = bodyTicks
+        self.sendTicks = sendTicks
+    }
 
     /// Starts the body of the request whose head was just parsed from the storage's buffer
     /// and returns the body to hand to the handler.
@@ -287,6 +299,9 @@ public final class HTTP1RequestBodyReader<Transport: ByteStreamTransport>: HTTPR
 
     /// Receives at least one byte; end of stream fails the body as truncated.
     func receive(into buffer: inout ByteBuffer, maxLength: Int) async throws -> Int {
+        if let watchdog, !watchdog.enter(.body, deadline: watchdog.deadline(after: bodyTicks)) {
+            throw preempted()
+        }
         let count: Int
         do {
             count = try await transport.receive(into: &buffer, maxLength: maxLength)
@@ -295,6 +310,8 @@ public final class HTTP1RequestBodyReader<Transport: ByteStreamTransport>: HTTPR
             mode = .failed(.truncated)
             throw error
         }
+        // The handler's own time is not limited.
+        if let watchdog, !watchdog.enter(.none) { throw preempted() }
         if count == 0 {
             mode = .failed(.truncated)
             throw HTTPRequestBodyError.truncated
@@ -306,6 +323,9 @@ public final class HTTP1RequestBodyReader<Transport: ByteStreamTransport>: HTTPR
     func sendContinueIfPending() async throws {
         guard continuePending else { return }
         continuePending = false
+        if let watchdog, !watchdog.enter(.send, deadline: watchdog.deadline(after: sendTicks)) {
+            throw preempted()
+        }
         do {
             try await transport.send(ByteBuffer(Self.continueResponse), endOfStream: false)
         } catch {
@@ -313,5 +333,14 @@ public final class HTTP1RequestBodyReader<Transport: ByteStreamTransport>: HTTPR
             mode = .failed(.truncated)
             throw error
         }
+        if let watchdog, !watchdog.enter(.none) { throw preempted() }
+    }
+
+    /// The supervisor took over (a body timeout): the body fails like a broken transport, so
+    /// the runner stops without answering.
+    func preempted() -> TransportError {
+        transportError = TransportError.timedOut
+        mode = .failed(.truncated)
+        return .timedOut
     }
 }
