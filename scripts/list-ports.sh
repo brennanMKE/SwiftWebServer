@@ -1,5 +1,7 @@
 #!/bin/bash
 
+cd "$(dirname "$0")/.."
+
 # Usage:
 #   ./list-ports-for-pids.sh            # lists ports for all SwiftWebServer processes
 #   ./list-ports-for-pids.sh 1234 5678  # lists ports for given PIDs

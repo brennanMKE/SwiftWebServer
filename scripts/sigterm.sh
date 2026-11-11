@@ -1,5 +1,7 @@
 #!/bin/bash
 
+cd "$(dirname "$0")/.."
+
 PORT=8080
 
 PID=$(lsof -ti tcp:$PORT)
@@ -9,5 +11,5 @@ if [ -z "$PID" ]; then
   exit 1
 fi
 
-echo "Sending SIGINT (kill -2) to PID $PID using port $PORT..."
-kill -2 "$PID"
+echo "Sending SIGTERM to PID $PID using port $PORT..."
+kill -TERM "$PID"

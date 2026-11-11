@@ -1,6 +1,6 @@
 # SwiftWebServer Roadmap: a dependency-free, modular HTTP/1.1 + HTTP/2 + HTTP/3 server
 
-Swift 6, macOS 15+, Network.framework, zero package dependencies. This document supersedes `HTTP2.md` (its limits table and DoS list remain valid and are carried into the HTTP/2 track).
+Swift 6, macOS 15+, Network.framework, zero package dependencies. This document supersedes `docs/HTTP2.md` (its limits table and DoS list remain valid and are carried into the HTTP/2 track).
 
 ## 1. Principles
 
@@ -23,7 +23,7 @@ Swift 6, macOS 15+, Network.framework, zero package dependencies. This document 
 
 ## 3. Critical review of the legacy code
 
-Keep: `Root/` fixtures; the `http-config.json` schema idea; status and error-page concepts; the state-enum instinct in `HTTPRuntime`; `os.Logger` behind the AccessLog component; the `HTTP2.md` limits/DoS tables.
+Keep: `Root/` fixtures; the `http-config.json` schema idea; status and error-page concepts; the state-enum instinct in `HTTPRuntime`; `os.Logger` behind the AccessLog component; the `docs/HTTP2.md` limits/DoS tables.
 
 Delete or rewrite:
 
