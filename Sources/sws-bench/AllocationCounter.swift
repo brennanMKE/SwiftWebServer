@@ -40,6 +40,21 @@ enum AllocationCounter {
         slot.pointee = nil
         return allocationEvents.load(ordering: .relaxed) - start
     }
+
+    /// Like ``count(_:)`` for async work. Process-wide: allocations made by other threads
+    /// (Network.framework's queues, the cooperative pool) while `body` runs are included,
+    /// which is what transport benchmarks want.
+    static func countAsync(_ body: () async throws -> Void) async rethrows -> Int? {
+        guard let slot = loggerSlot, slot.pointee == nil else {
+            try await body()
+            return nil
+        }
+        let start = allocationEvents.load(ordering: .relaxed)
+        slot.pointee = countingLogger
+        defer { slot.pointee = nil }
+        try await body()
+        return allocationEvents.load(ordering: .relaxed) - start
+    }
 }
 
 private let allocationEvents = Atomic<Int>(0)
