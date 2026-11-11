@@ -1,7 +1,7 @@
 import Foundation
 import Network
 import os.log
-import SwiftWebServerCore
+import Legacy
 
 // subsystem:HTTPServer
 let logger = Logger(subsystem: "HTTPServer", category: "HTTPServer")
