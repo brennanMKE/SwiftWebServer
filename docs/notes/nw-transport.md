@@ -1,0 +1,132 @@
+# Network.framework TCP transport: notes and measurements (#0078)
+
+`NetworkTransport` adapts `NWConnection`/`NWListener` to `ByteStreamTransport`
+(`TCPTransport`, `TCPListener`, `TCPConfiguration`). This note records how the adapter is
+built, what Network.framework does underneath it, and what one round trip costs (ROADMAP §7,
+"known floor").
+
+## Design summary
+
+- **Demand-driven reads.** Each `receive(into:maxLength:)` issues exactly one
+  `receive(minimumIncompleteLength: 1, maximumLength: maxLength)` and appends the delivered
+  `Data` straight into the caller's `ByteBuffer` tail (one `memcpy`, no intermediate buffer).
+  Nothing reads ahead, so a task that stops reading applies TCP backpressure.
+- **Sends** copy the `ByteBuffer` into `Data` (the one copy on the write path), send with
+  `isComplete: true`, and resume on `.contentProcessed`. `endOfStream` uses `.finalMessage`,
+  which is a TCP half-close (FIN). Receiving keeps working afterwards.
+- **Handlers before `start`.** State and viability handlers are installed in `init`. The
+  connection is started separately (#0010). The listener's state and new-connection handlers
+  are installed in `TCPListener.init`, and `start()` comes after.
+- **One serial `DispatchQueue` per connection, and one per listener.** This is the only
+  `DispatchQueue` use in the package's mainline code.
+- **Continuations.** Each one is an `UnsafeContinuation`, so the hot path has no
+  `CheckedContinuation` box allocation. Each lives in a `Mutex` and is taken out under the
+  lock before it is resumed. The NW callback, a state change, `close`, and task cancellation
+  all race to take it, so it is resumed exactly once. The callback object (`Core`) holds no
+  reference to the `NWConnection`, so the handlers do not form a retain cycle.
+- **Cancellation.** NW cannot cancel a single outstanding receive or send. Cancelling a
+  waiting task throws `CancellationError` at once and cancels the connection. Later calls
+  throw `TransportError.closed`.
+- **Bounded accept.** `TCPListener` holds at most `pendingConnectionLimit` connections that NW
+  has handed over but `connections` has not yet taken (still in the handshake, or ready and
+  waiting). Any connection beyond that is cancelled at once and counted in
+  `rejectedConnectionCount`. `connections` is an `AsyncSequence` whose `next()` pops one
+  connection or suspends. It yields connections only after `.ready`, so `info` (both
+  addresses) is set before anyone sees the transport.
+- **Binding.** The listener binds with `requiredLocalEndpoint` (default `127.0.0.1`, port 0).
+  `start()` returns the real port from `listener.port` once the listener is `.ready`.
+- **Socket options** live in `TCPConfiguration`: `noDelay` (default on), keep-alive
+  idle/interval/count (default off), connect timeout, and `allowLocalEndpointReuse`.
+- **Error mapping.** `ECONNRESET`, `EPIPE`, `ECONNABORTED`, `ENOTCONN` and `ENETRESET` map to
+  `.connectionReset`. `ETIMEDOUT` maps to `.timedOut` and `ECANCELED` to `.closed`. Anything
+  else maps to `.failed(code:)`.
+
+## Network.framework behaviour observed
+
+1. **A refused connect does not fail; it waits.** Connecting to a closed loopback port moves
+   the connection to `.waiting(POSIX ECONNREFUSED)`, and NW retries on path changes forever.
+   `TCPTransport.connect` therefore treats `.waiting` as a failure and cancels. Accepted
+   connections do not do this.
+2. **`forceCancel()` sends a TCP RST.** The peer's pending or next receive fails with
+   `ECONNRESET`, which maps to `.connectionReset`. Bytes accepted by an earlier `send` were not
+   delivered to the peer's reader. `close(.abort)` relies on this.
+3. **`cancel()` is graceful and keeps accepted bytes.** A client that sends 100 MiB and calls
+   `close(.normal)` right after its last `send` returns has every byte delivered, then EOF
+   (`largeTransferAppliesBackpressure`). So `.contentProcessed` plus `cancel()` is enough, and
+   no explicit FIN-then-wait is needed.
+4. **Loopback backpressure is tight.** When the server does not read, the client's sends stall
+   after about 1.2–1.8 MiB has been accepted (socket buffers plus NW's own). That is much
+   less than the several MiB per stream that the QUIC spike saw. The 100 MiB test asserts that
+   the accepted count stays below 32 MiB and stops changing.
+5. **A cancelled pending receive is reported as EOF or an error to the peer.** The test
+   accepts either one.
+6. **Cancelling an accepted connection that was never started** (the over-limit case) closes
+   the socket. The client sees EOF or an error on its next receive. Starting the connection
+   first is not needed.
+7. **NWListener has `newConnectionLimit`.** It could give kernel-level backpressure, because NW
+   stops handing over connections when the limit reaches 0. It was not used: what happens to
+   connections that arrive while the limit is 0 is undocumented, and the explicit
+   cancel-beyond-bound behaviour is what the issue asks for and is testable. Worth trying in
+   #0079 if accept storms matter.
+
+## Measurements
+
+`TransportBench.run(_:)` in `Sources/sws-bench/TransportBench.swift` is exposed only, not
+wired into a command. It was run in-process over 127.0.0.1 from a temporary, uncommitted
+`main.swift` case: a release build and one invocation of 3 rounds × {default, executor
+preference}. Allocation counts are process-wide (client, server and NW threads) and come from
+the `malloc_logger` hook (`AllocationCounter.countAsync`).
+
+- Machine: Apple M4 Pro, 12 cores, 64 GB, macOS 27.0, Swift 6.4.2.
+- **Load average 26.13 / 136.04 / 140.45 at the start (21.22 at the end).** Other agents were
+  busy on the machine, so treat these as rough. The milestone-end idle run should replace them.
+
+Median of 3 rounds:
+
+| Case | Default | Executor preference |
+|---|---|---|
+| Echo 64 B round trip, p50 | 45.0 µs | 44.8 µs |
+| Echo 64 B round trip, p99 | 67.1 µs | 67.2 µs |
+| Echo round trip allocations (2 sends + 2 receives, both ends, NW) | 50.0 | 58.0 |
+| Echo throughput, 64 KiB sends (each way) | 1342 MiB/s | 1442 MiB/s |
+| `send` 64 B until `.contentProcessed` | 15.6 µs/call | 13.1 µs/call |
+| `send` allocations (includes the server's reads) | 23.2/call | 26.8/call |
+| `receive` 64 B with data already buffered | 6.60 µs/call | 5.89 µs/call |
+| `receive` allocations | 12.0/call | 14.0/call |
+
+Reading the numbers:
+
+- **The per-read floor is about 6.5 µs and 12 allocations, nearly all of it inside NW.** Our
+  code allocates one escaping completion closure per receive. The continuation is unsafe and
+  does not allocate, and the copy goes into the reused buffer. The rest is NW's `Data`,
+  dispatch blocks and internal bookkeeping. A `receive` therefore costs about 40 times the
+  ROADMAP's 150 ns head-parse target. This confirms the ROADMAP's rule: read large
+  (`maxLength` of 16–64 KiB) and parse all pipelined requests from one read. Never read small.
+- **The per-write floor is about 11 allocations per send** (23.2 minus the server's
+  receives). It includes the `ByteBuffer` to `Data` copy. A future experiment is
+  `Data(bytesNoCopy:deallocator: .custom)` that retains the buffer's storage. That skips the
+  copy, but the connection's reused output buffer would then hit copy-on-write on its next
+  mutation if NW still holds the `Data`, so measure it before adopting.
+- **Task-executor preference** (`TCPTransport.taskExecutor`, a `TaskExecutor` that runs jobs
+  on the connection's queue, used with `withTaskExecutorPreference` and
+  `group.addTask(executorPreference:)`): send and receive are about 10–15% faster and
+  throughput about 7% higher. Echo latency does not change, and every call costs 2 more
+  allocations (the `queue.async` block per enqueued job). On a loaded machine that is not a
+  clear win, so it **stays opt-in and is off by default**. Re-measure on an idle machine when
+  the HTTP/1.1 runner exists (M3), since that is where the per-request hop count is decided.
+  An executor that runs jobs inline when it is already on the queue, instead of always calling
+  `queue.async`, might remove the extra allocations.
+
+## Tests
+
+`Tests/NetworkTransportTests/TCPTransportTests.swift`: every test binds 127.0.0.1 port 0, has
+`.timeLimit(.minutes(1))`, and runs under `scripts/guarded.sh`. The tests cover:
+
+- Echo with a raw `NWConnection` client and with two `TCPTransport`s.
+- Peer EOF returns 0 and stays 0, and half-close works.
+- A 100 MiB transfer with a stalled reader (backpressure), then a full drain with a checksum.
+- Abortive close resets the peer. A cancelled pending receive throws. A concurrent receive is
+  rejected, and `close` fails a receive in progress.
+- The bounded accept queue (limit 2, five clients, three rejected), two listeners in one
+  process, a connect failure before `.ready`, listener close and accept cancellation, and a
+  `/usr/bin/curl` exchange.
