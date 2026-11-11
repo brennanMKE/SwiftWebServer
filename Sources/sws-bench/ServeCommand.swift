@@ -4,6 +4,7 @@ import HTTP1
 import HTTPCore
 import HTTPServer
 import NetworkTransport
+import StaticFiles
 
 /// `sws-bench serve`: the new stack's server entry point (#0079) until the shipped
 /// `SwiftWebServer` executable moves off Legacy (#0086).
@@ -22,7 +23,7 @@ enum ServeCommand {
     static let usage = """
         usage: sws-bench serve [--config FILE] [--host HOST] [--port PORT]
                                [--max-connections N] [--drain-timeout SECONDS] [--body-size N]
-                               [--max-body-size N]
+                               [--max-body-size N] [--root DIR]
 
           --config FILE        JSON object with any of "host", "port", "maxConnections",
                                "drainTimeout" (seconds); flags override it
@@ -32,9 +33,12 @@ enum ServeCommand {
           --drain-timeout S    grace period for open connections on shutdown (default 10)
           --body-size N        answer with N bytes of "x" instead of "Hello, World!\n"
           --max-body-size N    largest request body accepted; larger gets 413 (default 10485760)
+          --root DIR           serve the files under DIR with StaticFiles (#0084) instead of
+                               the built-in handler
 
         Serves HTTP/1.1 (keep-alive, pipelining). POST echoes the request body, PUT answers
-        with the body's length, anything else gets 200 text/plain.
+        with the body's length, anything else gets 200 text/plain. With --root, every request
+        goes to StaticFiles (GET and HEAD only; other methods get 405).
 
         Prints "listening HOST:PORT" on stdout once bound. SIGINT/SIGTERM shut down gracefully.
 
@@ -48,6 +52,7 @@ enum ServeCommand {
         var drainTimeout = 10.0
         var bodySize: Int?
         var maxBodySize = HTTP1Configuration.defaultMaxBodySize
+        var root: String?
     }
 
     struct ConfigError: Error, CustomStringConvertible {
@@ -56,7 +61,7 @@ enum ServeCommand {
 
     static func run(_ argv: [String]) async throws -> Int32 {
         if argv.contains("--h3") { return try await H3ServeCommand.run(argv.filter { $0 != "--h3" }) }
-        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "max-connections", "drain-timeout", "body-size", "max-body-size"])
+        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "max-connections", "drain-timeout", "body-size", "max-body-size", "root"])
         if args.flag("help") == true { print(usage); return 0 }
         let configPath = args.string("config")
         let host = args.string("host")
@@ -65,6 +70,7 @@ enum ServeCommand {
         let drainTimeout = try args.seconds("drain-timeout")
         let bodySize = try args.int("body-size")
         let maxBodySize = try args.int("max-body-size")
+        let root = args.string("root")
         try args.checkAllConsumed()
 
         var settings = Settings()
@@ -98,6 +104,7 @@ enum ServeCommand {
             }
             settings.maxBodySize = maxBodySize
         }
+        if let root { settings.root = root }
         return await serve(settings)
     }
 
@@ -145,10 +152,27 @@ enum ServeCommand {
             printError("sws-bench serve: \(error)")
             return 1
         }
-        let server = Server(configuration: configuration, listeners: [listener],
-                            protocols: [HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))],
+        let protocols = [HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))]
+        if let root = settings.root {
+            let files: StaticFiles
+            do {
+                files = try StaticFiles(root: root)
+            } catch {
+                printError("sws-bench serve: cannot serve root \(root): \(error)")
+                return 1
+            }
+            let server = Server(configuration: configuration, listeners: [listener], protocols: protocols,
+                                handler: files)
+            return await run(server, settings)
+        }
+        let server = Server(configuration: configuration, listeners: [listener], protocols: protocols,
                             handler: ServeHandler(hello: HelloHandler(bodySize: settings.bodySize),
                                                  maxBodySize: settings.maxBodySize))
+        return await run(server, settings)
+    }
+
+    /// Runs `server` until SIGINT or SIGTERM has drained it.
+    static func run<H: HTTPHandler>(_ server: Server<TCPListener, H>, _ settings: Settings) async -> Int32 {
 
         // Ignore the default actions first, so a signal is never fatal, then route both to a
         // graceful shutdown. The sources are kept alive until the server stops (#0003).
