@@ -97,63 +97,6 @@ public struct HTTPResponse: Sendable {
     }
 }
 
-/// A request body: an `AsyncSequence` of byte chunks whose `next()` performs the read, so
-/// bytes are received only when the handler asks for them.
-///
-/// Only ``empty`` exists yet; the demand-driven `Content-Length`, chunked, HTTP/2 DATA and
-/// HTTP/3 DATA sources arrive with #0081, #0048 and #0101. ``empty`` costs nothing.
-public struct HTTPRequestBody: AsyncSequence, Sendable {
-    public typealias Element = ByteBuffer
-    public typealias Failure = any Error
-
-    @usableFromInline
-    enum Source: Sendable {
-        case empty
-    }
-
-    @usableFromInline let source: Source
-
-    @inlinable
-    init(source: Source) {
-        self.source = source
-    }
-
-    /// A body with no bytes.
-    public static let empty = HTTPRequestBody(source: .empty)
-
-    /// True when the body is known to have no bytes without reading.
-    @inlinable
-    public var isEmpty: Bool {
-        switch source {
-        case .empty: true
-        }
-    }
-
-    public struct AsyncIterator: AsyncIteratorProtocol {
-        public typealias Element = ByteBuffer
-        public typealias Failure = any Error
-
-        @usableFromInline var source: Source
-
-        @inlinable
-        init(source: Source) {
-            self.source = source
-        }
-
-        @inlinable
-        public mutating func next() async throws -> ByteBuffer? {
-            switch source {
-            case .empty: nil
-            }
-        }
-    }
-
-    @inlinable
-    public func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(source: source)
-    }
-}
-
 /// The sink a ``HTTPResponseBody/stream(length:writer:)`` body writes into. Each `write`
 /// suspends until the transport accepts the bytes, which is the backpressure (#0081).
 public protocol HTTPBodyWriter: Sendable {

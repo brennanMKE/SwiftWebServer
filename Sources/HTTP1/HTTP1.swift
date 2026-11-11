@@ -11,19 +11,38 @@ public struct HTTP1Configuration: Sendable, Hashable {
     /// The output buffer is sent early, before the pipelined batch ends, once it holds this
     /// many bytes, so a long pipeline of large responses does not grow it without bound.
     public var flushThreshold: Int
+    /// The largest request body accepted (legacy #0011): a larger `Content-Length` is answered
+    /// with `413 Content Too Large` before the handler runs, and a chunked body that grows
+    /// past it fails the handler's read and is answered with `413`. Either way the connection
+    /// closes.
+    public var maxBodySize: Int
+    /// The most body bytes read and discarded when a handler returns without reading the whole
+    /// body. A longer rest (or a malformed body) closes the connection instead.
+    public var maxDrainSize: Int
+    /// Chunk-size, extension and trailer limits for chunked request bodies.
+    public var chunkedLimits: ChunkedDecoderLimits
 
     public static let defaultReceiveSize = 16 * 1024
     public static let defaultFlushThreshold = 64 * 1024
+    public static let defaultMaxBodySize = 10 * 1024 * 1024
+    public static let defaultMaxDrainSize = 64 * 1024
 
     public init(
         parserLimits: HTTP1ParserLimits = HTTP1ParserLimits(),
         receiveSize: Int = HTTP1Configuration.defaultReceiveSize,
-        flushThreshold: Int = HTTP1Configuration.defaultFlushThreshold
+        flushThreshold: Int = HTTP1Configuration.defaultFlushThreshold,
+        maxBodySize: Int = HTTP1Configuration.defaultMaxBodySize,
+        maxDrainSize: Int = HTTP1Configuration.defaultMaxDrainSize,
+        chunkedLimits: ChunkedDecoderLimits = ChunkedDecoderLimits()
     ) {
         precondition(receiveSize > 0 && flushThreshold > 0, "HTTP1Configuration sizes must be positive")
+        precondition(maxBodySize >= 0 && maxDrainSize >= 0, "HTTP1Configuration body limits must not be negative")
         self.parserLimits = parserLimits
         self.receiveSize = receiveSize
         self.flushThreshold = flushThreshold
+        self.maxBodySize = maxBodySize
+        self.maxDrainSize = maxDrainSize
+        self.chunkedLimits = chunkedLimits
     }
 }
 
@@ -57,11 +76,24 @@ public struct HTTP1Configuration: Sendable, Hashable {
 /// - A receive or send error ends the connection with no further response (legacy #0008).
 /// - End of stream between requests or in the middle of a head closes quietly.
 ///
+/// ## Bodies (#0081)
+///
+/// - Request bodies are read by the handler through ``HTTPRequest/body``, on demand, by an
+///   ``HTTP1RequestBodyReader`` that borrows this loop's transport and receive buffer while
+///   the handler runs. `Expect: 100-continue` gets `100 Continue` when the handler first reads.
+///   A body the handler did not finish is drained up to ``HTTP1Configuration/maxDrainSize``
+///   before the response, or the response says `close`. Limits: see
+///   ``HTTP1Configuration/maxBodySize``.
+/// - `.stream` responses: the head is sent, then the writer's bytes, each write one `send`
+///   (backpressure) through an ``HTTP1ResponseBodyWriter``: with `Content-Length` when the
+///   length is known (a mismatch aborts the connection), chunked when it is not, and for
+///   HTTP/1.0 delimited by closing the connection. A writer that throws after the head was
+///   sent aborts the connection.
+/// - HEAD, `204` and `304` responses never carry body bytes, whatever the body kind; the
+///   serializer keeps their headers (#0016, #0018) and the writer or file is not run.
+///
 /// ## Hooks
 ///
-/// - Request bodies (#0081): a request with content is answered with
-///   ``HTTP1Connection/bodyNotSupportedStatus(for:)`` and the connection closes.
-/// - `.stream` responses (#0081) are not sent yet: they are answered like a handler error.
 /// - `.tunnel` responses (#0108): the head (`101` from the handler) is flushed, then the byte
 ///   stream is handed to the closure, replaying any bytes buffered after the request.
 /// - Draining (#0082): a connection checks the shutdown signal once per batch and then answers
@@ -126,7 +158,11 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
     var parser: HTTP1Parser
     var serializer: HTTP1Serializer<SystemWallClock>
     var output: ByteBuffer
-    var connection = HTTP1Connection()
+    var connection: HTTP1Connection
+    /// Created on the first request with a body, then reused.
+    var bodyReader: HTTP1RequestBodyReader<Transport>?
+    /// Created on the first `.stream` response, then reused.
+    var bodyWriter: HTTP1ResponseBodyWriter<Transport>?
 
     init(transport: Transport, handler: Handler, context: ConnectionContext, configuration: HTTP1Configuration) {
         self.transport = transport
@@ -138,6 +174,7 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         parser = HTTP1Parser(limits: configuration.parserLimits)
         serializer = HTTP1Serializer()
         output = ByteBuffer(capacity: 4 * 1024)
+        connection = HTTP1Connection(maxBodySize: configuration.maxBodySize)
     }
 
     /// Runs the connection; returns how it ended. The caller closes the transport.
@@ -191,23 +228,95 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
                     storage.endRequest()
                     return await perform(action)
                 }
+                var request = head.request(in: storage)
+                var reader: HTTP1RequestBodyReader<Transport>?
+                if summary.hasBody {
+                    let bodyReader = self.bodyReader ?? makeBodyReader()
+                    reader = bodyReader
+                    var expectsContinue = false
+                    if case .handling(let exchange) = connection.state { expectsContinue = exchange.expectsContinue }
+                    // `100 Continue` goes straight to the transport: earlier responses first.
+                    if expectsContinue && !output.isEmpty {
+                        if let ending = await flush(endOfStream: false) {
+                            storage.endRequest()
+                            return ending
+                        }
+                    }
+                    request.body = bodyReader.begin(framing: head.framing, expectsContinue: expectsContinue)
+                }
                 let response: HTTPResponse
                 do {
-                    response = try await handler.handle(head.request(in: storage), context: requestContext)
+                    response = try await handler.handle(request, context: requestContext)
                 } catch {
                     storage.endRequest()
+                    reader?.end()
                     // Cancelled (drain deadline): stop without answering.
                     if Task.isCancelled { return ending(connection.handle(.receiveFailed)) }
+                    if let reader {
+                        if reader.transportFailed { return ending(connection.handle(.receiveFailed)) }
+                        if let failure = Self.bodyFailure(reader.failure ?? (error as? HTTPRequestBodyError)) {
+                            return await perform(connection.handle(.bodyFailed(failure)))
+                        }
+                    }
                     return await perform(connection.handle(.handlerFailed))
                 }
+                if let reader {
+                    let ending = await settleBody(reader)
+                    if ending != nil {
+                        storage.endRequest()
+                        reader.end()
+                        return ending
+                    }
+                }
                 storage.endRequest()
+                reader?.end()
                 if let ending = await write(response) { return ending }
             }
         }
     }
 
-    /// Serializes one handler response (and sends a file body). Returns an ending when the
-    /// connection must stop after it.
+    // MARK: Request body
+
+    mutating func makeBodyReader() -> HTTP1RequestBodyReader<Transport> {
+        let reader = HTTP1RequestBodyReader(transport: transport, storage: storage,
+                                            receiveSize: configuration.receiveSize,
+                                            maxBodySize: configuration.maxBodySize,
+                                            chunkedLimits: configuration.chunkedLimits)
+        bodyReader = reader
+        return reader
+    }
+
+    /// How a body error that made the handler throw is answered: `413` or `400`.
+    static func bodyFailure(_ error: HTTPRequestBodyError?) -> HTTP1Connection.BodyFailure? {
+        switch error {
+        case .tooLarge: .tooLarge
+        case .malformed, .truncated: .malformed
+        case .expired, .concurrentRead, nil: nil
+        }
+    }
+
+    /// After the handler returned: drains a body it did not finish, so the next head starts at
+    /// the right byte, or marks the response `close`. Returns an ending if the transport failed.
+    mutating func settleBody(_ reader: HTTP1RequestBodyReader<Transport>) async -> HTTP1Ending? {
+        if reader.transportFailed { return ending(connection.handle(.receiveFailed)) }
+        if reader.isFinished { return nil }
+        let drainable = reader.canDrain(limit: configuration.maxDrainSize)
+        guard case .drainBody = connection.handle(.bodyUnread(drainable: drainable)) else { return nil }
+        switch await reader.drain(limit: configuration.maxDrainSize) {
+        case .complete:
+            _ = connection.handle(.bodyDrained(complete: true))
+        case .incomplete:
+            _ = connection.handle(.bodyDrained(complete: false))
+        case .transportFailed:
+            return ending(connection.handle(.receiveFailed))
+        }
+        return nil
+    }
+
+    // MARK: Response
+
+    /// Serializes one handler response (and sends a file or stream body). Returns an ending
+    /// when the connection must stop after it.
     mutating func write(_ response: HTTPResponse) async -> HTTP1Ending? {
         let kind: HTTP1Connection.ResponseKind
         switch response.body {
@@ -218,9 +327,8 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
             let code = response.status.code
             if code < 200 && code != 101 { return await perform(connection.handle(.handlerFailed)) }
             kind = .tunnel
-        case .stream:
-            // Hook for #0081: streamed responses are not sent yet.
-            return await perform(connection.handle(.handlerFailed))
+        case .stream(let length, _):
+            kind = length == nil ? .unknownLength : .delimited
         }
         guard case .writeResponse(let context) = connection.handle(.response(kind)) else {
             preconditionFailure("HTTP1Connection answers a response with writeResponse")
@@ -229,17 +337,26 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         switch framing {
         case .complete:
             break
-        case .contentLength:
-            if case .file(let region) = response.body {
+        case .contentLength(let length):
+            switch response.body {
+            case .file(let region):
                 if let ending = await flush(endOfStream: false) { return ending }
                 do {
                     try await transport.sendFile(region)
                 } catch {
                     return ending(connection.handle(.sendFailed))
                 }
+            case .stream(_, let writer):
+                if let ending = await sendStream(writer, framing: .contentLength(length)) { return ending }
+            default:
+                preconditionFailure("only .file and .stream bodies are sent after the head")
             }
         case .chunked:
-            preconditionFailure("only .stream bodies are chunked")
+            guard case .stream(_, let writer) = response.body else { preconditionFailure("only .stream bodies are chunked") }
+            if let ending = await sendStream(writer, framing: .chunked) { return ending }
+        case .closeDelimited:
+            guard case .stream(_, let writer) = response.body else { preconditionFailure("only .stream bodies are close-delimited") }
+            if let ending = await sendStream(writer, framing: .closeDelimited) { return ending }
         case .tunnel:
             break
         }
@@ -259,6 +376,32 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
             return nil
         }
         return await perform(next)
+    }
+
+    /// Sends the head, then runs a `.stream` writer; every write is one send. Returns an ending
+    /// when the body could not be completed (the connection is aborted).
+    mutating func sendStream(_ body: @Sendable (any HTTPBodyWriter) async throws -> Void,
+                             framing: HTTP1ResponseBodyWriter<Transport>.Framing) async -> HTTP1Ending? {
+        // The head goes out at once, so a slow first write does not hold it back.
+        if let ending = await flush(endOfStream: false) { return ending }
+        let writer: HTTP1ResponseBodyWriter<Transport>
+        if let existing = bodyWriter {
+            writer = existing
+        } else {
+            writer = HTTP1ResponseBodyWriter(transport: transport)
+            bodyWriter = writer
+        }
+        var failed = false
+        do {
+            try await body(writer.begin(framing))
+        } catch {
+            failed = true
+        }
+        writer.end()
+        if writer.transportFailed { return ending(connection.handle(.sendFailed)) }
+        if failed || !writer.lengthMatches { return ending(connection.handle(.responseBodyFailed)) }
+        if framing == .chunked { HTTP1ChunkedEncoder.appendLastChunk(into: &output) }
+        return nil
     }
 
     // MARK: Actions

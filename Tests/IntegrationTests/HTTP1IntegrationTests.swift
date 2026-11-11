@@ -64,6 +64,46 @@ import Testing
         #expect(try await serve.waitForExit(timeout: .seconds(5)) == 0, "stderr: \(serve.stderr)")
     }
 
+    /// #0081: `curl --data-binary @file` to the serve echo handler gets the file back; a 3 MiB
+    /// body makes curl send `Expect: 100-continue`, so the 100 path runs over real TCP. The
+    /// same file uploaded with `curl -T` (PUT) reports its length.
+    @Test(.timeLimit(.minutes(1)))
+    func curlPostEchoesAFile() async throws {
+        let directory = FileManager.default.temporaryDirectory
+        let tag = UInt64.random(in: 0...UInt64.max)
+        let input = directory.appending(path: "sws-echo-in-\(tag).bin")
+        let output = directory.appending(path: "sws-echo-out-\(tag).bin")
+        defer {
+            try? FileManager.default.removeItem(at: input)
+            try? FileManager.default.removeItem(at: output)
+        }
+        var generator = SystemRandomNumberGenerator()
+        let content = Data((0..<(3 * 1024 * 1024)).map { _ in UInt8.random(in: 0...255, using: &generator) })
+        try content.write(to: input)
+
+        let serve = try ChildProcess.launch(["serve", "--port", "0", "--drain-timeout", "0.5"])
+        defer { serve.kill() }
+        let port = try await serve.listeningPort()
+        let url = "http://127.0.0.1:\(port)/echo"
+
+        let (status, log) = try await runCurl(["-sS", "-v", "--max-time", "20", "--data-binary", "@\(input.path)",
+                                               "-H", "Content-Type: application/octet-stream",
+                                               "-o", output.path, url])
+        #expect(status == 0, "\(log)")
+        #expect(log.contains("HTTP/1.1 100 Continue"), "curl did not get 100 Continue:\n\(log)")
+        #expect(log.contains("HTTP/1.1 200 OK"), "\(log)")
+        let echoed = try Data(contentsOf: output)
+        #expect(echoed.count == content.count)
+        #expect(echoed == content)
+
+        let (putStatus, putOutput) = try await runCurl(["-sS", "--max-time", "20", "-T", input.path, url])
+        #expect(putStatus == 0, "\(putOutput)")
+        #expect(putOutput == "\(content.count)\n")
+
+        serve.signal(SIGTERM)
+        #expect(try await serve.waitForExit(timeout: .seconds(5)) == 0, "stderr: \(serve.stderr)")
+    }
+
     /// Runs `/usr/bin/curl` with a deadline and returns its status and combined output.
     func runCurl(_ arguments: [String]) async throws -> (Int32, String) {
         let process = Process()
