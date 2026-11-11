@@ -144,7 +144,8 @@ enum ServeCommand {
         }
         let server = Server(configuration: configuration, listeners: [listener],
                             protocols: [HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))],
-                            handler: HelloHandler(bodySize: settings.bodySize, maxBodySize: settings.maxBodySize))
+                            handler: ServeHandler(hello: HelloHandler(bodySize: settings.bodySize),
+                                                 maxBodySize: settings.maxBodySize))
 
         // Ignore the default actions first, so a signal is never fatal, then route both to a
         // graceful shutdown. The sources are kept alive until the server stops (#0003).
@@ -192,15 +193,13 @@ func describe(_ error: any Error) -> String {
     return "\(error)"
 }
 
-/// Answers `POST` with its body (echo), `PUT` with its body's length, and every other request
-/// with one prebuilt `200 text/plain` response. Returning a copy of a stored response retains
-/// its buffers and allocates nothing.
+/// Answers every request with one prebuilt `200 text/plain` response. Returning a copy of a
+/// stored response retains its buffers and allocates nothing. `sws-bench h1conn` measures the
+/// connection loop with it, so it stays free of suspension points.
 struct HelloHandler: HTTPHandler {
     let response: HTTPResponse
-    let maxBodySize: Int
 
-    init(bodySize: Int? = nil, maxBodySize: Int = HTTP1Configuration.defaultMaxBodySize) {
-        self.maxBodySize = maxBodySize
+    init(bodySize: Int? = nil) {
         var body = ByteBuffer()
         if let bodySize {
             body.append(contentsOf: repeatElement(UInt8(ascii: "x"), count: bodySize))
@@ -213,22 +212,39 @@ struct HelloHandler: HTTPHandler {
     }
 
     func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse {
+        response
+    }
+}
+
+/// The `serve` handler (#0081): `POST` gets its body echoed back (collected up to
+/// `maxBodySize`), `PUT` gets its body's length (read chunk by chunk, so memory stays at one
+/// receive whatever the size), and everything else goes to ``HelloHandler``.
+struct ServeHandler: HTTPHandler {
+    let hello: HelloHandler
+    let maxBodySize: Int
+
+    func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse {
         switch request.method {
-        case .post:
-            var headers = HTTPFields()
-            headers.append(.contentType, "application/octet-stream")
-            return HTTPResponse(status: .ok, headers: headers, body: .bytes(try await request.body.collect(upTo: maxBodySize)))
-        case .put:
-            var length = 0
-            for try await chunk in request.body { length += chunk.readableBytes }
-            var body = ByteBuffer()
-            body.append(decimal: length)
-            body.append("\n")
-            var headers = HTTPFields()
-            headers.append(.contentType, "text/plain; charset=utf-8")
-            return HTTPResponse(status: .ok, headers: headers, body: .bytes(body))
-        default:
-            return response
+        case .post: try await echo(request)
+        case .put: try await length(request)
+        default: try await hello.handle(request, context: context)
         }
+    }
+
+    func echo(_ request: HTTPRequest) async throws -> HTTPResponse {
+        var headers = HTTPFields()
+        headers.append(.contentType, "application/octet-stream")
+        return HTTPResponse(status: .ok, headers: headers, body: .bytes(try await request.body.collect(upTo: maxBodySize)))
+    }
+
+    func length(_ request: HTTPRequest) async throws -> HTTPResponse {
+        var length = 0
+        for try await chunk in request.body { length += chunk.readableBytes }
+        var body = ByteBuffer()
+        body.append(decimal: length)
+        body.append("\n")
+        var headers = HTTPFields()
+        headers.append(.contentType, "text/plain; charset=utf-8")
+        return HTTPResponse(status: .ok, headers: headers, body: .bytes(body))
     }
 }
