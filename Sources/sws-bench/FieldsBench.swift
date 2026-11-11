@@ -1,28 +1,30 @@
-import Darwin
 import HTTPCore
-import Synchronization
 
-/// HTTPFields / HTTPFieldName microbenchmarks (issue #0074). Not wired into `main` yet; the
-/// harness calls `runFieldsBenchmarks()` and reports the results.
+/// HTTPFields / HTTPFieldName microbenchmarks (issue #0074). Select with
+/// `sws-bench micro --filter fields`.
 ///
 /// Each benchmark reuses one `HTTPRequestStorage` the way a connection does, so the steady
-/// state is the hot path. `allocationsPerOp` comes from a `malloc_logger` hook (see
-/// `FieldsAllocationCounter`); it is `nil` when the hook is unavailable. Once the shared
-/// harness (#0070) lands, switch to its allocation counter.
-func runFieldsBenchmarks(iterations: Int = 1_000_000) -> [(name: String, nanosecondsPerOp: Double, allocationsPerOp: Double?)] {
+/// state is the hot path; the harness reports ns/op and allocations/op (target: 0).
+func registerFieldsBenchmarks() {
     let fixture = FieldsFixture()
-    return [
-        measureFields("fields.fill+clear 10-header request", iterations: iterations / 10, fixture.fillAndClear),
-        measureFields("fields.scan+hash+fill 10-header request", iterations: iterations / 10, fixture.scanAndFill),
-        measureFields("fieldname.lookup(hash:) well-known", iterations: iterations, fixture.lookupWellKnown),
-        measureFields("fieldname.lookup(hash:) unknown", iterations: iterations, fixture.lookupUnknown),
-        measureFields("fields.firstValue(for: .host)", iterations: iterations, fixture.firstValueHost),
-        measureFields("fields.contains(.contentLength) miss", iterations: iterations, fixture.containsMiss),
-        measureFields("fields.contentLength()", iterations: iterations, fixture.contentLength),
-        measureFields("method.parse GET", iterations: iterations, fixture.parseMethod),
-        measureFields("status.appendHTTP1StatusLine 200", iterations: iterations, fixture.statusLine),
-        measureFields("httpfields.append 5 static + removeAll", iterations: iterations / 5, fixture.responseFields),
-    ]
+    var i = 0
+    func register(_ name: String, _ body: @escaping (FieldsFixture) -> (Int) -> UInt64) {
+        let op = body(fixture)
+        Benchmark.register(name: name) {
+            blackHole(op(i))
+            i &+= 1
+        }
+    }
+    register("fields.fill+clear 10-header request", FieldsFixture.fillAndClear)
+    register("fields.scan+hash+fill 10-header request", FieldsFixture.scanAndFill)
+    register("fields.lookupWellKnown", FieldsFixture.lookupWellKnown)
+    register("fields.lookupUnknown", FieldsFixture.lookupUnknown)
+    register("fields.firstValue(host)", FieldsFixture.firstValueHost)
+    register("fields.containsMiss", FieldsFixture.containsMiss)
+    register("fields.contentLength", FieldsFixture.contentLength)
+    register("fields.methodParseGET", FieldsFixture.parseMethod)
+    register("fields.statusLine200", FieldsFixture.statusLine)
+    register("fields.response 5 static + removeAll", FieldsFixture.responseFields)
 }
 
 /// A typical browser request head plus reusable storage.
@@ -142,55 +144,4 @@ private final class FieldsFixture {
         response.append(.vary, "accept-encoding")
         return UInt64(response.count)
     }
-}
-
-/// Runs `body` `iterations` times and returns nanoseconds and allocations per call.
-private func measureFields(
-    _ name: String, iterations: Int, _ body: (Int) -> UInt64
-) -> (name: String, nanosecondsPerOp: Double, allocationsPerOp: Double?) {
-    var sink: UInt64 = 0
-    for i in 0..<min(iterations, 10_000) { sink &+= body(i) }   // warm up
-    let allocations = FieldsAllocationCounter.count {
-        for i in 0..<1_000 { sink &+= body(i) }
-    }
-    let clock = ContinuousClock()
-    let start = clock.now
-    for i in 0..<iterations { sink &+= body(i) }
-    let elapsed = start.duration(to: clock.now)
-    fieldsBlackHole(sink)
-    let (seconds, attoseconds) = elapsed.components
-    let nanoseconds = Double(seconds) * 1e9 + Double(attoseconds) / 1e9
-    return (name, nanoseconds / Double(iterations), allocations.map { Double($0) / 1_000 })
-}
-
-@inline(never)
-private func fieldsBlackHole(_ value: UInt64) {
-    if value == 0x5EED_5EED_5EED_5EED { print("") }
-}
-
-/// Counts heap allocations through libmalloc's exported `malloc_logger` hook, which it calls
-/// on every allocation when set. Private to this file so it does not clash with the shared
-/// harness counter.
-private enum FieldsAllocationCounter {
-    typealias Logger = @convention(c) (UInt32, UInt, UInt, UInt, UInt, UInt32) -> Void
-
-    nonisolated(unsafe) static let slot: UnsafeMutablePointer<Logger?>? = {
-        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "malloc_logger") else { return nil }
-        return symbol.assumingMemoryBound(to: Logger?.self)
-    }()
-
-    static func count(_ body: () -> Void) -> Int? {
-        guard let slot, slot.pointee == nil else { return nil }
-        let start = fieldsAllocationEvents.load(ordering: .relaxed)
-        slot.pointee = fieldsCountingLogger
-        body()
-        slot.pointee = nil
-        return fieldsAllocationEvents.load(ordering: .relaxed) - start
-    }
-}
-
-private let fieldsAllocationEvents = Atomic<Int>(0)
-
-private let fieldsCountingLogger: FieldsAllocationCounter.Logger = { type, _, _, _, _, _ in
-    if type & 0x2 != 0 { fieldsAllocationEvents.add(1, ordering: .relaxed) }   // MALLOC_LOG_TYPE_ALLOCATE
 }

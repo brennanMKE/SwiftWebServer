@@ -7,6 +7,7 @@
 /// `--filter` can select a target's benchmarks.
 func registerAllBenchmarks() {
     registerHarnessBenchmarks()
+    registerFieldsBenchmarks()   // M1.2: FieldsBench.swift
     registerSelfTimedSuites()
 }
 
