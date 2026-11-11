@@ -241,6 +241,46 @@ import Testing
         await listener.close()
     }
 
+    /// `sendFile` of an offset region (8 MiB, so the socket buffer fills and the sender waits
+    /// for writability): the peer gets exactly the region's bytes. BSD sockets use
+    /// `sendfile(2)` (#0084); Network.framework the bounded read loop. A region past the end of
+    /// the file throws `unexpectedEndOfFile`.
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func sendFileSendsTheRegion(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.sendFileSendsTheRegion(TCPListener.self)
+        case .bsd: try await Self.sendFileSendsTheRegion(BSDSocketListener.self)
+        }
+    }
+
+    static func sendFileSendsTheRegion<L: TestTCPListener>(_: L.Type) async throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "sws-sendfile-\(UInt64.random(in: 0...UInt64.max)).bin")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let size = 8 * 1024 * 1024
+        let content = (0..<size).map { UInt8(truncatingIfNeeded: $0 &* 7 &+ $0 >> 13) }
+        try Data(content).write(to: url)
+        let file = try OwnedFileDescriptor.openForReading(path: url.path)
+
+        let listener = try await L.makeStarted(limit: 64)
+        async let accepted = accept(listener)
+        let client = try await L.Transport.testConnect(port: listener.port)
+        let server = try await accepted
+        let offset = 12_345
+        let length = size - offset - 999
+        async let received = receive(client, exactly: length)
+        try await server.sendFile(FileRegion(file: file, offset: Int64(offset), length: Int64(length)))
+        let bytes = try await received
+        #expect(bytes.readableBytes == length)
+        #expect(bytes.withUnsafeReadableBytes { Array($0) } == Array(content[offset..<(offset + length)]))
+
+        await #expect(throws: TransportError.unexpectedEndOfFile) {
+            try await server.sendFile(FileRegion(file: file, offset: Int64(size - 10), length: 20))
+        }
+        await client.close(.abort)
+        await server.close(.normal)
+        await listener.close()
+    }
+
     static func echoRoundTripBetweenTwoTransports<L: TestTCPListener>(_: L.Type) async throws {
         let listener = try await L.makeStarted(limit: 64)
         async let accepted = accept(listener)
