@@ -35,6 +35,7 @@ If a prompt was triggered, report it to the orchestrator: what ran, what the pro
 ## Other unattended-run rules
 
 - Every server, client, and test must have a timeout. Swift Testing: `@Test(.timeLimit(.minutes(1)))` on anything that does I/O.
-- Never leave background processes running. Kill servers you start; prefer port 0 to avoid colliding with other agents.
+- Never leave background processes running. Kill every server or client you start, and before reporting back run `pgrep -fl "$PWD/.build"`: it must print nothing. Orphaned legacy servers once spun a dozen CPUs for 40 minutes after their agent finished. Prefer port 0 to avoid colliding with other agents.
 - Other agents work in parallel worktrees: never bind fixed ports (8080, 8443) in tests, never write outside your worktree except `$TMPDIR`.
+- **This Mac is the owner's workstation, so keep the load light.** At most 3 agents run at once. Build with `swift build -j 2`. While iterating, test only your target: `swift test -j 2 --filter <Target>Tests`. Run the full `swift test -j 2` once, before reporting. Avoid release builds unless the issue needs benchmark numbers. Never run load benchmarks while other agents are building; the orchestrator runs gating benchmarks at milestone end. Record the load average with every benchmark result.
 - No interactive commands (`git rebase -i`, editors, pagers): use `--no-pager`, `-y`, `GIT_EDITOR=true`.
