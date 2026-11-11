@@ -67,7 +67,26 @@ built, what Network.framework does underneath it, and what one round trip costs 
    stops handing over connections when the limit reaches 0. It was not used: what happens to
    connections that arrive while the limit is 0 is undocumented, and the explicit
    cancel-beyond-bound behaviour is what the issue asks for and is testable. Worth trying in
-   #0079 if accept storms matter.
+   #0079 if accept storms matter. (#0113: not tried. The profile puts the cost inside NW's own
+   accept handling, `nw_listener_inbox_socket_handle_new_socket`, not in the hand-over to our
+   handler, so limiting hand-overs is not expected to shorten it.)
+8. **Accepting a connection is expensive, serialized, and gets slower with every new peer
+   (#0113).** All Network.framework work for the process runs on one serial queue,
+   `com.apple.network.connections`; our per-connection queues barely appear in a `sample`. In
+   a new-connection-per-request load (16 clients, release build), 86% of samples were on that
+   queue, mostly in `nw_listener_inbox_socket_handle_new_socket` →
+   `nw_context_copy_registered_endpoint` → `nw_hash_table_get_node` → `nw_endpoint_is_equal`.
+   NW creates an `nw_association` (with a path evaluator, parameters, and endpoints) for every
+   distinct remote endpoint. It keeps the association for about 60 s after the connection
+   closes (`heap` showed 10,586 of them after about 10,600 connections, and the count fell all
+   at once roughly 60 s later), and the endpoint lookup slows down as that table grows. In
+   back-to-back rounds of 4,000 connections, the rate fell from about 4,000/s to 800–1,400/s,
+   then 300–1,400/s. Measured costs: about 665 µs of CPU and about 410 allocations per
+   connection, a 2.5 ms p50 from `connect` returning to `newConnectionHandler`, and another
+   2.4 ms to `.ready`. None of the public knobs changed this: a shared pool of 8 serial queues,
+   a private `NWParameters.PrivacyContext` (with or without `disableLogging()`), and periodic
+   `flushCache()` all stayed within noise. Cleartext TCP can therefore use
+   `BSDSocketListener` (POSIX sockets + kqueue) instead; see `docs/benchmarks/M3-accept.md`.
 
 ## Measurements
 

@@ -129,6 +129,12 @@ public final class TCPTransport: ByteStreamTransport {
     /// Addresses of the connection, captured when it became ready.
     public var info: ConnectionInfo { core.state.withLock { $0.info } }
 
+    /// When the listener handed this connection over and when it became ready, in
+    /// `CLOCK_UPTIME_RAW` nanoseconds (zero for outbound connections). For `sws-bench accept`.
+    @_spi(Benchmark) public var acceptTimestamps: (handedOver: UInt64, ready: UInt64) {
+        core.state.withLock { ($0.handedOverAt, $0.readyAt) }
+    }
+
     /// The last viability reported by Network.framework (false while the path is unusable).
     public var isViable: Bool { core.state.withLock { $0.isViable } }
 
@@ -257,6 +263,10 @@ extension TCPTransport {
             var didCancel = false
             var cancelWaiters: [UnsafeContinuation<Void, Never>] = []
             var onSettled: (@Sendable (Bool) -> Void)?
+            /// `CLOCK_UPTIME_RAW` nanoseconds when the listener handed the connection over, and
+            /// when it became ready (#0113, `sws-bench accept`). Zero when not recorded.
+            var handedOverAt: UInt64 = 0
+            var readyAt: UInt64 = 0
         }
 
         let state: Mutex<State>
@@ -427,6 +437,7 @@ extension TCPTransport {
                     guard case .setup = state.phase else { return (nil, nil) as (UnsafeContinuation<Void, any Error>?, (@Sendable (Bool) -> Void)?) }
                     state.phase = .ready
                     state.info = info
+                    state.readyAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                     defer { state.readyWaiter = nil; state.onSettled = nil }
                     return (state.readyWaiter, state.onSettled)
                 }

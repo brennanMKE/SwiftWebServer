@@ -19,6 +19,7 @@ Swift 6, macOS 15+, Network.framework, zero package dependencies. This document 
 | Server push (0066) | Dropped: browsers no longer accept it | wontfix (owner, 2026-11-11) |
 | h2c `Upgrade` (0068) | Dropped: removed by RFC 9113 | wontfix (owner, 2026-11-11) |
 | `DispatchQueue` | Allowed only where `NWListener`/`NWConnection.start(queue:)` require it (NetworkTransport target) and for signal sources in the executable | Accepted |
+| Cleartext TCP transport | BSD sockets + kqueue (`BSDSocketTransport`) by default; Network.framework `TCPListener` stays selectable. TLS and QUIC stay on Network.framework | Decided 2026-11-11 (#0113): NW accept cost is about 665 µs and 409 allocations per connection, serialized on one queue; BSD gets about 22k new connections/s, on par with nginx |
 | Actors | None on the request path. Shared HTTP/2 connection state uses `Mutex` (Synchronization) with non-suspending critical sections | Accepted |
 
 ## 3. Critical review of the legacy code

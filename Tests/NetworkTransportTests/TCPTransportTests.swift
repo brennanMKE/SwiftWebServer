@@ -6,271 +6,128 @@ import NetworkTransport
 import Synchronization
 import Testing
 
-/// Socket tests for the TCP adapter (#0078). Every listener binds 127.0.0.1 port 0, and every
-/// test has a time limit (AGENTS.md). Run through `scripts/guarded.sh`.
+/// Socket tests for the TCP adapters: Network.framework (#0078) and BSD sockets (#0113). Every
+/// shared test runs against both. Every listener binds 127.0.0.1 port 0, and every test has a
+/// time limit (AGENTS.md). Run through `scripts/guarded.sh`.
 @Suite struct TCPTransportTests {
-    @Test(.timeLimit(.minutes(1)))
-    func listenerBindsLoopbackOnPortZeroAndReportsPort() async throws {
-        let listener = try await makeListener()
-        #expect(listener.port != 0)
-        #expect(listener.localAddress == TransportAddress(host: "127.0.0.1", port: listener.port))
-        await listener.close()
-        await listener.close()   // idempotent
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func listenerBindsLoopbackOnPortZeroAndReportsPort(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.listenerBindsLoopbackOnPortZeroAndReportsPort(TCPListener.self)
+        case .bsd: try await Self.listenerBindsLoopbackOnPortZeroAndReportsPort(BSDSocketListener.self)
+        }
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func echoRoundTripWithNWConnectionClient() async throws {
-        let listener = try await makeListener()
-        let client = RawClient(port: listener.port)
-        try await client.start()
-        let server = try await accept(listener)
-
-        try await client.send(Array("hello".utf8))
-        let received = try await receive(server, exactly: 5)
-        #expect(received.bytes == Array("hello".utf8))
-        try await server.send(received, endOfStream: false)
-        #expect(await client.receive(exactly: 5) == Array("hello".utf8))
-
-        // ConnectionInfo carries both addresses.
-        #expect(server.info.localAddress == TransportAddress(host: "127.0.0.1", port: listener.port))
-        #expect(server.info.remoteAddress?.host == "127.0.0.1")
-        #expect(server.info.remoteAddress?.port != 0)
-        #expect(server.info.isSecure == false)
-
-        client.cancel()
-        await server.close(.normal)
-        await listener.close()
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func echoRoundTripWithNWConnectionClient(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.echoRoundTripWithNWConnectionClient(TCPListener.self)
+        case .bsd: try await Self.echoRoundTripWithNWConnectionClient(BSDSocketListener.self)
+        }
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func echoRoundTripBetweenTwoTransports() async throws {
-        let listener = try await makeListener()
-        async let accepted = accept(listener)
-        let client = try await TCPTransport.connect(host: "127.0.0.1", port: listener.port)
-        let server = try await accepted
-        #expect(client.info.remoteAddress == server.info.localAddress)
-        #expect(client.info.localAddress == server.info.remoteAddress)
-
-        for round in 0..<100 {
-            var message = ByteBuffer()
-            message.append(decimal: round)
-            try await client.send(message, endOfStream: false)
-            let echoed = try await receive(server, exactly: message.readableBytes)
-            try await server.send(echoed, endOfStream: false)
-            #expect(try await receive(client, exactly: message.readableBytes) == message)
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func echoRoundTripBetweenTwoTransports(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.echoRoundTripBetweenTwoTransports(TCPListener.self)
+        case .bsd: try await Self.echoRoundTripBetweenTwoTransports(BSDSocketListener.self)
         }
-        await client.close(.normal)
-        #expect(try await receive(server, exactly: 1).readableBytes == 0)   // FIN reached the server
-        await server.close(.normal)
-        await listener.close()
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func peerEndOfStreamReturnsZeroAndIsSticky() async throws {
-        let listener = try await makeListener()
-        let client = RawClient(port: listener.port)
-        try await client.start()
-        let server = try await accept(listener)
-
-        try await client.send(Array("abc".utf8), final: true)
-        #expect(try await receive(server, exactly: 3).bytes == Array("abc".utf8))
-        var buffer = ByteBuffer()
-        #expect(try await server.receive(into: &buffer, maxLength: 16) == 0)
-        #expect(try await server.receive(into: &buffer, maxLength: 16) == 0)
-
-        // Half-close: the server can still answer, then finish its side.
-        try await server.send(ByteBuffer("ok"), endOfStream: true)
-        await #expect(throws: TransportError.outputShutdown) {
-            try await server.send(ByteBuffer("x"), endOfStream: false)
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func peerEndOfStreamReturnsZeroAndIsSticky(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.peerEndOfStreamReturnsZeroAndIsSticky(TCPListener.self)
+        case .bsd: try await Self.peerEndOfStreamReturnsZeroAndIsSticky(BSDSocketListener.self)
         }
-        var got: [UInt8] = []
-        var complete = false
-        while !complete {
-            let (bytes, isComplete, error) = await client.receive()
-            got += bytes
-            complete = isComplete || error != nil
-        }
-        #expect(got == Array("ok".utf8))
-
-        client.cancel()
-        await server.close(.normal)
-        await listener.close()
     }
 
     /// 100 MiB from a client to a server that does not read for a while: the client's sends
     /// stall instead of the bytes piling up in memory (no eager receive pump), then the server
     /// reads everything after the client's graceful close.
-    @Test(.timeLimit(.minutes(1)))
-    func largeTransferAppliesBackpressure() async throws {
-        let listener = try await makeListener()
-        async let accepted = accept(listener)
-        let client = try await TCPTransport.connect(host: "127.0.0.1", port: listener.port)
-        let server = try await accepted
-
-        let total = 100 * 1024 * 1024
-        let chunkSize = 64 * 1024
-        var chunk = ByteBuffer(capacity: chunkSize)
-        for i in 0..<chunkSize { chunk.append(UInt8(truncatingIfNeeded: i &* 31)) }
-        let payload = chunk
-        let acceptedBytes = Counter()
-
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                var sent = 0
-                while sent < total {
-                    try await client.send(payload, endOfStream: false)
-                    sent += chunkSize
-                    acceptedBytes.value.store(sent, ordering: .relaxed)
-                }
-                await client.close(.normal)
-            }
-
-            // The server reads nothing: the sender must stall well short of 100 MiB.
-            try await Task.sleep(for: .milliseconds(500))
-            let first = acceptedBytes.value.load(ordering: .relaxed)
-            try await Task.sleep(for: .milliseconds(300))
-            let stalled = acceptedBytes.value.load(ordering: .relaxed)
-            #expect(stalled == first, "sender kept making progress while nobody read")
-            #expect(stalled < 32 * 1024 * 1024, "accepted \(stalled) bytes with no reader")
-            print("TCPTransport backpressure: \(stalled) bytes accepted before the reader started")
-
-            var buffer = ByteBuffer(capacity: 256 * 1024)
-            var received = 0
-            var checksum: UInt64 = 0
-            while true {
-                buffer.clear()
-                let n = try await server.receive(into: &buffer, maxLength: 256 * 1024)
-                if n == 0 { break }
-                #expect(n <= 256 * 1024)
-                buffer.withUnsafeReadableBytes { raw in
-                    for byte in raw { checksum = checksum &* 31 &+ UInt64(byte) }
-                }
-                received += n
-            }
-            #expect(received == total)
-            var expected: UInt64 = 0
-            for _ in 0..<(total / chunkSize) {
-                chunk.withUnsafeReadableBytes { raw in
-                    for byte in raw { expected = expected &* 31 &+ UInt64(byte) }
-                }
-            }
-            #expect(checksum == expected)
-            try await group.waitForAll()
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func largeTransferAppliesBackpressure(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.largeTransferAppliesBackpressure(TCPListener.self)
+        case .bsd: try await Self.largeTransferAppliesBackpressure(BSDSocketListener.self)
         }
-        await server.close(.normal)
-        await listener.close()
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func abortiveCloseResetsThePeer() async throws {
-        let listener = try await makeListener()
-        async let accepted = accept(listener)
-        let client = try await TCPTransport.connect(host: "127.0.0.1", port: listener.port)
-        let server = try await accepted
-
-        try await server.send(ByteBuffer("unsent?"), endOfStream: false)
-        await server.close(.abort)
-        await #expect(throws: TransportError.closed) {
-            try await server.send(ByteBuffer("x"), endOfStream: false)
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func abortiveCloseResetsThePeer(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.abortiveCloseResetsThePeer(TCPListener.self)
+        case .bsd: try await Self.abortiveCloseResetsThePeer(BSDSocketListener.self)
         }
-        await #expect(throws: TransportError.closed) {
-            var buffer = ByteBuffer()
-            _ = try await server.receive(into: &buffer, maxLength: 1)
-        }
-
-        // The peer sees a reset, never a clean end of stream.
-        var buffer = ByteBuffer()
-        var outcome: Result<Int, any Error> = .success(1)
-        while case .success(let n) = outcome, n > 0 {
-            do { outcome = .success(try await client.receive(into: &buffer, maxLength: 1024)) }
-            catch { outcome = .failure(error) }
-        }
-        guard case .failure(let error) = outcome else {
-            Issue.record("abort looked like a graceful close")
-            return
-        }
-        #expect(error as? TransportError == .connectionReset)
-        await client.close(.normal)
-        await listener.close()
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func cancellingAPendingReceiveThrowsAndClosesTheConnection() async throws {
-        let listener = try await makeListener()
-        let client = RawClient(port: listener.port)
-        try await client.start()
-        let server = try await accept(listener)
-
-        let task = Task {
-            var buffer = ByteBuffer()
-            return try await server.receive(into: &buffer, maxLength: 1024)
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func cancellingAPendingReceiveThrowsAndClosesTheConnection(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.cancellingAPendingReceiveThrowsAndClosesTheConnection(TCPListener.self)
+        case .bsd: try await Self.cancellingAPendingReceiveThrowsAndClosesTheConnection(BSDSocketListener.self)
         }
-        try await Task.sleep(for: .milliseconds(100))
-        let clock = ContinuousClock()
-        let start = clock.now
-        task.cancel()
-        await #expect(throws: CancellationError.self) { try await task.value }
-        #expect(start.duration(to: clock.now) < .seconds(1))
-
-        // The connection is gone: later calls fail and the peer sees the close.
-        await #expect(throws: TransportError.closed) {
-            var buffer = ByteBuffer()
-            _ = try await server.receive(into: &buffer, maxLength: 1)
-        }
-        let (_, isComplete, error) = await client.receive()
-        #expect(isComplete || error != nil)
-
-        await server.close(.normal)   // still safe after the cancellation
-        client.cancel()
-        await listener.close()
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func secondConcurrentReceiveIsRejected() async throws {
-        let listener = try await makeListener()
-        let client = RawClient(port: listener.port)
-        try await client.start()
-        let server = try await accept(listener)
-
-        try await withThrowingTaskGroup(of: Int.self) { group in
-            group.addTask {
-                var buffer = ByteBuffer()
-                return try await server.receive(into: &buffer, maxLength: 8)
-            }
-            try await Task.sleep(for: .milliseconds(50))
-            await #expect(throws: TransportError.receiveAlreadyPending) {
-                var buffer = ByteBuffer()
-                _ = try await server.receive(into: &buffer, maxLength: 8)
-            }
-            try await client.send([1, 2, 3])
-            #expect(try await group.next() == 3)
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func secondConcurrentReceiveIsRejected(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.secondConcurrentReceiveIsRejected(TCPListener.self)
+        case .bsd: try await Self.secondConcurrentReceiveIsRejected(BSDSocketListener.self)
         }
-        client.cancel()
-        await server.close(.normal)
-        await listener.close()
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func closeFailsAReceiveInProgress() async throws {
-        let listener = try await makeListener()
-        let client = RawClient(port: listener.port)
-        try await client.start()
-        let server = try await accept(listener)
-
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                await #expect(throws: TransportError.closed) {
-                    var buffer = ByteBuffer()
-                    _ = try await server.receive(into: &buffer, maxLength: 8)
-                }
-            }
-            try await Task.sleep(for: .milliseconds(50))
-            await server.close(.normal)
-            try await group.waitForAll()
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func closeFailsAReceiveInProgress(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.closeFailsAReceiveInProgress(TCPListener.self)
+        case .bsd: try await Self.closeFailsAReceiveInProgress(BSDSocketListener.self)
         }
-        client.cancel()
-        await listener.close()
     }
+
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func twoListenersInOneProcess(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.twoListenersInOneProcess(TCPListener.self)
+        case .bsd: try await Self.twoListenersInOneProcess(BSDSocketListener.self)
+        }
+    }
+
+    /// The state handler is installed before `start`, so a connection that never becomes
+    /// ready reports its failure instead of hanging (#0010).
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func connectionThatFailsBeforeReadyReportsTheFailure(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.connectionThatFailsBeforeReadyReportsTheFailure(TCPListener.self)
+        case .bsd: try await Self.connectionThatFailsBeforeReadyReportsTheFailure(BSDSocketListener.self)
+        }
+    }
+
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func closingTheListenerEndsTheConnectionSequence(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.closingTheListenerEndsTheConnectionSequence(TCPListener.self)
+        case .bsd: try await Self.closingTheListenerEndsTheConnectionSequence(BSDSocketListener.self)
+        }
+    }
+
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func cancellingAcceptThrowsCancellation(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.cancellingAcceptThrowsCancellation(TCPListener.self)
+        case .bsd: try await Self.cancellingAcceptThrowsCancellation(BSDSocketListener.self)
+        }
+    }
+
+    @Test(.timeLimit(.minutes(1)), arguments: TCPKind.allCases)
+    func servesCurl(_ kind: TCPKind) async throws {
+        switch kind {
+        case .nw: try await Self.servesCurl(TCPListener.self)
+        case .bsd: try await Self.servesCurl(BSDSocketListener.self)
+        }
+    }
+
+    // MARK: Adapter-specific
 
     /// Accepted connections beyond `pendingConnectionLimit` are cancelled, not buffered.
     @Test(.timeLimit(.minutes(1)))
@@ -316,15 +173,302 @@ import Testing
         await listener.close()
     }
 
+    /// The BSD listener accepts only when asked: connections the kernel completed wait in the
+    /// listen backlog (the bound), and nothing is taken until `next()` is called.
     @Test(.timeLimit(.minutes(1)))
-    func twoListenersInOneProcess() async throws {
-        let first = try await makeListener()
-        let second = try await makeListener()
+    func bsdListenerAcceptsOnlyOnDemand() async throws {
+        let listener = try await BSDSocketListener.makeStarted(limit: 8)
+        var clients: [RawClient] = []
+        for _ in 0..<3 {
+            let client = RawClient(port: listener.port)
+            try await client.start()   // the kernel completes the handshake from the backlog
+            clients.append(client)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(listener.acceptedConnectionCount == 0)
+
+        var iterator = listener.connections.makeAsyncIterator()
+        var servers: [BSDSocketTransport] = []
+        for (index, client) in clients.enumerated() {
+            let server = try #require(try await iterator.next())
+            #expect(listener.acceptedConnectionCount == index + 1)
+            #expect(server.info.localAddress == listener.localAddress)
+            #expect(server.info.remoteAddress?.host == "127.0.0.1")
+            servers.append(server)
+            try await client.send([UInt8(index)])
+        }
+        // Each server reads exactly its client's byte (accept order is completion order).
+        var got: Set<UInt8> = []
+        for server in servers { got.formUnion(try await receive(server, exactly: 1).bytes) }
+        #expect(got == [0, 1, 2])
+
+        for client in clients { client.cancel() }
+        for server in servers { await server.close(.normal) }
+        await listener.close()
+        #expect(try await iterator.next() == nil)
+    }
+
+    // MARK: Shared bodies (run against both adapters)
+
+    static func listenerBindsLoopbackOnPortZeroAndReportsPort<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        #expect(listener.port != 0)
+        #expect(listener.localAddress == TransportAddress(host: "127.0.0.1", port: listener.port))
+        await listener.close()
+        await listener.close()   // idempotent
+    }
+
+    static func echoRoundTripWithNWConnectionClient<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        let client = RawClient(port: listener.port)
+        try await client.start()
+        let server = try await accept(listener)
+
+        try await client.send(Array("hello".utf8))
+        let received = try await receive(server, exactly: 5)
+        #expect(received.bytes == Array("hello".utf8))
+        try await server.send(received, endOfStream: false)
+        #expect(await client.receive(exactly: 5) == Array("hello".utf8))
+
+        // ConnectionInfo carries both addresses.
+        #expect(server.info.localAddress == TransportAddress(host: "127.0.0.1", port: listener.port))
+        #expect(server.info.remoteAddress?.host == "127.0.0.1")
+        #expect(server.info.remoteAddress?.port != 0)
+        #expect(server.info.isSecure == false)
+
+        client.cancel()
+        await server.close(.normal)
+        await listener.close()
+    }
+
+    static func echoRoundTripBetweenTwoTransports<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        async let accepted = accept(listener)
+        let client = try await L.Transport.testConnect(port: listener.port)
+        let server = try await accepted
+        #expect(client.info.remoteAddress == server.info.localAddress)
+        #expect(client.info.localAddress == server.info.remoteAddress)
+
+        for round in 0..<100 {
+            var message = ByteBuffer()
+            message.append(decimal: round)
+            try await client.send(message, endOfStream: false)
+            let echoed = try await receive(server, exactly: message.readableBytes)
+            try await server.send(echoed, endOfStream: false)
+            #expect(try await receive(client, exactly: message.readableBytes) == message)
+        }
+        await client.close(.normal)
+        #expect(try await receive(server, exactly: 1).readableBytes == 0)   // FIN reached the server
+        await server.close(.normal)
+        await listener.close()
+    }
+
+    static func peerEndOfStreamReturnsZeroAndIsSticky<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        let client = RawClient(port: listener.port)
+        try await client.start()
+        let server = try await accept(listener)
+
+        try await client.send(Array("abc".utf8), final: true)
+        #expect(try await receive(server, exactly: 3).bytes == Array("abc".utf8))
+        var buffer = ByteBuffer()
+        #expect(try await server.receive(into: &buffer, maxLength: 16) == 0)
+        #expect(try await server.receive(into: &buffer, maxLength: 16) == 0)
+
+        // Half-close: the server can still answer, then finish its side.
+        try await server.send(ByteBuffer("ok"), endOfStream: true)
+        await #expect(throws: TransportError.outputShutdown) {
+            try await server.send(ByteBuffer("x"), endOfStream: false)
+        }
+        var got: [UInt8] = []
+        var complete = false
+        while !complete {
+            let (bytes, isComplete, error) = await client.receive()
+            got += bytes
+            complete = isComplete || error != nil
+        }
+        #expect(got == Array("ok".utf8))
+
+        client.cancel()
+        await server.close(.normal)
+        await listener.close()
+    }
+
+    static func largeTransferAppliesBackpressure<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        async let accepted = accept(listener)
+        let client = try await L.Transport.testConnect(port: listener.port)
+        let server = try await accepted
+
+        let total = 100 * 1024 * 1024
+        let chunkSize = 64 * 1024
+        var chunk = ByteBuffer(capacity: chunkSize)
+        for i in 0..<chunkSize { chunk.append(UInt8(truncatingIfNeeded: i &* 31)) }
+        let payload = chunk
+        let acceptedBytes = Counter()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                var sent = 0
+                while sent < total {
+                    try await client.send(payload, endOfStream: false)
+                    sent += chunkSize
+                    acceptedBytes.value.store(sent, ordering: .relaxed)
+                }
+                await client.close(.normal)
+            }
+
+            // The server reads nothing: the sender must stall well short of 100 MiB.
+            try await Task.sleep(for: .milliseconds(500))
+            let first = acceptedBytes.value.load(ordering: .relaxed)
+            try await Task.sleep(for: .milliseconds(300))
+            let stalled = acceptedBytes.value.load(ordering: .relaxed)
+            #expect(stalled == first, "sender kept making progress while nobody read")
+            #expect(stalled < 32 * 1024 * 1024, "accepted \(stalled) bytes with no reader")
+            print("\(L.self) backpressure: \(stalled) bytes accepted before the reader started")
+
+            var buffer = ByteBuffer(capacity: 256 * 1024)
+            var received = 0
+            var checksum: UInt64 = 0
+            while true {
+                buffer.clear()
+                let n = try await server.receive(into: &buffer, maxLength: 256 * 1024)
+                if n == 0 { break }
+                #expect(n <= 256 * 1024)
+                buffer.withUnsafeReadableBytes { raw in
+                    for byte in raw { checksum = checksum &* 31 &+ UInt64(byte) }
+                }
+                received += n
+            }
+            #expect(received == total)
+            var expected: UInt64 = 0
+            for _ in 0..<(total / chunkSize) {
+                chunk.withUnsafeReadableBytes { raw in
+                    for byte in raw { expected = expected &* 31 &+ UInt64(byte) }
+                }
+            }
+            #expect(checksum == expected)
+            try await group.waitForAll()
+        }
+        await server.close(.normal)
+        await listener.close()
+    }
+
+    static func abortiveCloseResetsThePeer<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        async let accepted = accept(listener)
+        let client = try await L.Transport.testConnect(port: listener.port)
+        let server = try await accepted
+
+        try await server.send(ByteBuffer("unsent?"), endOfStream: false)
+        await server.close(.abort)
+        await #expect(throws: TransportError.closed) {
+            try await server.send(ByteBuffer("x"), endOfStream: false)
+        }
+        await #expect(throws: TransportError.closed) {
+            var buffer = ByteBuffer()
+            _ = try await server.receive(into: &buffer, maxLength: 1)
+        }
+
+        // The peer sees a reset, never a clean end of stream.
+        var buffer = ByteBuffer()
+        var outcome: Result<Int, any Error> = .success(1)
+        while case .success(let n) = outcome, n > 0 {
+            do { outcome = .success(try await client.receive(into: &buffer, maxLength: 1024)) }
+            catch { outcome = .failure(error) }
+        }
+        guard case .failure(let error) = outcome else {
+            Issue.record("abort looked like a graceful close")
+            return
+        }
+        #expect(error as? TransportError == .connectionReset)
+        await client.close(.normal)
+        await listener.close()
+    }
+
+    static func cancellingAPendingReceiveThrowsAndClosesTheConnection<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        let client = RawClient(port: listener.port)
+        try await client.start()
+        let server = try await accept(listener)
+
+        let task = Task {
+            var buffer = ByteBuffer()
+            return try await server.receive(into: &buffer, maxLength: 1024)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let clock = ContinuousClock()
+        let start = clock.now
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(start.duration(to: clock.now) < .seconds(1))
+
+        // The connection is gone: later calls fail and the peer sees the close.
+        await #expect(throws: TransportError.closed) {
+            var buffer = ByteBuffer()
+            _ = try await server.receive(into: &buffer, maxLength: 1)
+        }
+        let (_, isComplete, error) = await client.receive()
+        #expect(isComplete || error != nil)
+
+        await server.close(.normal)   // still safe after the cancellation
+        client.cancel()
+        await listener.close()
+    }
+
+    static func secondConcurrentReceiveIsRejected<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        let client = RawClient(port: listener.port)
+        try await client.start()
+        let server = try await accept(listener)
+
+        try await withThrowingTaskGroup(of: Int.self) { group in
+            group.addTask {
+                var buffer = ByteBuffer()
+                return try await server.receive(into: &buffer, maxLength: 8)
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            await #expect(throws: TransportError.receiveAlreadyPending) {
+                var buffer = ByteBuffer()
+                _ = try await server.receive(into: &buffer, maxLength: 8)
+            }
+            try await client.send([1, 2, 3])
+            #expect(try await group.next() == 3)
+        }
+        client.cancel()
+        await server.close(.normal)
+        await listener.close()
+    }
+
+    static func closeFailsAReceiveInProgress<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        let client = RawClient(port: listener.port)
+        try await client.start()
+        let server = try await accept(listener)
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await #expect(throws: TransportError.closed) {
+                    var buffer = ByteBuffer()
+                    _ = try await server.receive(into: &buffer, maxLength: 8)
+                }
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            await server.close(.normal)
+            try await group.waitForAll()
+        }
+        client.cancel()
+        await listener.close()
+    }
+
+    static func twoListenersInOneProcess<L: TestTCPListener>(_: L.Type) async throws {
+        let first = try await L.makeStarted(limit: 64)
+        let second = try await L.makeStarted(limit: 64)
         #expect(first.port != second.port)
 
         for listener in [first, second] {
             async let accepted = accept(listener)
-            let client = try await TCPTransport.connect(host: "127.0.0.1", port: listener.port)
+            let client = try await L.Transport.testConnect(port: listener.port)
             let server = try await accepted
             var message = ByteBuffer()
             message.append(decimal: listener.port)
@@ -339,22 +483,18 @@ import Testing
         await second.close()
     }
 
-    /// The state handler is installed before `start`, so a connection that never becomes
-    /// ready reports its failure instead of hanging (#0010).
-    @Test(.timeLimit(.minutes(1)))
-    func connectionThatFailsBeforeReadyReportsTheFailure() async throws {
-        let listener = try await makeListener()
+    static func connectionThatFailsBeforeReadyReportsTheFailure<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
         let port = listener.port
         await listener.close()
         await #expect(throws: TransportError.self) {
-            _ = try await TCPTransport.connect(host: "127.0.0.1", port: port)
+            _ = try await L.Transport.testConnect(port: port)
         }
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func closingTheListenerEndsTheConnectionSequence() async throws {
-        let listener = try await makeListener()
-        try await withThrowingTaskGroup(of: TCPTransport?.self) { group in
+    static func closingTheListenerEndsTheConnectionSequence<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
+        try await withThrowingTaskGroup(of: L.Transport?.self) { group in
             group.addTask {
                 var iterator = listener.connections.makeAsyncIterator()
                 return try await iterator.next()
@@ -366,9 +506,8 @@ import Testing
         }
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func cancellingAcceptThrowsCancellation() async throws {
-        let listener = try await makeListener()
+    static func cancellingAcceptThrowsCancellation<L: TestTCPListener>(_: L.Type) async throws {
+        let listener = try await L.makeStarted(limit: 64)
         let task = Task {
             var iterator = listener.connections.makeAsyncIterator()
             return try await iterator.next()
@@ -379,11 +518,10 @@ import Testing
         await listener.close()
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func servesCurl() async throws {
+    static func servesCurl<L: TestTCPListener>(_: L.Type) async throws {
         let curl = URL(fileURLWithPath: "/usr/bin/curl")
         try #require(FileManager.default.isExecutableFile(atPath: curl.path))
-        let listener = try await makeListener()
+        let listener = try await L.makeStarted(limit: 64)
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
