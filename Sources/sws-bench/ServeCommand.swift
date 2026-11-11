@@ -9,7 +9,9 @@ import NetworkTransport
 /// `SwiftWebServer` executable moves off Legacy (#0086).
 ///
 /// Runs a ``Server`` over a `TCPListener` speaking HTTP/1.1 (#0080) with a built-in handler:
-/// every request gets `200` with `Hello, World!\n`, or with `--body-size` bytes of `x`.
+/// a `POST` gets its body echoed back, a `PUT` gets the length of its body (read in bounded
+/// chunks, so any size works up to `--max-body-size`), and every other request gets `200` with
+/// `Hello, World!\n`, or with `--body-size` bytes of `x` (#0081).
 /// SIGINT and SIGTERM start a graceful shutdown through `DispatchSource` signal sources, the
 /// one place `DispatchQueue` is allowed outside NetworkTransport. No handler calls `exit()`
 /// and nothing calls `dispatchMain()`: the command returns its status after `run()` returns.
@@ -20,6 +22,7 @@ enum ServeCommand {
     static let usage = """
         usage: sws-bench serve [--config FILE] [--host HOST] [--port PORT]
                                [--max-connections N] [--drain-timeout SECONDS] [--body-size N]
+                               [--max-body-size N]
 
           --config FILE        JSON object with any of "host", "port", "maxConnections",
                                "drainTimeout" (seconds); flags override it
@@ -28,8 +31,10 @@ enum ServeCommand {
           --max-connections N  connections served at once (default 1024)
           --drain-timeout S    grace period for open connections on shutdown (default 10)
           --body-size N        answer with N bytes of "x" instead of "Hello, World!\n"
+          --max-body-size N    largest request body accepted; larger gets 413 (default 10485760)
 
-        Serves HTTP/1.1 (keep-alive, pipelining): every request gets 200 text/plain.
+        Serves HTTP/1.1 (keep-alive, pipelining). POST echoes the request body, PUT answers
+        with the body's length, anything else gets 200 text/plain.
 
         Prints "listening HOST:PORT" on stdout once bound. SIGINT/SIGTERM shut down gracefully.
         """
@@ -40,6 +45,7 @@ enum ServeCommand {
         var maxConnections = 1024
         var drainTimeout = 10.0
         var bodySize: Int?
+        var maxBodySize = HTTP1Configuration.defaultMaxBodySize
     }
 
     struct ConfigError: Error, CustomStringConvertible {
@@ -47,7 +53,7 @@ enum ServeCommand {
     }
 
     static func run(_ argv: [String]) async throws -> Int32 {
-        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "max-connections", "drain-timeout", "body-size"])
+        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "max-connections", "drain-timeout", "body-size", "max-body-size"])
         if args.flag("help") == true { print(usage); return 0 }
         let configPath = args.string("config")
         let host = args.string("host")
@@ -55,6 +61,7 @@ enum ServeCommand {
         let maxConnections = try args.int("max-connections")
         let drainTimeout = try args.seconds("drain-timeout")
         let bodySize = try args.int("body-size")
+        let maxBodySize = try args.int("max-body-size")
         try args.checkAllConsumed()
 
         var settings = Settings()
@@ -80,6 +87,13 @@ enum ServeCommand {
                 return 1
             }
             settings.bodySize = bodySize
+        }
+        if let maxBodySize {
+            guard maxBodySize >= 0 else {
+                printError("sws-bench serve: invalid max body size \(maxBodySize)")
+                return 1
+            }
+            settings.maxBodySize = maxBodySize
         }
         return await serve(settings)
     }
@@ -129,7 +143,8 @@ enum ServeCommand {
             return 1
         }
         let server = Server(configuration: configuration, listeners: [listener],
-                            protocols: [HTTP1()], handler: HelloHandler(bodySize: settings.bodySize))
+                            protocols: [HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))],
+                            handler: HelloHandler(bodySize: settings.bodySize, maxBodySize: settings.maxBodySize))
 
         // Ignore the default actions first, so a signal is never fatal, then route both to a
         // graceful shutdown. The sources are kept alive until the server stops (#0003).
@@ -177,12 +192,15 @@ func describe(_ error: any Error) -> String {
     return "\(error)"
 }
 
-/// Answers every request with one prebuilt `200 text/plain` response. Returning a copy of a
-/// stored response retains its buffers and allocates nothing.
+/// Answers `POST` with its body (echo), `PUT` with its body's length, and every other request
+/// with one prebuilt `200 text/plain` response. Returning a copy of a stored response retains
+/// its buffers and allocates nothing.
 struct HelloHandler: HTTPHandler {
     let response: HTTPResponse
+    let maxBodySize: Int
 
-    init(bodySize: Int? = nil) {
+    init(bodySize: Int? = nil, maxBodySize: Int = HTTP1Configuration.defaultMaxBodySize) {
+        self.maxBodySize = maxBodySize
         var body = ByteBuffer()
         if let bodySize {
             body.append(contentsOf: repeatElement(UInt8(ascii: "x"), count: bodySize))
@@ -195,6 +213,22 @@ struct HelloHandler: HTTPHandler {
     }
 
     func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse {
-        response
+        switch request.method {
+        case .post:
+            var headers = HTTPFields()
+            headers.append(.contentType, "application/octet-stream")
+            return HTTPResponse(status: .ok, headers: headers, body: .bytes(try await request.body.collect(upTo: maxBodySize)))
+        case .put:
+            var length = 0
+            for try await chunk in request.body { length += chunk.readableBytes }
+            var body = ByteBuffer()
+            body.append(decimal: length)
+            body.append("\n")
+            var headers = HTTPFields()
+            headers.append(.contentType, "text/plain; charset=utf-8")
+            return HTTPResponse(status: .ok, headers: headers, body: .bytes(body))
+        default:
+            return response
+        }
     }
 }

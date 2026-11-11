@@ -15,11 +15,16 @@ public struct HTTP1ResponseContext: Sendable, Hashable {
     /// The method of the request being answered. `HEAD` responses carry no content.
     public var requestMethod: HTTPMethod
     public var persistence: Persistence
+    /// The version of the request being answered. HTTP/1.0 has no chunked coding, so a
+    /// `.stream` of unknown length is delimited by closing the connection instead.
+    public var requestVersion: HTTP1Version
 
     @inlinable
-    public init(requestMethod: HTTPMethod = .get, persistence: Persistence = .keepAlive) {
+    public init(requestMethod: HTTPMethod = .get, persistence: Persistence = .keepAlive,
+                requestVersion: HTTP1Version = .http1_1) {
         self.requestMethod = requestMethod
         self.persistence = persistence
+        self.requestVersion = requestVersion
     }
 
     @inlinable
@@ -39,6 +44,10 @@ public enum HTTP1BodyFraming: Sendable, Hashable {
     /// The head is in the buffer with `transfer-encoding: chunked`; the runner frames each
     /// write of the `.stream` writer with ``HTTP1ChunkedEncoder`` and ends with the last chunk.
     case chunked
+    /// The head is in the buffer with no framing field (an HTTP/1.0 request and a `.stream` of
+    /// unknown length): the runner sends the writer's bytes unframed and the body ends when the
+    /// connection closes (RFC 9112 §6.3, rule 8). The context must say `close`.
+    case closeDelimited
     /// The head is in the buffer; after sending it the runner hands the byte stream to the
     /// `.tunnel` closure.
     case tunnel
@@ -82,6 +91,7 @@ public enum HTTP1SerializationError: Error, Sendable, Hashable {
 /// | `.bytes(b)` | `content-length: b.count` | `b` | `.complete` |
 /// | `.file(r)` / `.stream(length: n)` | `content-length` | – (runner sends it) | `.contentLength(n)` |
 /// | `.stream(length: nil)` | `transfer-encoding: chunked` | – (runner sends it) | `.chunked` |
+/// | `.stream(length: nil)` to HTTP/1.0 | none; `connection: close` | – (runner sends it, then closes) | `.closeDelimited` |
 /// | `.tunnel` | none (RFC 9110 §9.3.6), no `connection` | – | `.tunnel` |
 /// | `HEAD` request or `304` | `content-length` of the content that a `GET` / `200` would carry, when known; a `.empty` or chunked body writes none and passes the handler's own `content-length` through (RFC 9110 §8.6, §15.4.5) | – | `.complete` |
 /// | `204` | none (RFC 9110 §8.6, RFC 9112 §6.1) | – | `.complete` |
@@ -150,8 +160,13 @@ public struct HTTP1Serializer<Clock: WallClock>: Sendable {
             contentLength = length
             framing = .contentLength(length)
         case .stream(nil, _):
-            chunked = true
-            framing = .chunked
+            if context.requestVersion == .http1_0 {
+                assert(context.persistence == .close, "a close-delimited body needs connection: close")
+                framing = .closeDelimited
+            } else {
+                chunked = true
+                framing = .chunked
+            }
         case .tunnel:
             isTunnel = true
             framing = .tunnel

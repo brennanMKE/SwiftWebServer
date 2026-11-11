@@ -18,8 +18,18 @@ public import HTTPCore
 ///   closing ◀───────────┴────────────────────┘            closing / tunnelled
 /// ```
 ///
-/// - ``State/readingBody(_:)`` is the hook for request bodies (#0081). Until then a request
-///   with a body is answered with ``bodyNotSupportedStatus(for:)`` and the connection closes.
+/// ## Request bodies (#0081)
+///
+/// The handler reads the body itself, through the request's ``HTTPRequestBody``, while the
+/// connection is in ``State/handling(_:)``. When it returns with body bytes unread, the runner
+/// reports ``Event/bodyUnread(drainable:)``: a drainable body moves to ``State/readingBody(_:)``
+/// and is drained (``Action/drainBody``) before the response is written, so the next head
+/// starts at the right byte; anything else (a body past the drain limit, a malformed body, an
+/// `Expect: 100-continue` body the client was never asked for) makes the response say `close`.
+/// A `Content-Length` beyond ``maxBodySize`` is answered with `413` before the handler runs, an
+/// unknown expectation with `417`, and a body that fails while the handler reads it with `413`
+/// or `400` (``Event/bodyFailed(_:)``); each of those closes the connection.
+///
 /// - ``State/tunnelled`` is the hook for protocol switches (#0108): after a `.tunnel` response
 ///   the byte stream belongs to the tunnel closure and no more HTTP is read.
 public struct HTTP1Connection: Sendable, Hashable {
@@ -31,7 +41,7 @@ public struct HTTP1Connection: Sendable, Hashable {
         case readingHead
         /// The handler is producing the response to `exchange`.
         case handling(Exchange)
-        /// The handler is reading the request body (#0081). Not entered yet.
+        /// The handler returned before reading the whole body; the rest is being drained.
         case readingBody(Exchange)
         /// The response to `exchange` is being serialized and sent.
         case writing(Exchange)
@@ -51,15 +61,33 @@ public struct HTTP1Connection: Sendable, Hashable {
         public var persistence: HTTP1ResponseContext.Persistence
         /// True when the response hands the byte stream to a tunnel.
         public var isTunnel: Bool
+        /// True when the request announced content.
+        public var hasBody: Bool
+        /// True when the request has content and `Expect: 100-continue` (HTTP/1.1 only):
+        /// `100 Continue` is sent when the handler starts reading the body.
+        public var expectsContinue: Bool
 
         @inlinable
         public init(method: HTTPMethod, version: HTTP1Version,
-                    persistence: HTTP1ResponseContext.Persistence, isTunnel: Bool = false) {
+                    persistence: HTTP1ResponseContext.Persistence, isTunnel: Bool = false,
+                    hasBody: Bool = false, expectsContinue: Bool = false) {
             self.method = method
             self.version = version
             self.persistence = persistence
             self.isTunnel = isTunnel
+            self.hasBody = hasBody
+            self.expectsContinue = expectsContinue
         }
+    }
+
+    /// What the request's `Expect` field asks for (RFC 9110 §10.1.1).
+    public enum Expectation: Sendable, Hashable {
+        /// No `Expect` field.
+        case none
+        /// `Expect: 100-continue`.
+        case `continue`
+        /// An expectation this server does not support (`417`).
+        case unsupported
     }
 
     /// The facts about a request head that the connection decides on.
@@ -71,16 +99,20 @@ public struct HTTP1Connection: Sendable, Hashable {
         public var connectionClose: Bool
         /// The `Connection` field lists `keep-alive` (the HTTP/1.0 opt-in).
         public var connectionKeepAlive: Bool
+        /// The `Expect` field. HTTP/1.0 requests never expect `100-continue` (RFC 9110 §10.1.1).
+        public var expectation: Expectation
 
         @inlinable
         public init(method: HTTPMethod = .get, version: HTTP1Version = .http1_1,
                     framing: HTTP1RequestFraming = .none,
-                    connectionClose: Bool = false, connectionKeepAlive: Bool = false) {
+                    connectionClose: Bool = false, connectionKeepAlive: Bool = false,
+                    expectation: Expectation = .none) {
             self.method = method
             self.version = version
             self.framing = framing
             self.connectionClose = connectionClose
             self.connectionKeepAlive = connectionKeepAlive
+            self.expectation = expectation
         }
 
         /// Summarizes a parsed head and its fields.
@@ -92,8 +124,21 @@ public struct HTTP1Connection: Sendable, Hashable {
                 close = fields.containsListElement("close", in: .connection)
                 keepAlive = fields.containsListElement("keep-alive", in: .connection)
             }
+            var expectation = Expectation.none
+            if fields.contains(.expect) {
+                fields.forEachListElement(of: .expect) { element in
+                    let isContinue = fields.withSpan(of: element) { ASCII.equalsCaseInsensitive($0, "100-continue") }
+                    if !isContinue {
+                        expectation = .unsupported
+                    } else if expectation == .none {
+                        expectation = .continue
+                    }
+                }
+                // An HTTP/1.0 client cannot receive 100 (Continue): ignore the expectation.
+                if expectation == .continue && head.version == .http1_0 { expectation = .none }
+            }
             self.init(method: head.method, version: head.version, framing: head.framing,
-                      connectionClose: close, connectionKeepAlive: keepAlive)
+                      connectionClose: close, connectionKeepAlive: keepAlive, expectation: expectation)
         }
 
         /// Whether the client asks for the connection to persist (RFC 9112 §9.3): `close`
@@ -107,13 +152,29 @@ public struct HTTP1Connection: Sendable, Hashable {
             }
         }
 
-        /// True when the head announces content (#0081 reads it).
+        /// True when the head announces content.
         @inlinable
         public var hasBody: Bool {
             switch framing {
             case .none: false
             case .contentLength(let length): length > 0
             case .chunked: true
+            }
+        }
+    }
+
+    /// Why a request body failed while the handler read it.
+    public enum BodyFailure: Sendable, Hashable {
+        /// More bytes than ``HTTP1Connection/maxBodySize`` (`413`).
+        case tooLarge
+        /// Invalid framing or an early end of stream (`400`).
+        case malformed
+
+        @inlinable
+        public var status: HTTPStatus {
+            switch self {
+            case .tooLarge: .contentTooLarge
+            case .malformed: .badRequest
             }
         }
     }
@@ -141,6 +202,19 @@ public struct HTTP1Connection: Sendable, Hashable {
         case response(ResponseKind)
         /// The handler threw, or returned a response this connection cannot send.
         case handlerFailed
+        /// The handler threw because the request body failed: too large (`413`) or malformed
+        /// or truncated (`400`). The connection closes after the error response.
+        case bodyFailed(BodyFailure)
+        /// The handler returned with body bytes unread. `drainable` is false when the body
+        /// cannot be skipped safely: it failed, it is longer than the drain limit, or it has
+        /// `Expect: 100-continue` and the client was never told to send it.
+        case bodyUnread(drainable: Bool)
+        /// The drain after ``bodyUnread(drainable:)`` finished; `complete` is false when it hit
+        /// the drain limit or the body failed.
+        case bodyDrained(complete: Bool)
+        /// A `.stream` writer threw, or wrote a different length than it declared, after the
+        /// head was sent: the response cannot be completed.
+        case responseBodyFailed
         /// The response (or error response) is in the output buffer or sent.
         case responseWritten
         /// The peer finished sending (receive returned 0).
@@ -159,6 +233,9 @@ public struct HTTP1Connection: Sendable, Hashable {
         case proceed
         /// Call the handler with the request.
         case callHandler
+        /// Read and discard the rest of the request body (up to the drain limit), then report
+        /// ``Event/bodyDrained(complete:)``.
+        case drainBody
         /// Serialize the handler's response with this context.
         case writeResponse(HTTP1ResponseContext)
         /// Serialize an empty response with this status and context (which says `close`),
@@ -175,23 +252,16 @@ public struct HTTP1Connection: Sendable, Hashable {
     public private(set) var isDraining: Bool
     /// Request heads accepted so far.
     public private(set) var requestCount: Int
+    /// The largest request body accepted. A larger `Content-Length` gets `413` before the
+    /// handler runs; a chunked body is checked as it is read.
+    public let maxBodySize: Int
 
-    public init() {
+    public init(maxBodySize: Int = .max) {
+        precondition(maxBodySize >= 0, "maxBodySize must not be negative")
         state = .idle
         isDraining = false
         requestCount = 0
-    }
-
-    /// The status answering a request whose body this connection cannot read yet.
-    ///
-    /// Hook for #0081: request bodies are not read yet, so a `Content-Length` body gets
-    /// `413 Content Too Large` and a chunked body `501 Not Implemented`, and the connection
-    /// closes (the unread body bytes cannot be skipped safely). #0081 replaces this with
-    /// ``State/readingBody(_:)``.
-    @inlinable
-    public static func bodyNotSupportedStatus(for framing: HTTP1RequestFraming) -> HTTPStatus {
-        if case .chunked = framing { return .notImplemented }
-        return .contentTooLarge
+        self.maxBodySize = maxBodySize
     }
 
     public mutating func handle(_ event: Event) -> Action {
@@ -211,12 +281,18 @@ public struct HTTP1Connection: Sendable, Hashable {
                 requestCount &+= 1
                 let persistence: HTTP1ResponseContext.Persistence =
                     summary.wantsPersistence && !isDraining ? .keepAlive : .close
-                if summary.hasBody {
+                if summary.expectation == .unsupported {
+                    // The body (if any) is not read, so it cannot be skipped: close.
                     state = .closing(.normal)
-                    return .writeError(Self.bodyNotSupportedStatus(for: summary.framing),
-                                       HTTP1ResponseContext(requestMethod: summary.method, persistence: .close))
+                    return .writeError(.expectationFailed, errorContext(summary))
                 }
-                state = .handling(Exchange(method: summary.method, version: summary.version, persistence: persistence))
+                if case .contentLength(let length) = summary.framing, length > UInt64(maxBodySize) {
+                    state = .closing(.normal)
+                    return .writeError(.contentTooLarge, errorContext(summary))
+                }
+                let hasBody = summary.hasBody
+                state = .handling(Exchange(method: summary.method, version: summary.version, persistence: persistence,
+                                           hasBody: hasBody, expectsContinue: hasBody && summary.expectation == .continue))
                 return .callHandler
             default:
                 return unexpected(event)
@@ -243,13 +319,43 @@ public struct HTTP1Connection: Sendable, Hashable {
                 exchange.isTunnel = true
             }
             state = .writing(exchange)
-            return .writeResponse(HTTP1ResponseContext(requestMethod: exchange.method, persistence: exchange.persistence))
+            return .writeResponse(HTTP1ResponseContext(requestMethod: exchange.method, persistence: exchange.persistence,
+                                                       requestVersion: exchange.version))
 
         case .handlerFailed:
             guard case .handling(let exchange) = state else { return unexpected(event) }
             state = .closing(.normal)
             return .writeError(.internalServerError,
-                               HTTP1ResponseContext(requestMethod: exchange.method, persistence: .close))
+                               HTTP1ResponseContext(requestMethod: exchange.method, persistence: .close,
+                                                    requestVersion: exchange.version))
+
+        case .bodyFailed(let failure):
+            guard case .handling(let exchange) = state, exchange.hasBody else { return unexpected(event) }
+            state = .closing(.normal)
+            return .writeError(failure.status,
+                               HTTP1ResponseContext(requestMethod: exchange.method, persistence: .close,
+                                                    requestVersion: exchange.version))
+
+        case .bodyUnread(let drainable):
+            guard case .handling(var exchange) = state, exchange.hasBody else { return unexpected(event) }
+            if drainable {
+                state = .readingBody(exchange)
+                return .drainBody
+            }
+            exchange.persistence = .close
+            state = .handling(exchange)
+            return .proceed
+
+        case .bodyDrained(let complete):
+            guard case .readingBody(var exchange) = state else { return unexpected(event) }
+            if !complete { exchange.persistence = .close }
+            state = .handling(exchange)
+            return .proceed
+
+        case .responseBodyFailed:
+            guard case .writing = state else { return unexpected(event) }
+            state = .closing(.abort)
+            return .close(.abort)
 
         case .responseWritten:
             switch state {
@@ -301,6 +407,12 @@ public struct HTTP1Connection: Sendable, Hashable {
         }
     }
 
+    /// The context of an error response to a request that was not handed to the handler.
+    @inlinable
+    func errorContext(_ summary: RequestSummary) -> HTTP1ResponseContext {
+        HTTP1ResponseContext(requestMethod: summary.method, persistence: .close, requestVersion: summary.version)
+    }
+
     /// An event that cannot happen in the current state is a runner bug: debug builds trap,
     /// release builds end the connection.
     mutating func unexpected(_ event: Event) -> Action {
@@ -314,7 +426,8 @@ extension HTTP1Connection.Action: Equatable {
     /// Statuses compare by code and reason phrase.
     public static func == (lhs: Self, rhs: Self) -> Bool {
         switch (lhs, rhs) {
-        case (.proceed, .proceed), (.callHandler, .callHandler), (.startTunnel, .startTunnel):
+        case (.proceed, .proceed), (.callHandler, .callHandler), (.startTunnel, .startTunnel),
+             (.drainBody, .drainBody):
             return true
         case (.writeResponse(let a), .writeResponse(let b)):
             return a == b

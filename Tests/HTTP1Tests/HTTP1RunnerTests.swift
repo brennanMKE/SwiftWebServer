@@ -7,8 +7,8 @@ import HTTPTestSupport
 
 // MARK: - Support
 
-/// Answers `200` with the request path as the body. `/throw` throws, `/stream` returns a
-/// streamed body (not supported yet), `/file` sends ``fileRegion``.
+/// Answers `200` with the request path as the body. `/throw` throws, `/stream` returns an
+/// empty streamed body, `/file` sends ``fileRegion``.
 struct PathHandler: HTTPHandler {
     struct Failure: Error {}
 
@@ -323,24 +323,6 @@ func serveScripted(
         #expect(result.trailing.isEmpty)
         #expect(result.transport.sends.load(ordering: .relaxed) == 0)
         #expect(result.transport.base.isClosed)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func requestWithBodyIsRejectedAndClosed() async {
-        let withLength = await serveScripted([.bytes(buffer(get("/a", "Content-Length: 5\r\n") + "hello")), .endOfStream])
-        #expect(withLength.responses.map(\.status) == [413])
-        #expect(withLength.responses.first?.header("connection") == "close")
-        let chunked = await serveScripted([.bytes(buffer(get("/a", "Transfer-Encoding: chunked\r\n") + "0\r\n\r\n")), .endOfStream])
-        #expect(chunked.responses.map(\.status) == [501])
-        let empty = await serveScripted([.bytes(buffer(get("/a", "Content-Length: 0\r\n") + get("/b"))), .endOfStream])
-        #expect(empty.responses.map(\.body) == ["/a", "/b"])
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func streamedResponseIsAHookFor0081() async {
-        let result = await serveScripted([.bytes(buffer(get("/stream") + get("/never"))), .endOfStream])
-        #expect(result.responses.map(\.status) == [500])
-        #expect(result.responses.first?.header("connection") == "close")
     }
 
     @Test(.timeLimit(.minutes(1)))
