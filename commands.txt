@@ -37,10 +37,9 @@ swift build --product YourApp
 swift run -c release --product webserver
 
 swift build --target SwiftWebServer
-swift build --target SwiftWebServerCore
+swift build --target Legacy
 swift build --target SwiftWebServerFunctionalTests
 
-swift run -c debug SwiftWebSocketsTestSuite
 
 find . -name "*.swift" -print0 | xargs -0 cat | wc -l
 
