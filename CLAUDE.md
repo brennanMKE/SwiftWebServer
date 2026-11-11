@@ -21,6 +21,7 @@ Every change merged to `main` must pass both. Milestone-end comprehensive runs a
 - `AsyncStream` only for low-rate signals. Byte and frame flows use demand-driven `AsyncSequence`s or `BoundedAsyncQueue`. Never unbounded buffering.
 - Hot path (per request/frame): no allocations in our code, no `String`/Foundation, no existentials except `.stream` bodies. Parse bytes directly.
 - Every optional feature lives in its own target and registers through the extension points in ROADMAP §5.2. Do not add feature code to `HTTPCore`, `HTTP1`, or `HTTPServer`.
+- **Never touch the user's keychain.** No `security` commands, no keychain add/delete/trust changes. Load TLS identities in memory only (`SecPKCS12Import` with `kSecImportToMemoryOnly: true`). Test certificates and keys live in a gitignored folder created by script.
 - Tests use Swift Testing (`import Testing`). Protocol logic is tested over in-memory transports; socket tests bind port 0.
 
 ## Parallel work (worker protocol)
