@@ -14,9 +14,10 @@ import Testing
         defer { child.kill() }
         let port = try await child.listeningPort()
 
-        // An open, idle connection: the drain deadline must cancel it.
+        // An open, idle keep-alive connection: the drain deadline must cancel it.
         let client = try await TCPTransport.connect(host: "127.0.0.1", port: port)
-        #expect(await roundTrip(client, "ping") == "ping")
+        let reply = await roundTrip(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        #expect(reply.hasPrefix("HTTP/1.1 200 OK\r\n"), "\(reply)")
 
         let start = ContinuousClock.now
         child.signal(SIGTERM)

@@ -85,6 +85,25 @@ written before the harness) are registered with `Benchmark.registerSuite(name:ru
 `registerSelfTimedSuites()`. They report their own ns/op with no percentiles or allocation
 counts (`batch` shows `self`); converting them to `register(name:body:)` closures adds both.
 
+## `sws-bench h1conn`
+
+The HTTP/1.1 connection loop (#0080) over an in-process transport that never suspends:
+
+```
+sws-bench h1conn [--requests N] [--json]
+```
+
+Reports ns and allocations per request for keep-alive (one request per receive) and pipelined
+(16 per receive) traffic with the `serve` hello handler. Per-request figures are the difference
+between an N-request and an N/10-request connection, so per-connection setup cancels out. The
+target is 0 allocations per request.
+
+## `sws-bench serve`
+
+The new-stack HTTP/1.1 server on a `TCPListener` (loopback by default, port 0 picks a free port),
+answering every request with `200 text/plain` `Hello, World!` or `--body-size N` bytes. Prints
+`listening HOST:PORT`; SIGINT/SIGTERM drain and exit 0.
+
 ## `sws-bench load`
 
 An HTTP/1.1 load client on Network.framework `NWConnection`:
