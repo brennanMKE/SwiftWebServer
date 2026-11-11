@@ -83,7 +83,16 @@ actor HTTPRuntime {
         let config = try HTTPConfig.init(configURL: configURL)
         let port = NWEndpoint.Port(rawValue: UInt16(config.port))!
         let publicURL = URL(fileURLWithPath: config.path, relativeTo: rootURL).standardizedFileURL
-        let listener = try NWListener(using: .tcp, on: port)
+        // LISTEN_HOST (e.g. 127.0.0.1) restricts the listener to one interface; benchmarks
+        // and tests bind loopback only so no firewall prompt can appear (AGENTS.md).
+        let listener: NWListener
+        if let host = ProcessInfo.processInfo.environment["LISTEN_HOST"], !host.isEmpty {
+            let parameters = NWParameters.tcp
+            parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(host), port: port)
+            listener = try NWListener(using: parameters)
+        } else {
+            listener = try NWListener(using: .tcp, on: port)
+        }
         let runtimeConfig = RuntimeConfiguration(rootURL: rootURL, publicURL: publicURL, config: config, port: port, listener: listener)
 
         logger.log("Listening on port http://localhost:\(config.port)/")

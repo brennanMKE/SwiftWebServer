@@ -22,8 +22,8 @@ WATCH_NAMES="SecurityAgent CoreServicesUIAgent UserNotificationCenter"
 watch_pids() { for n in $WATCH_NAMES; do pgrep -x "$n"; done | sort -u | tr '\n' ' '; }
 baseline=$(watch_pids)
 
-set -m
-"$@" &
+# Start the command in its own process group (perl setpgrp works without job control).
+perl -e 'setpgrp(0,0); exec @ARGV or die "exec: $!"' -- "$@" &
 CMD=$!
 start=$(date +%s)
 status=""

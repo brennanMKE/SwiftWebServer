@@ -90,8 +90,12 @@ targets += [
         swiftSettings: legacySwiftSettings),
     .executableTarget(
         name: "SWSBench",
-        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HeaderCompression", "HTTP3"],
+        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HeaderCompression", "HTTP3", "QPACK"],
         path: "Sources/sws-bench",
+        swiftSettings: modernSwiftSettings),
+    .testTarget(
+        name: "SWSBenchTests",
+        dependencies: ["SWSBench"],
         swiftSettings: modernSwiftSettings),
     .testTarget(
         name: "IntegrationTests",
