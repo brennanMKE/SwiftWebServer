@@ -8,7 +8,8 @@ let usage = """
     commands:
       micro    run registered microbenchmarks (ns/op, allocations/op)
       load     drive an HTTP/1.1 server and report req/s and latency
-      serve    run the new-stack server (echo protocol until HTTP/1.1 lands)
+      serve    run the new-stack HTTP/1.1 server with a built-in hello handler
+      h1conn   ns and allocations per request of the HTTP/1.1 connection loop
 
     Run `sws-bench <command> --help` for options. With no command, runs `micro`.
     """
@@ -26,6 +27,8 @@ do {
         status = try await LoadCommand.run(rest)
     case "serve":
         status = try await ServeCommand.run(rest)
+    case "h1conn":
+        status = try await H1ConnBench.run(rest)
     case "help", "--help", "-h":
         print(usage)
         status = 0

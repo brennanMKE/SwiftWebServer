@@ -1,5 +1,6 @@
 import Dispatch
 import Foundation
+import HTTP1
 import HTTPCore
 import HTTPServer
 import NetworkTransport
@@ -7,7 +8,8 @@ import NetworkTransport
 /// `sws-bench serve`: the new stack's server entry point (#0079) until the shipped
 /// `SwiftWebServer` executable moves off Legacy (#0086).
 ///
-/// Runs a ``Server`` over a `TCPListener` with an echo protocol (HTTP/1.1 arrives with #0080).
+/// Runs a ``Server`` over a `TCPListener` speaking HTTP/1.1 (#0080) with a built-in handler:
+/// every request gets `200` with `Hello, World!\n`, or with `--body-size` bytes of `x`.
 /// SIGINT and SIGTERM start a graceful shutdown through `DispatchSource` signal sources, the
 /// one place `DispatchQueue` is allowed outside NetworkTransport. No handler calls `exit()`
 /// and nothing calls `dispatchMain()`: the command returns its status after `run()` returns.
@@ -17,7 +19,7 @@ import NetworkTransport
 enum ServeCommand {
     static let usage = """
         usage: sws-bench serve [--config FILE] [--host HOST] [--port PORT]
-                               [--max-connections N] [--drain-timeout SECONDS]
+                               [--max-connections N] [--drain-timeout SECONDS] [--body-size N]
 
           --config FILE        JSON object with any of "host", "port", "maxConnections",
                                "drainTimeout" (seconds); flags override it
@@ -25,6 +27,9 @@ enum ServeCommand {
           --port PORT          port to bind; 0 picks a free one (default 0)
           --max-connections N  connections served at once (default 1024)
           --drain-timeout S    grace period for open connections on shutdown (default 10)
+          --body-size N        answer with N bytes of "x" instead of "Hello, World!\n"
+
+        Serves HTTP/1.1 (keep-alive, pipelining): every request gets 200 text/plain.
 
         Prints "listening HOST:PORT" on stdout once bound. SIGINT/SIGTERM shut down gracefully.
         """
@@ -34,6 +39,7 @@ enum ServeCommand {
         var port: UInt16 = 0
         var maxConnections = 1024
         var drainTimeout = 10.0
+        var bodySize: Int?
     }
 
     struct ConfigError: Error, CustomStringConvertible {
@@ -41,13 +47,14 @@ enum ServeCommand {
     }
 
     static func run(_ argv: [String]) async throws -> Int32 {
-        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "max-connections", "drain-timeout"])
+        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "max-connections", "drain-timeout", "body-size"])
         if args.flag("help") == true { print(usage); return 0 }
         let configPath = args.string("config")
         let host = args.string("host")
         let port = try args.int("port")
         let maxConnections = try args.int("max-connections")
         let drainTimeout = try args.seconds("drain-timeout")
+        let bodySize = try args.int("body-size")
         try args.checkAllConsumed()
 
         var settings = Settings()
@@ -67,6 +74,13 @@ enum ServeCommand {
         }
         if let maxConnections { settings.maxConnections = maxConnections }
         if let drainTimeout { settings.drainTimeout = drainTimeout }
+        if let bodySize {
+            guard bodySize >= 0 else {
+                printError("sws-bench serve: invalid body size \(bodySize)")
+                return 1
+            }
+            settings.bodySize = bodySize
+        }
         return await serve(settings)
     }
 
@@ -115,7 +129,7 @@ enum ServeCommand {
             return 1
         }
         let server = Server(configuration: configuration, listeners: [listener],
-                            protocols: [EchoProtocol()], handler: EmptyHandler())
+                            protocols: [HTTP1()], handler: HelloHandler(bodySize: settings.bodySize))
 
         // Ignore the default actions first, so a signal is never fatal, then route both to a
         // graceful shutdown. The sources are kept alive until the server stops (#0003).
@@ -163,26 +177,24 @@ func describe(_ error: any Error) -> String {
     return "\(error)"
 }
 
-/// Echoes bytes until end of stream, a shutdown, or cancellation at the drain deadline.
-struct EchoProtocol: ConnectionProtocol {
-    static var alpnTokens: [String] { [] }
+/// Answers every request with one prebuilt `200 text/plain` response. Returning a copy of a
+/// stored response retains its buffers and allocates nothing.
+struct HelloHandler: HTTPHandler {
+    let response: HTTPResponse
 
-    static func matchesCleartextPreface(_ bytes: borrowing ByteBuffer) -> SniffResult { .match }
-
-    func run<T: ByteStreamTransport, H: HTTPHandler>(_ t: T, handler: H, context: ConnectionContext) async {
-        var buffer = ByteBuffer(capacity: 16 * 1024)
-        while !context.shutdown.isTriggered {
-            buffer.clear()
-            guard let count = try? await t.receive(into: &buffer, maxLength: 16 * 1024), count > 0 else { break }
-            guard (try? await t.send(buffer, endOfStream: false)) != nil else { break }
+    init(bodySize: Int? = nil) {
+        var body = ByteBuffer()
+        if let bodySize {
+            body.append(contentsOf: repeatElement(UInt8(ascii: "x"), count: bodySize))
+        } else {
+            body.append("Hello, World!\n")
         }
-        await t.close(.normal)
+        var headers = HTTPFields()
+        headers.append(.contentType, "text/plain; charset=utf-8")
+        response = HTTPResponse(status: .ok, headers: headers, body: .bytes(body))
     }
-}
 
-/// Answers every request with `204 No Content` (unused by ``EchoProtocol``).
-struct EmptyHandler: HTTPHandler {
     func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse {
-        HTTPResponse(status: .noContent)
+        response
     }
 }

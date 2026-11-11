@@ -2,7 +2,7 @@ public import HTTPCore
 
 /// What the connection decided about persistence, plus the request facts that change how a
 /// response is framed. Built by the connection state machine (#0080) for each response.
-public struct HTTP1ResponseContext: Sendable {
+public struct HTTP1ResponseContext: Sendable, Hashable {
     /// The `Connection` field the serializer writes. The decision belongs to the connection
     /// state machine (#0080); the serializer only renders it.
     public enum Persistence: Sendable, Hashable {
