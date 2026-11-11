@@ -237,9 +237,10 @@ import Testing
                 _ = critical
             }
             group.addTask {
-                output.withLock { $0 = (try? runProcess(Self.curlPath, [
+                let result = (try? await runProcess(Self.curlPath, [
                     "--http3-only", "-k", "-s", "--max-time", "15", "https://127.0.0.1:\(port)/",
-                ])) ?? "" }
+                ])) ?? ""
+                output.withLock { $0 = result }
             }
             try await group.waitForAll()
         }
@@ -295,17 +296,9 @@ import Testing
     }
 }
 
-/// Runs a short-lived tool to completion and returns its standard output. The tool must
-/// enforce its own timeout (curl `--max-time`); the test's time limit backs it up.
-private func runProcess(_ path: String, _ arguments: [String]) throws -> String {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: path)
-    process.arguments = arguments
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = FileHandle.nullDevice
-    try process.run()
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    return String(decoding: data, as: UTF8.self)
+/// Runs a short-lived tool to completion and returns its standard output. The tool enforces
+/// its own timeout (curl `--max-time`); a hard deadline and the test's time limit
+/// (cancellation) SIGKILL it otherwise (#0114).
+private func runProcess(_ path: String, _ arguments: [String]) async throws -> String {
+    try await ChildProcess.run(URL(fileURLWithPath: path), arguments, timeout: .seconds(30)).stdout
 }

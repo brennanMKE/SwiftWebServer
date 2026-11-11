@@ -1,5 +1,6 @@
 import Foundation
 import HTTPCore
+import HTTPTestSupport
 import Network
 import NetworkTransport
 import Synchronization
@@ -411,17 +412,8 @@ final class Counter: Sendable {
     let value = Atomic<Int>(0)
 }
 
-/// Runs `executable` and returns its standard output.
+/// Runs `executable` and returns its standard output. A hard deadline and the test's time
+/// limit (cancellation) SIGKILL it (#0114).
 private func runProcess(_ executable: URL, _ arguments: [String]) async throws -> String {
-    let process = Process()
-    process.executableURL = executable
-    process.arguments = arguments
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    try await withUnsafeThrowingContinuation { (continuation: UnsafeContinuation<Void, any Error>) in
-        process.terminationHandler = { _ in continuation.resume() }
-        do { try process.run() } catch { continuation.resume(throwing: error) }
-    }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    return String(decoding: data, as: UTF8.self)
+    try await ChildProcess.run(executable, arguments, timeout: .seconds(30)).stdout
 }
