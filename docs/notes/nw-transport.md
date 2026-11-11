@@ -130,3 +130,48 @@ Reading the numbers:
 - The bounded accept queue (limit 2, five clients, three rejected), two listeners in one
   process, a connect failure before `.ready`, listener close and accept cancellation, and a
   `/usr/bin/curl` exchange.
+
+# Network.framework QUIC transport (#0098)
+
+`QUICListener` (`NWListener` + `newConnectionGroupHandler`), `QUICConnection` (one
+`NWConnectionGroup`, a `MultiplexedTransport`) and `QUICStreamTransport` (one stream
+`NWConnection`, `ByteStreamTransport & StreamIdentified`) follow the spike's API shape
+(`docs/spikes/quic-spike.md`). The decisions in `QUICConnectionState` / `QUICStreamState` are
+pure value types; the classes hold continuations in a `Mutex`, as in the TCP adapter. One
+serial queue per connection runs the group and all its streams.
+
+- **Inbound streams** are started at once (the ID is only readable when ready) and handed over
+  in ready order through a demand-driven sequence. At most `pendingStreamLimit` are held; the
+  rest are reset with `rejectedStreamErrorCode`.
+- **Stream credit.** NW never replenishes MAX_STREAMS. When a peer stream finishes (cancelled or
+  failed after it was ready), the adapter sets the group's `localMaxStreamsBidirectional` /
+  `Unidirectional` to initial + finished. Without this, the conformance test stalls until the
+  idle timeout.
+- **Sends** are split into `sendChunkSize` chunks (64 KiB), each waiting for `.contentProcessed`.
+  NW's own per-stream buffer cannot be bounded: with a stalled reader a client accepted about
+  4.1 MiB (256 KiB stream window plus NW buffering) before sends stalled. In memory the same
+  test stalls at 64 KiB.
+- **Close** sets the group's `applicationError` (with a non-nil reason), `forceCancel`s every
+  ready stream, `cancel`s never-ready ones, then cancels the group.
+- **Names.** macOS 26's Network module declares `QUICStream`, so ours is `QUICStreamTransport`.
+
+Behaviour observed while building it:
+
+1. `NWProtocolQUIC.Metadata.applicationError = ApplicationError(code:)` with a nil `reason`
+   crashes with SIGSEGV. Always pass a reason (`""` is fine).
+2. A plain `cancel()` of a stream during connection close sometimes reaches the peer as FIN, so
+   a truncated response would look complete. `forceCancel()` gives the peer `ECONNRESET`.
+3. Setting `streamApplicationErrorCode` on each stream just before cancelling the streams and
+   the group made a spurious server-initiated bidirectional stream (ID 1) show up at the NW
+   client. `reset(applicationError:)` on a single stream does not do this.
+4. A client whose verify block rejects the server's certificate gets no TLS error: its group
+   stays `waiting(ENETDOWN)`, while the server group fails with `EINVAL`. `connect` therefore
+   relies on `connectTimeout`.
+5. After the peer closes the connection, an NW client's streams fail with `ENETDOWN` or
+   `ECONNRESET`, and its group fails with `EINVAL`. All of these map to `.connectionReset`, and
+   inbound iteration then ends with `nil`, which matches the in-memory transport.
+
+Tests: `Tests/NetworkTransportTests/MultiplexedTransportConformanceTests.swift` runs 9 scenarios
+against both implementations. `QUICTransportTests.swift` covers a raw `NWConnectionGroup`
+client, stream bounds, credit, the identity loader, the state machines, and one
+`curl --http3-only -k` request served with the spike's hand-encoded HTTP/3 response.
