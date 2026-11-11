@@ -21,7 +21,7 @@ public enum HTTP1RequestTargetForm: Sendable, Hashable {
 
 /// How the body of a request is delimited (RFC 9112 §6.3). The parser decides; reading the
 /// body is #0081.
-public enum HTTP1BodyFraming: Sendable, Hashable {
+public enum HTTP1RequestFraming: Sendable, Hashable {
     /// No `Content-Length` and no `Transfer-Encoding`: the request has no body.
     case none
     /// A `Content-Length` body of exactly this many bytes (possibly zero).
@@ -55,7 +55,7 @@ public struct HTTP1RequestHead: Sendable, Hashable {
     /// True when the query contains a `%`.
     public var queryHasPercent: Bool
     /// The body framing decision.
-    public var framing: HTTP1BodyFraming
+    public var framing: HTTP1RequestFraming
     /// Number of bytes the head occupied, from the first byte (including any leading empty
     /// lines) through the CRLF that ends the field section.
     public var length: Int
@@ -72,7 +72,7 @@ public struct HTTP1RequestHead: Sendable, Hashable {
         query: ByteView = .empty,
         pathHasPercent: Bool = false,
         queryHasPercent: Bool = false,
-        framing: HTTP1BodyFraming = .none,
+        framing: HTTP1RequestFraming = .none,
         length: Int = 0
     ) {
         self.method = method

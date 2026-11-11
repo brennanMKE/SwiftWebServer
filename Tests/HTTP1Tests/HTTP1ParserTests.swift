@@ -129,13 +129,13 @@ import HTTPTestSupport
     // MARK: Framing (RFC 9112 §6.3)
 
     @Test func framing() throws {
-        func framing(_ fields: String) -> HTTP1BodyFraming? {
+        func framing(_ fields: String) -> HTTP1RequestFraming? {
             head("POST / HTTP/1.1\r\nHost: a\r\n\(fields)\r\n")?.framing
         }
         func framingError(_ fields: String) -> HTTP1ParseError? {
             error("POST / HTTP/1.1\r\nHost: a\r\n\(fields)\r\n")
         }
-        #expect(framing("") == HTTP1BodyFraming.none)
+        #expect(framing("") == HTTP1RequestFraming.none)
         #expect(framing("Content-Length: 42\r\n") == .contentLength(42))
         #expect(framing("Content-Length: 0\r\n") == .contentLength(0))
         #expect(framing("Content-Length: 7\r\nContent-Length: 7\r\n") == .contentLength(7))

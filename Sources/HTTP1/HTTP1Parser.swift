@@ -40,7 +40,7 @@ public import HTTPCore
 /// - Field values may contain VCHAR, obs-text, SP and HTAB; leading and trailing SP/HTAB
 ///   are trimmed.
 /// - After the head: HTTP/1.1 needs exactly one `Host` (any version: at most one), then
-///   framing per RFC 9112 §6.3 (see ``HTTP1BodyFraming``).
+///   framing per RFC 9112 §6.3 (see ``HTTP1RequestFraming``).
 ///
 /// The test-support `ReferenceHTTP1Parser` implements the same rules independently; the
 /// differential test in `HTTP1Tests` checks that both agree.

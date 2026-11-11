@@ -37,7 +37,7 @@ public enum HTTP1HeadOutcome: Hashable, Sendable, CustomStringConvertible {
         public var pathHasPercent: Bool
         public var queryHasPercent: Bool
         public var fields: [Field]
-        public var framing: HTTP1BodyFraming
+        public var framing: HTTP1RequestFraming
         /// Bytes consumed by the head.
         public var length: Int
     }
