@@ -111,7 +111,7 @@ public struct HTTPFieldsView: Sendable, HTTPFieldCollection {
     public func firstValue(for name: HTTPFieldName) -> ByteView? {
         checkValid()
         guard let i = storage.fields.firstIndex(of: name) else { return nil }
-        return storage.fields._valueViews[i]
+        return storage.fields.valueViews[i]
     }
 
     /// Copies the fields into owned ``HTTPFields`` that outlive the request.
