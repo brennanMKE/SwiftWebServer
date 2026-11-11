@@ -1,6 +1,6 @@
 /// Prefix integers and Huffman coding shared by HPACK and QPACK.
 ///
-/// Placeholder namespace declared by the M0 package restructure (docs/ROADMAP.md §5.1).
+/// See `PrefixInteger` (RFC 7541 §5.1) and `Huffman` (RFC 7541 §5.2, Appendix B).
 public enum HeaderCompressionModule {
     /// The module name.
     public static let name = "HeaderCompression"
