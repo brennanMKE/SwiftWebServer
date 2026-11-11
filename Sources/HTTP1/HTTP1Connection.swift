@@ -223,7 +223,8 @@ public struct HTTP1Connection: Sendable, Hashable {
         case receiveFailed
         /// A send threw.
         case sendFailed
-        /// The server started draining.
+        /// The server started draining: between requests (idle, or part of a head) the
+        /// connection closes; an exchange in flight finishes and its response says `close`.
         case shutdown
     }
 
@@ -395,7 +396,8 @@ public struct HTTP1Connection: Sendable, Hashable {
         case .shutdown:
             isDraining = true
             switch state {
-            case .idle:
+            case .idle, .readingHead:
+                // No request in flight (part of a head is not one): close without answering.
                 state = .closing(.shutdown)
                 return .close(.shutdown)
             case .closing(let reason):

@@ -363,7 +363,8 @@ func serveScripted(
         let idle = await serveScripted([.bytes(buffer(get("/a"))), .endOfStream], shutdown: shutdown)
         #expect(idle.responses.isEmpty)   // closed before reading a request
 
-        // Shutdown arriving mid-batch: the next response says close.
+        // Shutdown arriving while /b is handled: /b's response says close (#0082) and the
+        // pipelined /c, not started yet, gets no response.
         let (client, server) = InMemoryTransport.makePair()
         let signal = ShutdownSignal()
         await withTaskGroup(of: Void.self) { group in
@@ -371,12 +372,14 @@ func serveScripted(
                 await HTTP1().run(server, handler: TriggeringHandler(signal: signal),
                                   context: ConnectionContext(info: server.info, shutdown: signal))
             }
-            try? await client.send(buffer(get("/a") + get("/b")), endOfStream: false)
+            try? await client.send(buffer(get("/a") + get("/b") + get("/c")), endOfStream: false)
             var received = ByteBuffer()
             while (try? await client.receive(into: &received, maxLength: 4096)) ?? 0 > 0 {}
             let responses = parseResponses(received).responses
             #expect(responses.map(\.status) == [200, 200])
-            #expect(responses.map { $0.header("connection") } == ["keep-alive", "keep-alive"])
+            #expect(responses.map { $0.header("connection") } == ["keep-alive", "close"])
+            // The server lingers (it left /c unread) until the client closes.
+            try? await client.send(ByteBuffer(), endOfStream: true)
             await group.waitForAll()
         }
     }
@@ -408,9 +411,8 @@ func serveScripted(
     }
 }
 
-/// Triggers the shutdown signal while handling `/b`, the second of two pipelined requests,
-/// after both heads were read in one batch: the in-flight batch still completes with
-/// keep-alive (the signal is checked per batch), then the connection closes before reading.
+/// Triggers the shutdown signal while handling `/b`, after the pipelined heads were read in one
+/// batch: `/b`'s response is the last one and says close.
 struct TriggeringHandler: HTTPHandler {
     let signal: ShutdownSignal
 

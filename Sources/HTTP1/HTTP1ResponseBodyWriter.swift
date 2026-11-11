@@ -33,9 +33,17 @@ public final class HTTP1ResponseBodyWriter<Transport: ByteStreamTransport>: @unc
     public private(set) var written = 0
     var scratch = ByteBuffer()
     var transportError: (any Error)?
+    /// The connection's watchdog (#0082): every send runs under the send limit.
+    var watchdog: HTTP1Watchdog?
+    var sendTicks: UInt64 = 0
 
     public init(transport: Transport) {
         self.transport = transport
+    }
+
+    func watch(_ watchdog: HTTP1Watchdog, sendTicks: UInt64) {
+        self.watchdog = watchdog
+        self.sendTicks = sendTicks
     }
 
     /// Starts a response body and returns the writer for its closure.
@@ -72,6 +80,13 @@ public final class HTTP1ResponseBodyWriter<Transport: ByteStreamTransport>: @unc
         }
         defer { busy.store(false, ordering: .releasing) }
         let count = bytes.readableBytes
+        if let watchdog, !watchdog.enter(.send, deadline: watchdog.deadline(after: sendTicks)) {
+            transportError = TransportError.timedOut
+            throw TransportError.timedOut
+        }
+        defer {
+            if let watchdog, !watchdog.enter(.none), transportError == nil { transportError = TransportError.timedOut }
+        }
         do {
             switch framing {
             case .contentLength(let length):
