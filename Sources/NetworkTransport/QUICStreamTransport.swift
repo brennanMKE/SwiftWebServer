@@ -253,6 +253,10 @@ public final class QUICStreamTransport: ByteStreamTransport, StreamIdentified {
     }
 }
 
+/// `reset(applicationError:)` and `stopSending(applicationError:)` above are the HTTPCore
+/// stream-reset capability HTTP/3 uses for stream errors (#0101).
+extension QUICStreamTransport: ResettableStream {}
+
 // MARK: - Core
 
 extension QUICStreamTransport {

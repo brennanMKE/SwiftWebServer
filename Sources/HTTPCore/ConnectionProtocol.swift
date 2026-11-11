@@ -23,6 +23,22 @@ public protocol ConnectionProtocol: Sendable {
     func run<T: ByteStreamTransport, H: HTTPHandler>(_ t: T, handler: H, context: ConnectionContext) async
 }
 
+/// A wire protocol that serves one multiplexed connection (HTTP/3 over QUIC): the
+/// ``MultiplexedTransport`` counterpart of ``ConnectionProtocol``.
+///
+/// Every connection of a QUIC listener negotiated one of ``alpnTokens`` in its handshake, so
+/// there is no sniffing. ``run(_:handler:context:)`` owns the connection until it returns and
+/// closes it with an application error code before returning.
+public protocol MultiplexedConnectionProtocol: Sendable {
+    /// ALPN tokens this protocol accepts (`"h3"`).
+    static var alpnTokens: [String] { get }
+
+    /// Serves the connection until it ends. Must return promptly when the task is cancelled.
+    func run<T: MultiplexedTransport, H: HTTPHandler>(
+        _ t: T, handler: H, context: ConnectionContext
+    ) async where T.Stream: ResettableStream
+}
+
 /// The answer of ``ConnectionProtocol/matchesCleartextPreface(_:)``.
 public enum SniffResult: Sendable, Hashable {
     /// The bytes start this protocol's preface.
