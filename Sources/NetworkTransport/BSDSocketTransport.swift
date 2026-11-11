@@ -199,6 +199,61 @@ public final class BSDSocketTransport: ByteStreamTransport {
         }
     }
 
+    /// Sends `region` with `sendfile(2)`: the kernel copies from the page cache to the socket,
+    /// so no bytes pass through user space (#0084). The socket is non-blocking: a partial send
+    /// waits for writability, which is the backpressure, and cancellation while waiting throws
+    /// `CancellationError` as in ``send(_:endOfStream:)``. Callers slice large regions (the
+    /// HTTP/1.1 runner sends at most 1 MiB per call, each under the send timeout).
+    ///
+    /// - Throws: ``TransportError/unexpectedEndOfFile`` when the file is shorter than the
+    ///   region, ``TransportError/closed``, or the socket error.
+    public func sendFile(_ region: FileRegion) async throws {
+        guard region.length > 0 else { return }
+        try core.state.withLock { state throws(TransportError) in
+            if state.closedLocally { throw .closed }
+            if state.outputShutdown { throw .outputShutdown }
+            precondition(!state.sending, "BSDSocketTransport: concurrent send calls")
+            state.sending = true
+        }
+        defer { core.state.withLock { $0.sending = false } }
+
+        var offset = region.offset
+        var remaining = region.length
+        while remaining > 0 {
+            guard let fd = core.acquire() else { throw TransportError.closed }
+            var length = off_t(remaining)
+            let result = Darwin.sendfile(region.file.rawValue, fd, off_t(offset), &length, nil, 0)
+            let code = result == 0 ? 0 : errno
+            core.release()
+            offset += Int64(length)
+            remaining -= Int64(length)
+            if result == 0 {
+                // Complete, or end of file before the region's end.
+                if remaining > 0 && length == 0 { throw TransportError.unexpectedEndOfFile }
+                continue
+            }
+            if code == EINTR { continue }
+            if code == EAGAIN {
+                if length > 0 { continue }       // made progress; try again before waiting
+                switch await core.wait(.write) {
+                case .ready: continue
+                case .cancelled: throw CancellationError()
+                case .closed: throw TransportError.closed
+                }
+            }
+            if (code == ENOTSUP || code == EOPNOTSUPP) && offset == region.offset {
+                // A file `sendfile` cannot read (not a regular file on a supporting file
+                // system): fall back to the bounded read loop, which calls `send`.
+                core.state.withLock { $0.sending = false }
+                defer { core.state.withLock { $0.sending = true } }
+                try await sendFileByReading(FileRegion(file: region.file, offset: offset, length: remaining),
+                                            chunkSize: FileRegion.defaultChunkSize)
+                return
+            }
+            throw core.state.withLock { $0.closedLocally } ? TransportError.closed : TransportError(errno: code)
+        }
+    }
+
     public func close(_ reason: CloseReason) async {
         let first = core.state.withLock { state -> Bool in
             defer { state.closeCalled = true; state.closedLocally = true }
