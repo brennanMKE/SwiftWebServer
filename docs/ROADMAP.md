@@ -179,6 +179,8 @@ Concurrency rules: `AsyncStream` only for low-rate signals; byte/frame flows use
 
 **Spike (M0, one day), questions 1–11:** (1) QUIC listener accepts `curl --http3-only -k` and an NW QUIC client; (2) inbound stream direction/ID readable; (3) server opens three uni streams; (4) FIN mapping both ways; (5) reset/STOP_SENDING codes; (6) connection close with app error code; (7) backpressure via not receiving, send completion as signal; (8) 0-RTT; (9) per-stream cost; (10) TCP+UDP on same port; (11) client tooling (Homebrew curl HTTP/3, `URLSession` `assumesHTTP3Capable` with trust override). **Gate:** 1–7 must work, else Track A pauses, Track B is promoted, and Option B goes to the owner.
 
+**Spike result (2026-11-11, `docs/spikes/quic-spike.md`): conditional GO.** 1–5, 7, 10 and 11 work. Q6 is partial: close works, but the app error code on CONNECTION_CLOSE is unobserved; it is verified under #0104. Q8: no 0-RTT or resumption. Per-stream NW cost is about 590 allocations and 0.4–0.8 ms.
+
 ## 7. Performance discipline
 
 | Lesson | Where it applies |
