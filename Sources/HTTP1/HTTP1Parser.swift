@@ -20,9 +20,9 @@ public import HTTPCore
 /// ## Cost
 ///
 /// One pass over the bytes, no allocation once ``fields`` has grown to fit, no `String`.
-/// Header names are hashed (FNV-1a over lowercased bytes) in the same loop that finds `:`
-/// and resolved through ``HTTPFieldName/lookup(hash:name:)``; token bytes are checked
-/// against ``ASCII/tokenTable`` (256 bits, one per byte value).
+/// Header names are scanned for `:` with one ``ASCII/tokenTable`` test per byte (256 bits,
+/// one per byte value) and resolved through ``HTTPFieldName/lookup(_:from:to:)``, which keys
+/// a perfect-hash table on the name's length and first and last eight bytes.
 ///
 /// ## Rules
 ///
@@ -69,8 +69,9 @@ public struct HTTP1Parser: Sendable {
     var nameEnd = 0
     var valueStart = 0
     var queryStart = -1
-    var hash: UInt32 = ASCII.FNV1a.offsetBasis
     var fieldName: HTTPFieldName = .unknown
+    /// Held here so that resolving a name does not go through the global's lazy initializer.
+    let nameTable = HTTPFieldName.table
     var hostCount = 0
 
     public init(limits: HTTP1ParserLimits = HTTP1ParserLimits(), fieldCapacity: Int = 32) {
@@ -167,7 +168,7 @@ public struct HTTP1Parser: Sendable {
         while i < end {
             switch state {
             case .start:
-                if bytes[i] == cr {
+                if bytes[unchecked: i] == cr {
                     state = .leadingLF
                     i &+= 1
                 } else {
@@ -177,13 +178,22 @@ public struct HTTP1Parser: Sendable {
                 }
 
             case .leadingLF:
-                guard bytes[i] == lf else { return .error(.bareCarriageReturn) }
+                guard bytes[unchecked: i] == lf else { return .error(.bareCarriageReturn) }
                 i &+= 1
                 state = .start
 
             case .method:
+                // `GET ` as one 4-byte compare; any other method takes the loop.
+                if i == tokenStart && i &+ 4 <= end && maxLine >= 4
+                    && bytes.bytes.unsafeLoadUnaligned(fromUncheckedByteOffset: i, as: UInt32.self) == UInt32(littleEndian: 0x2054_4547) {
+                    head.method = .get
+                    i &+= 4
+                    tokenStart = i
+                    state = .target
+                    break
+                }
                 while i < end {
-                    let b = bytes[i]
+                    let b = bytes[unchecked: i]
                     if i &- lineStart >= maxLine && b != cr && b != lf { return .error(.requestLineTooLong) }
                     if b == sp {
                         guard i > tokenStart,
@@ -201,9 +211,22 @@ public struct HTTP1Parser: Sendable {
                 }
 
             case .target:
-                while i < end {
-                    let b = bytes[i]
-                    if i &- lineStart >= maxLine && b != cr && b != lf { return .error(.requestLineTooLong) }
+                // Bytes from `stop` on are past the request-line limit.
+                let stop = maxLine < end &- lineStart ? lineStart &+ maxLine : end
+                let raw = bytes.bytes
+                while i < stop {
+                    // Eight bytes at a time while none is SP, `%`, `?` or outside 0x21-0x7E.
+                    while i &+ 8 <= stop {
+                        let w = UInt64(littleEndian: raw.unsafeLoadUnaligned(fromUncheckedByteOffset: i, as: UInt64.self))
+                        let special = Self.targetSpecial(w)
+                        if special != 0 {
+                            i &+= special.trailingZeroBitCount &>> 3
+                            break
+                        }
+                        i &+= 8
+                    }
+                    guard i < stop else { break }
+                    let b = bytes[unchecked: i]
                     if b == sp {
                         guard i > tokenStart else { return .error(.invalidRequestTarget) }
                         if let error = classifyTarget(bytes, end: i) { return .error(error) }
@@ -220,10 +243,27 @@ public struct HTTP1Parser: Sendable {
                     }
                     i &+= 1
                 }
+                if state == .target && i < end {
+                    // The byte at the limit: CR and LF are not counted, but are invalid here.
+                    let b = bytes[unchecked: i]
+                    return .error(b != cr && b != lf ? .requestLineTooLong : .invalidRequestTarget)
+                }
 
             case .version:
+                // `HTTP/1.1` or `HTTP/1.0` then CR as one 8-byte compare, when the eight bytes
+                // are within the request-line limit.
+                if i == tokenStart && i &+ 9 <= end && i &+ 8 &- lineStart <= maxLine
+                    && bytes[unchecked: i &+ 8] == cr {
+                    let w = UInt64(littleEndian: bytes.bytes.unsafeLoadUnaligned(fromUncheckedByteOffset: i, as: UInt64.self))
+                    if w == Self.http11 || w == Self.http10 {
+                        head.version = w == Self.http11 ? .http1_1 : .http1_0
+                        i &+= 9
+                        state = .requestLineLF
+                        break
+                    }
+                }
                 while i < end {
-                    let b = bytes[i]
+                    let b = bytes[unchecked: i]
                     if i &- lineStart >= maxLine && b != cr && b != lf { return .error(.requestLineTooLong) }
                     if b == cr {
                         if let error = classifyVersion(bytes.extracting(tokenStart..<i)) { return .error(error) }
@@ -237,12 +277,12 @@ public struct HTTP1Parser: Sendable {
                 }
 
             case .requestLineLF:
-                guard bytes[i] == lf else { return .error(.bareCarriageReturn) }
+                guard bytes[unchecked: i] == lf else { return .error(.bareCarriageReturn) }
                 i &+= 1
                 state = .lineStart
 
             case .lineStart:
-                let b = bytes[i]
+                let b = bytes[unchecked: i]
                 if b == cr {
                     i &+= 1
                     state = .finalLF
@@ -254,53 +294,69 @@ public struct HTTP1Parser: Sendable {
                     return .error(.tooManyFields)
                 } else {
                     tokenStart = i
-                    hash = ASCII.FNV1a.offsetBasis
                     state = .name
+                    // A field line normally runs to its LF without returning to the dispatch.
+                    fallthrough
                 }
 
             case .name:
-                // Scan and hash in one pass (docs/ROADMAP.md §7).
                 // `:` is not a tchar, so one test per byte finds both the end and errors.
-                var h = hash
-                while i < end {
-                    let b = bytes[i]
-                    guard ASCII.isTokenCharacter(b) else { break }
-                    h = (h ^ UInt32(ASCII.lowercased(b))) &* ASCII.FNV1a.prime
+                // The name is resolved from its length and first/last eight bytes once `:`
+                // is found, so the scan carries no per-byte hash chain (#0112).
+                // Eight bytes at a time while all are letters, digits or `-` (SWAR); the first
+                // other byte (`:`, another tchar, or an error) is handled one at a time.
+                let raw = bytes.bytes
+                while true {
+                    while i &+ 8 <= end {
+                        let w = UInt64(littleEndian: raw.unsafeLoadUnaligned(fromUncheckedByteOffset: i, as: UInt64.self))
+                        let other = Self.nonAlphanumericOrDash(w)
+                        if other != 0 {
+                            i &+= other.trailingZeroBitCount &>> 3
+                            break
+                        }
+                        i &+= 8
+                    }
+                    guard i < end, ASCII.isTokenCharacter(bytes[unchecked: i]) else { break }
                     i &+= 1
                 }
-                hash = h
                 guard i < end else { break }
-                let b = bytes[i]
+                let b = bytes[unchecked: i]
                 guard b == colon else {
                     return .error(b == sp || b == ht ? .whitespaceBeforeColon : .invalidFieldName)
                 }
                 guard i > tokenStart else { return .error(.invalidFieldName) }
-                fieldName = HTTPFieldName.lookup(hash: h, name: bytes.extracting(tokenStart..<i))
+                fieldName = nameTable.lookup(bytes, from: tokenStart, to: i)
                 if fieldName == .host { hostCount &+= 1 }
                 nameStart = tokenStart
                 nameEnd = i
                 i &+= 1
                 state = .valueOWS
+                fallthrough
 
             case .valueOWS:
-                while i < end, bytes[i] == sp || bytes[i] == ht { i &+= 1 }
+                while i < end, bytes[unchecked: i] == sp || bytes[unchecked: i] == ht { i &+= 1 }
                 guard i < end else { break }
                 valueStart = i
                 state = .value
+                fallthrough
 
             case .value:
                 // Eight bytes at a time while none is a control byte or DEL (SWAR), then
                 // byte by byte. A word with any such byte (CR, HTAB, NUL, ...) falls through.
                 let raw = bytes.bytes
                 while i &+ 8 <= end {
-                    let w = UInt64(littleEndian: raw.unsafeLoadUnaligned(fromByteOffset: i, as: UInt64.self))
+                    let w = UInt64(littleEndian: raw.unsafeLoadUnaligned(fromUncheckedByteOffset: i, as: UInt64.self))
                     let del = w ^ Self.repeated(0x7F)
                     let flags = ((w &- Self.repeated(0x20)) | (del &- Self.repeated(0x01))) & ~w & Self.repeated(0x80)
-                    if flags != 0 { break }
+                    if flags != 0 {
+                        // Borrows only start at a flagged byte, so the lowest flag is exact.
+                        i &+= flags.trailingZeroBitCount &>> 3
+                        break
+                    }
                     i &+= 8
                 }
                 while i < end {
-                    let b = bytes[i]
+                    let b = bytes[unchecked: i]
                     if (b >= sp && b != 0x7F) || b == ht {
                         i &+= 1
                     } else if b == cr {
@@ -312,7 +368,7 @@ public struct HTTP1Parser: Sendable {
                 guard i < end else { break }
                 // Trim trailing OWS; leading OWS was skipped, so this stops at valueStart.
                 var valueEnd = i
-                while valueEnd > valueStart && (bytes[valueEnd &- 1] == sp || bytes[valueEnd &- 1] == ht) {
+                while valueEnd > valueStart && (bytes[unchecked: valueEnd &- 1] == sp || bytes[unchecked: valueEnd &- 1] == ht) {
                     valueEnd &-= 1
                 }
                 let base = headStart
@@ -320,21 +376,55 @@ public struct HTTP1Parser: Sendable {
                               nameView: ByteView(offset: base &+ nameStart, length: nameEnd &- nameStart),
                               valueView: ByteView(offset: base &+ valueStart, length: valueEnd &- valueStart))
                 i &+= 1
-                state = .fieldLF
+                if i < end && bytes[unchecked: i] == lf {
+                    i &+= 1
+                    state = .lineStart
+                } else {
+                    state = .fieldLF
+                }
 
             case .fieldLF:
-                guard bytes[i] == lf else { return .error(.bareCarriageReturn) }
+                guard bytes[unchecked: i] == lf else { return .error(.bareCarriageReturn) }
                 i &+= 1
                 state = .lineStart
 
             case .finalLF:
-                guard bytes[i] == lf else { return .error(.bareCarriageReturn) }
+                guard bytes[unchecked: i] == lf else { return .error(.bareCarriageReturn) }
                 i &+= 1
                 state = .start
                 return .complete
             }
         }
         return .needMoreBytes
+    }
+
+    /// Bit 7 of each byte of `w` that is not an ASCII letter, digit or `-`, the bytes of
+    /// almost every field name; 0 when all eight are. Exact per byte (no carries cross bytes).
+    @inline(__always)
+    static func nonAlphanumericOrDash(_ w: UInt64) -> UInt64 {
+        let low = w & repeated(0x7F)
+        let digit = (low &+ repeated(0x80 &- 0x30)) & ~(low &+ repeated(0x80 &- 0x3A))
+        let folded = low | repeated(0x20)
+        let letter = (folded &+ repeated(0x80 &- 0x61)) & ~(folded &+ repeated(0x80 &- 0x7B))
+        let dash = ~((low ^ repeated(0x2D)) &+ repeated(0x7F))
+        return ~((digit | letter | dash) & ~w) & repeated(0x80)
+    }
+
+    /// `HTTP/1.1` and `HTTP/1.0` as little-endian words.
+    static var http11: UInt64 { 0x312E_312F_5054_5448 }
+    static var http10: UInt64 { 0x302E_312F_5054_5448 }
+
+    /// Bit 7 of the first byte of `w` that is SP, `%`, `?`, below 0x21 or above 0x7E (bits
+    /// above it may be set too); 0 when there is none.
+    @inline(__always)
+    static func targetSpecial(_ w: UInt64) -> UInt64 {
+        let below = (w &- repeated(0x21)) & ~w
+        let above = w | (w &+ repeated(0x01))
+        let percent = w ^ repeated(0x25)
+        let question = w ^ repeated(0x3F)
+        let isPercent = (percent &- repeated(0x01)) & ~percent
+        let isQuestion = (question &- repeated(0x01)) & ~question
+        return (below | above | isPercent | isQuestion) & repeated(0x80)
     }
 
     /// `byte` in every byte of a word.

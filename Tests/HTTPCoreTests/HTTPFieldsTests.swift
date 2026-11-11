@@ -195,3 +195,87 @@ import HTTPCore
         #expect(owned.valueStrings(for: .host) == ["example.com", "dup"])
     }
 }
+
+/// ``HTTPFieldIndex`` keeps its three parallel arrays in one copy-on-write allocation (#0112).
+@Suite struct HTTPFieldIndexStorageTests {
+    static func view(_ n: Int) -> ByteView { ByteView(offset: n, length: n &+ 1) }
+
+    static func name(_ n: Int) -> HTTPFieldName { n.isMultiple(of: 3) ? .host : .unknown }
+
+    static func filled(_ count: Int, capacity: Int = 4) -> HTTPFieldIndex {
+        var index = HTTPFieldIndex(minimumCapacity: capacity)
+        for i in 0..<count {
+            index.append(name(i), nameView: view(i), valueView: view(i &+ 100))
+        }
+        return index
+    }
+
+    static func check(_ index: HTTPFieldIndex, _ expected: [Int], sourceLocation: SourceLocation = #_sourceLocation) {
+        #expect(index.count == expected.count, sourceLocation: sourceLocation)
+        #expect(Array(index.nameViews) == expected.map(view), sourceLocation: sourceLocation)
+        #expect(Array(index.valueViews) == expected.map { view($0 &+ 100) }, sourceLocation: sourceLocation)
+        #expect(Array(index.names) == expected.map(name), sourceLocation: sourceLocation)
+        for (position, n) in expected.enumerated() {
+            #expect(index[position] == HTTPField(name: name(n), nameView: view(n), valueView: view(n &+ 100)),
+                    sourceLocation: sourceLocation)
+        }
+        #expect(index.contains(.host) == expected.contains { $0.isMultiple(of: 3) }, sourceLocation: sourceLocation)
+    }
+
+    @Test func growsPastCapacityKeepingOrder() {
+        let index = Self.filled(100, capacity: 1)
+        Self.check(index, Array(0..<100))
+        #expect(index.capacity >= 100)
+        #expect(HTTPFieldIndex().capacity == 0)
+        #expect(HTTPFieldIndex(minimumCapacity: 7).capacity == 7)
+    }
+
+    @Test func copiesAreIndependent() {
+        let original = Self.filled(5)
+        var appended = original
+        appended.append(.host, nameView: Self.view(9), valueView: Self.view(109))
+        var removed = original
+        removed.remove(at: 0)
+        var cleared = original
+        cleared.removeAll()
+        var filtered = original
+        filtered.removeAll(.host)
+        Self.check(original, [0, 1, 2, 3, 4])
+        Self.check(appended, [0, 1, 2, 3, 4, 9])
+        Self.check(removed, [1, 2, 3, 4])
+        Self.check(cleared, [])
+        Self.check(filtered, [1, 2, 4])
+        #expect(cleared.capacity == original.capacity)
+        // Two copies appending at the same position do not see each other's field.
+        var a = original
+        var b = original
+        a.append(.unknown, nameView: Self.view(7), valueView: Self.view(107))
+        b.append(.host, nameView: Self.view(6), valueView: Self.view(106))
+        Self.check(a, [0, 1, 2, 3, 4, 7])
+        Self.check(b, [0, 1, 2, 3, 4, 6])
+    }
+
+    @Test func columnsAreSnapshots() {
+        var index = Self.filled(3)
+        let names = index.names
+        let values = index.valueViews
+        index.removeAll()
+        index.append(.connection, nameView: Self.view(50), valueView: Self.view(150))
+        #expect(Array(names) == [.host, .unknown, .unknown])
+        #expect(Array(values) == [Self.view(100), Self.view(101), Self.view(102)])
+        #expect(index.names.first == .connection)
+        #expect(names.count == 3 && names.indices == 0..<3)
+    }
+
+    @Test func removalsKeepOrderAndPresence() {
+        var index = Self.filled(10)
+        index.remove(at: 9)
+        index.remove(at: 0)
+        Self.check(index, [1, 2, 3, 4, 5, 6, 7, 8])
+        index.removeAll(.host)
+        Self.check(index, [1, 2, 4, 5, 7, 8])
+        #expect(index.firstIndex(of: .host) == nil)
+        index.removeAll(keepingCapacity: false)
+        #expect(index.capacity == 0 && index.isEmpty)
+    }
+}

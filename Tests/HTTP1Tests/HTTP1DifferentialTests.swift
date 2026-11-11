@@ -162,3 +162,59 @@ import HTTPTestSupport
         print("HTTP1 differential: \(count) inputs, outcomes \(statuses.sorted { $0.key < $1.key })")
     }
 }
+
+/// The word-at-a-time paths added in #0112 (`GET ` and `HTTP/1.x` compares, SWAR scans of
+/// the target, field names and values) agree with the reference at every request-line limit
+/// that falls inside them, whole and split at every offset.
+@Suite struct HTTP1FastPathTests {
+    static let heads: [String] = [
+        HTTP1Corpus.browser,
+        "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET / HTTP/1.0\r\n\r\n",
+        "GET /a%20b?c=%41&d HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /averyveryverylongpathsegment/x.html?q=1?2 HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /p HTTP/1.2\r\nHost: a\r\n\r\n",
+        "GET /p HTTP/1.1 \r\nHost: a\r\n\r\n",
+        "GET /p\tq HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /p\u{7F}q HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GETX / HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GE / HTTP/1.1\r\nHost: a\r\n\r\n",
+        "get / HTTP/1.1\r\nHost: a\r\n\r\n",
+        "POST /submit HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nX_Under~Score^Name!: v\r\nAccess-Control-Request-Headers: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nUser-Agent: a\tb  c \t\r\nAccept: \u{80}\u{FF}obs\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nBad\u{0}Name: v\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nValue: a\u{0}b\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nValue: abcdefgh\nX: y\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nContent-Lengt\u{C1}: 3\r\n\r\n",
+        "GET / HTTP/1.1\r\nhOsT: a\r\nHOST: b\r\n\r\n",
+    ]
+
+    @Test func everyRequestLineLimitMatchesReference() {
+        var compared = 0
+        for text in Self.heads {
+            let bytes = HTTP1Corpus.bytes(text)
+            let lineLength = bytes.firstIndex(of: 0x0D) ?? bytes.count
+            for maxLine in 1...(lineLength + 2) {
+                let limits = HTTP1ParserLimits(maxRequestLineLength: maxLine)
+                let reference = ReferenceHTTP1Parser.parse(bytes, limits: limits)
+                let fast = ParserDriver.oneShot(bytes, limits: limits)
+                #expect(fast == reference, "\(text.debugDescription) maxLine \(maxLine): fast \(fast) reference \(reference)")
+                compared += 1
+            }
+        }
+        #expect(compared > 20 * Self.heads.count)
+    }
+
+    @Test func everySplitMatchesReference() {
+        for text in Self.heads {
+            let bytes = HTTP1Corpus.bytes(text)
+            let reference = ReferenceHTTP1Parser.parse(bytes)
+            #expect(ParserDriver.oneShot(bytes) == reference, "\(text.debugDescription)")
+            for split in 0...bytes.count {
+                let outcome = ParserDriver.feed(bytes, chunks: [split]).last
+                #expect(outcome == reference, "\(text.debugDescription) split at \(split)")
+            }
+        }
+    }
+}
