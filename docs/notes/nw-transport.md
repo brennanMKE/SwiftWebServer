@@ -165,7 +165,9 @@ serial queue per connection runs the group and all its streams.
 - **Stream credit.** NW never replenishes MAX_STREAMS. When a peer stream finishes (cancelled or
   failed after it was ready), the adapter sets the group's `localMaxStreamsBidirectional` /
   `Unidirectional` to initial + finished. Without this, the conformance test stalls until the
-  idle timeout.
+  idle timeout. `QUICConnection` is also `StreamCreditGranting` (#0102): HTTP/3 raises the limit
+  to its own `maxConcurrentRequestStreams` (+ finished requests) through `raiseMaxStreams`,
+  which only ever raises it and runs on the connection's queue.
 - **Sends** are split into `sendChunkSize` chunks (64 KiB), each waiting for `.contentProcessed`.
   NW's own per-stream buffer cannot be bounded: with a stalled reader a client accepted about
   4.1 MiB (256 KiB stream window plus NW buffering) before sends stalled. In memory the same

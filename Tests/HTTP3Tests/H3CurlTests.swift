@@ -39,6 +39,58 @@ struct H3CurlTests {
         #expect(lines.count == 20)
         #expect(lines.allSatisfy { $0.hasPrefix("200 ") })
     }
+
+    /// #0102: a shutdown while curl waits on a slow handler sends GOAWAY, lets the request
+    /// finish, then closes the connection, and the whole server (accept loop and connection
+    /// tasks) returns well before QUIC's 10 s idle timeout could have ended it.
+    @Test func shutdownDuringASlowRequestLetsCurlFinishAndTheServerExits() async throws {
+        let started = Flag()
+        let handler = ClosureHandler { _ in
+            started.set()
+            try await Task.sleep(for: .milliseconds(1500))
+            return HTTPResponse(status: .ok, body: .bytes(ByteBuffer("slow done")))
+        }
+        let material = try TestIdentity.load()
+        let identity = try TLSIdentity(pkcs12: material.pkcs12, password: TestIdentity.password)
+        let listener = try QUICListener(
+            configuration: .init(host: "127.0.0.1", port: 0, quic: QUICConfiguration(alpn: HTTP3.alpnTokens, idleTimeoutMilliseconds: 10_000)),
+            identity: identity)
+        let port = try await listener.start()
+        let shutdown = ShutdownSignal()
+        let clock = ContinuousClock()
+        let start = clock.now
+        let output = try await withThrowingTaskGroup(of: String?.self) { group in
+            group.addTask {
+                await withDiscardingTaskGroup { connections in
+                    do {
+                        for try await connection in listener.connections {
+                            connections.addTask {
+                                await HTTP3().run(connection, handler: handler,
+                                                  context: ConnectionContext(info: connection.info, shutdown: shutdown))
+                            }
+                        }
+                    } catch {}
+                }
+                return nil
+            }
+            group.addTask {
+                try await runCurl(["--http3-only", "-k", "-s", "-S", "--max-time", "15",
+                                   "-w", "\\n%{http_code} %{http_version}", "https://127.0.0.1:\(port)/slow"])
+            }
+            defer { group.cancelAll() }
+            await started.wait()
+            // What `Server` does when draining: stop accepting, then signal every connection.
+            await listener.close()
+            shutdown.trigger()
+            var output: String?
+            for try await result in group {
+                if let result { output = result }
+            }
+            return output
+        }
+        #expect(output == "slow done\n200 3")
+        #expect(start.duration(to: clock.now) < .seconds(8))
+    }
 }
 
 /// Homebrew curl, built with HTTP/3 (ngtcp2).
