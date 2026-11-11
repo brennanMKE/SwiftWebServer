@@ -23,8 +23,9 @@
 ///
 /// ## Unsafe code
 ///
-/// All pointer manipulation in `HTTPCore` lives in this file. Everything else reads bytes
-/// through `Span<UInt8>` / `RawSpan` closures, which are bounds-checked.
+/// All pointer manipulation in `HTTPCore` lives in this file and `ByteBuffer+Writer.swift`.
+/// Everything else reads bytes through `Span<UInt8>` / `RawSpan` closures, which are
+/// bounds-checked.
 public struct ByteBuffer: Sendable {
     /// Heap storage. Mutated only while uniquely referenced (checked by
     /// `isKnownUniquelyReferenced`), which is what makes the `@unchecked Sendable` sound.
