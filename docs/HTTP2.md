@@ -1,3 +1,5 @@
+> **Superseded.** This plan is replaced by [`docs/ROADMAP.md`](ROADMAP.md) (milestones M11–M13 for HTTP/2) and the milestone table in [`issues/Issues.md`](../issues/Issues.md). Two parts remain authoritative and are carried into Track B: the **Default limits** table and the DoS list (its rate-limit rows plus the CVE-2023-44487 and VU#421644 references, implemented in #0056). Ignore the rest, in particular the phases, the actor-based connection design and the "HTTP/3 is a non-goal" statement.
+
 # HTTP/2 Implementation Plan
 
 This plan takes SwiftWebServer from a one-request-per-connection HTTP/1.1 static file server to a complete HTTP/2 server ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113) with HPACK, [RFC 7541](https://www.rfc-editor.org/rfc/rfc7541)). HTTP/1.1 stays available as a fallback. Every phase is tracked as issues in `issues/`; see `issues/Issues.md` for the phase-to-issue map.

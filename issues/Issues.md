@@ -1,6 +1,6 @@
 # SwiftWebServer
 
-SwiftWebServer is a dependency-free web server for macOS written in Swift 6 with Swift Concurrency and Network.framework. It serves static files from `Root/Public` and is being extended to a full HTTP/2 implementation built on `AsyncSequence` and structured concurrency, with no Combine (see `HTTP2.md`). Bugs, HTTP/1.1 conformance gaps, security problems, and HTTP/2 feature work all belong here.
+SwiftWebServer is a dependency-free, modular HTTP/1.1 + HTTP/2 + HTTP/3 server for macOS 15+ written in Swift 6 with Swift Concurrency and Network.framework. It serves static files from `Root/Public`. The design and milestone plan is `docs/ROADMAP.md`; code rules are in `CLAUDE.md`. Bugs, conformance gaps, security problems, performance work, and feature work for every protocol track all belong here.
 
 This file is the local guide for managing issues in this project. The companion Mac app (Issues.app) watches the `issues/` folder and renders the current state. Markdown files (and `project.json`) are the source of truth — there is no generated artifact or index to keep in sync.
 
@@ -232,10 +232,24 @@ Status flow: `open` → `in-progress` → `resolved`. **Never set `closed`** —
 
 ### Build / verify command for this project
 
-- `swift build`
-- `swift test`: must show test names executing and a passing summary. (Until #0001 lands there is no test target.)
-- Run locally: `ROOT_PATH=$PWD/Root swift run SwiftWebServer`. Until #0003 is fixed, stop it with `pkill -9 -f SwiftWebServer`.
-- HTTP/2 checks, once implemented: `curl -v --http2-prior-knowledge http://localhost:8080/`, `curl -v --http2 -k https://localhost:8443/`, and `h2spec` (`brew install h2spec`).
+Every change merged to `main` must pass:
+
+```bash
+swift build && swift test
+```
+
+`swift test` must show test names executing and a passing summary.
+
+**Milestone-end comprehensive runs.** The last issue of a milestone also runs the integration tests, `swift run -c release sws-bench` (results recorded in `docs/benchmarks/`; a regression over 10% blocks the milestone, see #0063), and the external checks that milestone's exit criteria name, for example:
+
+- Run locally: `ROOT_PATH=$PWD/Root swift run SwiftWebServer` (until #0079 lands, stop the legacy server with `pkill -9 -f SwiftWebServer`).
+- HTTP/1.1 load: `oha` (M3, M4).
+- TLS: `curl -k https://localhost:8443/` and a `URLSession` test (M5).
+- HTTP/3: `/opt/homebrew/opt/curl/bin/curl --http3-only -k https://localhost:8443/` (M9, M10); the system `/usr/bin/curl` has no HTTP/3.
+- HTTP/2: `curl -v --http2-prior-knowledge http://localhost:8080/`, `curl -v --http2 -k https://localhost:8443/`, `h2spec`, `h2load` (M12, M13).
+- WebSockets: `URLSessionWebSocketTask` echo tests (M14).
+
+Tool prerequisites and the test identity come from #0072 (`scripts/check-tools.sh`, `scripts/make-test-identity.sh`).
 
 ### When the subagent can't finish
 
@@ -296,52 +310,61 @@ The `*` matches the U+202F. Substitute the actual timestamp; if you don't know w
 
 ## Module conventions for this project
 
-Use these names in the **Module** row. Separate multiple modules with ` / `.
+Use these names in the **Module** row. Separate multiple modules with ` / `. They match the targets in `docs/ROADMAP.md` §5.1.
 
-- `Lifecycle`: startup, shutdown, signals, `ExitHandler`, `main.swift`
-- `Connection`: accepting and driving connections
-- `Transport`: the byte-level `Transport` abstraction and Network.framework adapters
-- `HTTP1`: HTTP/1.1 parsing and serialization
-- `Semantics`: HTTP message types, headers, status codes, conditional requests
-- `StaticFiles`: file mapping, MIME types, caching validators
-- `Security`: limits, timeouts, path safety, DoS mitigations
-- `Config`: `http-config.json` and `HTTPConfig`
-- `HTTP2Frames`: frame codec and frame AsyncSequence
-- `HPACK`: header compression
-- `HTTP2Connection`: HTTP/2 connection and stream state, GOAWAY, and RST_STREAM
-- `FlowControl`: HTTP/2 windows and concurrency limits
-- `TLS`: certificates and ALPN
-- `Conformance`: h2spec, curl, and browser interoperability
-- `Performance`: benchmarks and profiling
-- `Tests`: test infrastructure
+- `HTTPCore`: `ByteBuffer`, `HTTPFields`, request/response types, extension-point protocols, limits, `BoundedAsyncQueue`, date cache, shared pseudo-header validation
+- `HTTP1`: HTTP/1.1 parser, serializer, chunked codec, connection state machine and runner
+- `HTTPServer`: `Server`, `ServerConfiguration`, lifecycle state machine, protocol registry, listeners
+- `NetworkTransport`: `NWListener`/`NWConnection` adapters for TCP, TLS (+ALPN) and QUIC
+- `HeaderCompression`: prefix integers, string literals, Huffman (shared by HPACK and QPACK)
+- `HPACK`: HTTP/2 header compression tables, decoder, encoder
+- `HTTP2`: HTTP/2 frames, connection and stream state machines, flow control, limits
+- `QPACK`: HTTP/3 header compression
+- `HTTP3`: HTTP/3 frames, control and request streams, GOAWAY, Alt-Svc
+- `WebSockets`: RFC 6455 and its HTTP/2 and HTTP/3 bootstraps
+- `StaticFiles`: file mapping, containment, MIME, validators, conditional requests, Range
+- `Compression`: content-coding component
+- `VirtualHosts`: host-based routing component
+- `Auth`: authentication component
+- `AccessLog`: access logging and metrics component
+- `Router`: method and path routing component
+- `ConfigFile`: JSON config decoding into components (CLI only)
+- `Bench`: `sws-bench` harness and benchmark results
+- `Tests`: test infrastructure, `HTTPTestSupport`, integration tests, external tooling
 - `Docs`: markdown docs and scripts
-- `Optional`: optional HTTP/2 extensions (Phase 12)
+- `Legacy`: the pre-roadmap server, kept buildable until the M4 cut-over (#0086)
 
-## Phases
+Older issues may still carry pre-roadmap module names (`Lifecycle`, `Connection`, `Transport`, `Semantics`, `Security`, `Config`, `HTTP2Frames`, `HTTP2Connection`, `FlowControl`, `TLS`, `Conformance`, `Performance`, `Optional`); leave them as filed.
 
-Work proceeds in phase order. This ordering overrides issue number order. Within a phase, pick the lowest-numbered `open` issue whose **Blocked by** issues (in its `## Relation` section) are all resolved. The full design and rationale are in `HTTP2.md` at the repo root.
+## Milestones
 
-| Phase | Name | Issues |
-|---|---|---|
-| 1 | Test foundations | #0001–#0002 |
-| 2 | Lifecycle and connection handling | #0003–#0010 |
-| 3 | Security | #0011–#0015 |
-| 4 | HTTP/1.1 semantics | #0016–#0022 |
-| 5 | Config, performance, docs | #0023–#0026 |
-| 6 | AsyncSequence architecture | #0027–#0033 |
-| 7 | HTTP/2 wire layer | #0034–#0041 |
-| 8 | HTTP/2 connections and streams | #0042–#0052 |
-| 9 | HTTP/2 flow control and limits | #0053–#0056 |
-| 10 | TLS and ALPN | #0057–#0059 |
-| 11 | Conformance and performance | #0060–#0064 |
-| 12 | Optional HTTP/2 extensions | #0065–#0068 |
+Work proceeds in milestone order from `docs/ROADMAP.md` §8. **Milestone order wins over issue number order**: the issue number is only a filing order. Within a milestone, pick the lowest-numbered `open` issue whose **Blocked by** issues (in its `## Relation` section) are all resolved.
 
-Phases 1–5 fix bugs in the existing HTTP/1.1 server. Phases 6–12 implement HTTP/2.
+Tracks A (HTTP/3), B (HTTP/2) and C (WebSockets) are independent of each other and can run in parallel once their dependencies are met: Tracks A and B after M5 (Track A also needs a GO from the QUIC spike, #0071), Track C after M3. M6 components can be picked up any time after M4. Parallel work happens in git worktrees per `CLAUDE.md`.
 
-### Design rules for all HTTP/2 work
+Legacy issues 0001–0068 that ROADMAP §9 merges into newer issues stay `open` with a **Superseded by** line in their Relation block. Don't work them directly; work the superseding issue, whose acceptance tests include the legacy repro steps. The owner closes the legacy issue.
 
-- Bytes, frames, requests, and bodies flow through `AsyncSequence`. Protocol layers are sequence transformers.
-- Structured concurrency (task groups, cancellation) owns connection and stream lifetimes. No unstructured `Task {}` for connection or stream work.
-- **No Combine.**
-- Protocol state machines (HPACK, HTTP/2 connection) are synchronous, pure value types with no I/O.
-- Swift 6 strict concurrency, and no external package dependencies.
+| Milestone | Name | Issues | Depends on | Exit criteria (summary) |
+|---|---|---|---|---|
+| M0 | Ground | #0069–#0072 | — | `swift test` runs real tests; legacy baseline recorded; QUIC spike go/no-go |
+| M1 | Bytes and HTTP/1.1 codec | #0073–#0076 | M0 | Parses identically split at every byte offset; oversized head → 431; zero allocations; ns/request recorded |
+| M2 | Transport and lifecycle | #0077–#0079 | M1 | Two servers on port 0 in one process; exit 0 on SIGTERM, 1 on bad config; per-read overhead measured |
+| M3 | HTTP/1.1 connections | #0080–#0082 | M2 | In-memory + curl tests; slow-header client closed; keep-alive throughput vs baseline |
+| M4 | Components, StaticFiles, cut-over | #0083–#0086 | M3 | Repro steps of 0003–0025 pass as tests; throughput beats baseline; flat memory on large file; `Legacy` deleted |
+| M5 | TLS and protocol registry | #0087–#0089 | M4, #0072 | `curl -k https://localhost:8443/` and a `URLSession` test |
+| M6 | Small components | #0090–#0094 | M4 | Each: unit tests, and no benchmark change when unregistered |
+| M7 | Pure codecs (Track A; 7.1 shared with B) | #0095–#0097 | M5; spike GO for #0096 | RFC 7541 App. C Huffman vectors and RFC 9204 examples |
+| M8 | QUIC transport (Track A) | #0098–#0099 | M5, spike GO | Echo test vs NW QUIC client incl. FIN and reset |
+| M9 | HTTP/3 MVP (Track A) | #0100–#0103 | M7, M8 | `curl --http3-only -k` fetches static files, concurrent and large; in-memory malformed-frame suite |
+| M10 | HTTP/3 hardening (Track A) | #0104–#0107, #0062 (h3 part via #0105), #0065 (h3 part via #0107) | M9 | Abuse limits tested; browser interop; load numbers; optional QPACK dynamic table and priorities |
+| M11 | HTTP/2 codecs (Track B) | #0034–#0036, #0039–#0041 | M5, #0095 | RFC 7541 App. C vectors |
+| M12 | HTTP/2 connections and streams (Track B) | #0042–#0052, #0058 (h2 routing) | M11 | `curl --http2-prior-knowledge` and `curl --http2 -k`, concurrent streams |
+| M13 | HTTP/2 flow control and limits (Track B) | #0053–#0056, #0061, #0062 (h2), #0065 (optional) | M12 | `h2spec` passes; `h2load` numbers |
+| M14 | WebSockets (Track C) | #0108–#0109 | M3 (and #0083) | `URLSessionWebSocketTask` echo tests; Autobahn when Docker is available |
+| M15 | WebSocket extensions (Track C) | #0110 (optional), #0067 (RFC 8441 over h2), #0111 (RFC 9220 over h3) | M14; M12 for #0067; M9 for #0111 | Extended CONNECT echo on each |
+| — | Per-milestone benchmarks | #0063 | #0070 | Each milestone records a `sws-bench` run; a regression over 10% blocks it |
+| — | Won't fix | #0066 (server push), #0068 (h2c Upgrade) | — | Status `wontfix` by owner decision (ROADMAP §2) |
+
+## Design rules
+
+Design rules live in `CLAUDE.md` (code rules, binding) and `docs/ROADMAP.md` (architecture, state machines, performance discipline, milestone plan). `docs/HTTP2.md` is superseded except for its default limits table and DoS list, which Track B still uses.
