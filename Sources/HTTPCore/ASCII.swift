@@ -99,6 +99,19 @@ public enum ASCII {
         byte &- 0x41 < 26 ? byte | 0x20 : byte
     }
 
+    /// The eight bytes of `word` with `A`-`Z` folded to `a`-`z` (SWAR); every other byte,
+    /// including `@`, `[`-`` ` `` and bytes 0x80 and above, is unchanged.
+    @inlinable
+    public static func lowercased(word: UInt64) -> UInt64 {
+        let lowBits = word & 0x7F7F_7F7F_7F7F_7F7F
+        // Per byte, adding 0x80 - c sets bit 7 when the byte's low seven bits are >= c; the
+        // sums stay below 0x100, so no carry crosses into the next byte.
+        let atLeastA = lowBits &+ 0x3F3F_3F3F_3F3F_3F3F    // 0x80 - 0x41 ("A")
+        let pastZ = lowBits &+ 0x2525_2525_2525_2525       // 0x80 - 0x5B (one past "Z")
+        let upper = atLeastA & ~pastZ & ~word & 0x8080_8080_8080_8080
+        return word | (upper &>> 2)
+    }
+
     /// Case-insensitive ASCII comparison of `bytes` with `literal`.
     @inlinable
     public static func equalsCaseInsensitive(_ bytes: Span<UInt8>, _ literal: StaticString) -> Bool {

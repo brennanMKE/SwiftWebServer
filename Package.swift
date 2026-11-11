@@ -38,7 +38,7 @@ let libraries: [Library] = [
     Library("HTTPCore"),
     Library("HTTP1", dependencies: ["HTTPCore"], testDependencies: ["HTTPTestSupport"]),
     Library("HTTPServer", dependencies: ["HTTPCore", "HTTP1"]),
-    Library("NetworkTransport", dependencies: ["HTTPCore"]),
+    Library("NetworkTransport", dependencies: ["HTTPCore"], testDependencies: ["HTTPTestSupport"]),
     // Header compression shared by HPACK and QPACK
     Library("HeaderCompression"),
     Library("HPACK", dependencies: ["HeaderCompression", "HTTPCore"]),
