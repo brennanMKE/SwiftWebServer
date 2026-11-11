@@ -83,6 +83,23 @@ public protocol MultiplexedTransport: Sendable {
     func close(applicationError: UInt64) async
 }
 
+/// A stream that can be abandoned with an application error code: QUIC RESET_STREAM and
+/// STOP_SENDING (RFC 9000 §3.5). HTTP/3 uses it for stream errors such as `H3_MESSAGE_ERROR`
+/// and to ignore unknown unidirectional streams (RFC 9114 §6.2, §8).
+///
+/// Conformers: `QUICStreamTransport` (NetworkTransport) and `InMemoryMultiplexedTransport.Stream`
+/// (HTTPTestSupport). Network.framework has no call that sends only STOP_SENDING, so there
+/// ``stopSending(applicationError:)`` abandons both directions of the local end; callers must
+/// not rely on the receive side surviving it.
+public protocol ResettableStream: Sendable {
+    /// Abandons the sending direction with RESET_STREAM(`applicationError`). Unsent bytes are
+    /// discarded. Idempotent: the first code wins.
+    func reset(applicationError: UInt64) async
+
+    /// Asks the peer to stop sending with STOP_SENDING(`applicationError`).
+    func stopSending(applicationError: UInt64) async
+}
+
 /// A stream with a transport-level identifier, such as a QUIC stream ID (RFC 9000 §2.1).
 public protocol StreamIdentified {
     /// The stream's identifier. For QUIC, bit 0 is the initiator (0 = client) and bit 1 the
