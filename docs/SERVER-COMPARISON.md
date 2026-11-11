@@ -20,7 +20,7 @@ Run of 2026-11-11, commit `6bd196a` (end of M3.2: HTTP/1.1 keep-alive, pipelinin
 
 | Server | Version | Configuration |
 |---|---|---|
-| **new server** | this repo, `sws-bench serve` | release build, HTTP/1.1 runner (#0080/#0081). Answers from memory until StaticFiles (#0084) lands |
+| **new server** | this repo, `sws-bench serve` | release build, HTTP/1.1 runner (#0080/#0081). In this run it answered from memory (`--body-size 626`); see [StaticFiles results](#staticfiles-results-0084) for the run that serves the file from disk |
 | nginx | 1.31.8 | `worker_processes auto`, sendfile, `open_file_cache`, access log off |
 | Apache httpd | 2.4.67, event MPM | default MPM settings, unlimited keep-alive requests, sendfile, no access log |
 | Caddy | 2.11.1 | `file_server`, admin API off, no access log |
@@ -68,7 +68,7 @@ Run of 2026-11-11, commit `6bd196a` (end of M3.2: HTTP/1.1 keep-alive, pipelinin
 
 ## Takeaways
 
-- **Keep-alive: the new server is competitive.** It is within 4% of nginx at both concurrency levels, ahead of Apache and Caddy, and about 15–20% behind lighttpd and h2o. At 64 connections it has the tightest tail of any server measured: p99 1.44 ms, p99.9 2.37 ms. At this point it is not serving from disk, so the comparison will be repeated after StaticFiles (#0084).
+- **Keep-alive: the new server is competitive.** It is within 4% of nginx at both concurrency levels, ahead of Apache and Caddy, and about 15–20% behind lighttpd and h2o. At 64 connections it has the tightest tail of any server measured: p99 1.44 ms, p99.9 2.37 ms. This run did not serve from disk; the [StaticFiles results](#staticfiles-results-0084) below do.
 - **The bottleneck is not our code.** The server spends about 0.3 µs per request in its own code, with no allocations (`sws-bench h1conn`). The rest of the time goes to Network.framework receive and send, at about 6.6 µs and 15.6 µs per call (`docs/notes/nw-transport.md`), and to the load client sharing the same cores.
 - **New connections are the clear weakness.** The new server accepts about 2,300 connections per second, roughly 10× fewer than nginx, with a 6 ms p50. Setting up each connection through Network.framework (`NWListener` → `NWConnection` → `start`) is expensive. The QUIC spike and #0078 saw the same cost. Tracked in #0113.
 - **Against the legacy server:** about the same rate of new connections, but with far fewer errors and a much tighter p99.9 (25 ms against 386 ms). The legacy server cannot keep connections alive at all.
@@ -79,3 +79,31 @@ Run of 2026-11-11, commit `6bd196a` (end of M3.2: HTTP/1.1 keep-alive, pipelinin
 - One agent was building during the run (load average 9–15). Re-run on an idle machine before quoting numbers externally.
 - All servers use their default concurrency model. nginx and Apache spread across processes, h2o uses threads, lighttpd is a single event loop, and the new server uses Swift Concurrency's cooperative pool.
 - HTTP/2, HTTP/3, TLS, and large-file comparisons will be added as those milestones land.
+
+## StaticFiles results (#0084)
+
+Run of 2026-11-11, commit `2e512a7`. Raw results: [benchmarks/compare-servers-staticfiles.md](benchmarks/compare-servers-staticfiles.md). Re-run with:
+
+```bash
+scripts/guarded.sh -t 2400 -- scripts/bench-compare.sh 10 docs/benchmarks/compare-servers-staticfiles.md
+```
+
+The new server now serves the same 626-byte `index.html` from disk with `sws-bench serve --root` (StaticFiles #0084) over the BSD socket transport (#0113). Like nginx with `open_file_cache`, it keeps small files in memory with their headers rendered once (`Content-Type`, strong `ETag`, `Last-Modified`, `Accept-Ranges`) and re-checks each with `realpath` + `stat` at most once per second. A cache hit costs about 75 ns with no allocations (`sws-bench micro --filter StaticFiles`).
+
+Load average 4.7 at the start; other agents started building during the closed-connection rows (27.6 at the end).
+
+| Server | keep-alive, 16 conns | keep-alive, 64 conns | new connection per request, 16 |
+|---|---:|---:|---:|
+| lighttpd | **107,091** | **115,349** | 12,411 |
+| **new server** | 89,439 | 90,236 | 8,464 |
+| nginx | 79,804 | 74,377 | **19,385** |
+| h2o | 71,811 | 87,367 | 10,324 |
+| Apache | 53,313 | 49,191 | 5,452 |
+| Caddy | 42,140 | 42,907 | 3,854 |
+| legacy SwiftWebServer | – | – | 1,156 |
+
+(req/s; latency columns are in the raw file.)
+
+- **Serving from disk costs nothing measurable.** Keep-alive throughput went from 63k to 89k req/s against the earlier in-memory run. Most of that gain is probably the BSD socket transport (#0113), not StaticFiles (not measured separately). The new server is second only to lighttpd and 12–21% ahead of nginx. nginx still has the tighter p99 at 16 connections (0.27 ms against 0.61 ms). At 64 connections the new server's p99 of 1.07 ms beats nginx's 1.47 ms.
+- **New connections:** about 8,500 per second, 3.7× the Network.framework listener's 2,300, but under the load that rose during these rows. nginx still leads. Repeat on an idle machine before ranking.
+- **Large files:** `BSDSocketTransport.sendFile` now uses `sendfile(2)`. Serving a page-cached 512 MiB file to curl over loopback took 9.0 GB/s (median of 5) against 5.8 GB/s with the bounded `pread` loop on the same transport and 2.3 GB/s on Network.framework, with about 35% less server CPU than the `pread` loop. Measured at load average about 17, so treat these as relative figures. A 1 GiB download keeps server RSS flat at 8 MiB (`StaticFilesIntegrationTests`).
