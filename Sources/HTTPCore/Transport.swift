@@ -100,6 +100,19 @@ public protocol ResettableStream: Sendable {
     func stopSending(applicationError: UInt64) async
 }
 
+/// A multiplexed connection whose stream credit (QUIC MAX_STREAMS, RFC 9000 §4.6) the
+/// protocol can raise, so that the number of streams the peer can have open at once follows
+/// the protocol's own concurrency limit. HTTP/3 grants one more request stream each time a
+/// request finishes (#0102).
+///
+/// Conformers: `QUICConnection` (NetworkTransport) and `InMemoryMultiplexedTransport`
+/// (HTTPTestSupport).
+public protocol StreamCreditGranting: Sendable {
+    /// Raises the *cumulative* number of bidirectional and unidirectional streams the peer may
+    /// open (`nil` leaves a direction unchanged). Limits only grow; a smaller value is ignored.
+    func raiseMaxStreams(bidirectional: UInt64?, unidirectional: UInt64?)
+}
+
 /// A stream with a transport-level identifier, such as a QUIC stream ID (RFC 9000 §2.1).
 public protocol StreamIdentified {
     /// The stream's identifier. For QUIC, bit 0 is the initiator (0 = client) and bit 1 the

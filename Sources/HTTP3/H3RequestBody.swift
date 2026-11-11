@@ -13,6 +13,8 @@ import Synchronization
 /// - a malformed body (DATA that disagrees with `content-length`, trailers with pseudo-header
 ///   fields, a frame out of order) is ``HTTPRequestBodyError/malformed``; a stream ending inside
 ///   a frame is ``HTTPRequestBodyError/truncated``;
+/// - a body larger than ``H3Configuration/maxRequestBodySize`` is
+///   ``HTTPRequestBodyError/tooLarge`` (answered `413`);
 /// - a peer reset is ``TransportError/connectionReset`` (the handler task is also cancelled);
 /// - after the handler returned, ``HTTPRequestBodyError/expired``.
 final class H3BodyChannel: HTTPRequestBodySource {
@@ -26,15 +28,23 @@ final class H3BodyChannel: HTTPRequestBodySource {
     let queue: BoundedAsyncQueue<ByteBuffer>
     /// The request stream's ID; the `request` that ``HTTPRequestBody`` passes back.
     let streamID: UInt64
+    /// Limits the handler's waits for body bytes (``H3Timeouts/body``), when set.
+    let watch: H3StreamWatch?
     private let state = Mutex(State())
 
-    init(capacity: Int, streamID: UInt64) {
+    init(capacity: Int, streamID: UInt64, watch: H3StreamWatch? = nil) {
         queue = BoundedAsyncQueue(capacity: capacity)
         self.streamID = streamID
+        self.watch = watch
     }
 
     /// True when the body ended with an error.
     var failed: Bool { state.withLock { $0.failure != nil } }
+
+    /// True when the body ended because it grew past ``H3Configuration/maxRequestBodySize``.
+    var isTooLarge: Bool {
+        state.withLock { ($0.failure as? HTTPRequestBodyError) == .tooLarge }
+    }
 
     // MARK: Reader side
 
@@ -64,7 +74,10 @@ final class H3BodyChannel: HTTPRequestBodySource {
             state.reading = true
         }
         defer { state.withLock { $0.reading = false } }
-        if let chunk = await queue.next() { return chunk }
+        watch?.armBody()
+        let chunk = await queue.next()
+        watch?.disarmBody()
+        if let chunk { return chunk }
         // The reader records why the body ended before the handler task is cancelled, so the
         // specific error wins over the cancellation.
         if let failure = state.withLock({ $0.failure }) { throw failure }

@@ -36,7 +36,7 @@ import Synchronization
 /// or close, such as ``TransportError/timedOut``), fails waiting opens, and fails every stream.
 ///
 /// All Network.framework callbacks of the group and its streams run on one serial queue.
-public final class QUICConnection: MultiplexedTransport {
+public final class QUICConnection: MultiplexedTransport, StreamCreditGranting {
     public typealias Stream = QUICStreamTransport
 
     let group: NWConnectionGroup
@@ -125,6 +125,18 @@ public final class QUICConnection: MultiplexedTransport {
     /// Opens a locally initiated bidirectional stream (clients send requests on these).
     public func openBidirectionalStream() async throws -> QUICStreamTransport {
         try await core.open(unidirectional: false)
+    }
+
+    /// Raises the cumulative stream limits the peer may open (MAX_STREAMS) to at least these
+    /// values (#0102). The adapter already returns one stream of credit per finished peer
+    /// stream; this lets a protocol set a higher concurrency than
+    /// ``QUICConfiguration/maxStreamsBidirectional``. Applied on the connection's queue.
+    public func raiseMaxStreams(bidirectional: UInt64?, unidirectional: UInt64?) {
+        let clamp = { (value: UInt64?) -> Int in value.map { Int(clamping: $0) } ?? 0 }
+        let (bidirectional, unidirectional) = (clamp(bidirectional), clamp(unidirectional))
+        queue.async { [core] in
+            core.raiseAtLeast(bidirectional: bidirectional, unidirectional: unidirectional)
+        }
     }
 
     /// Closes the connection with an application error code. Idempotent: the first close wins.
@@ -327,6 +339,12 @@ extension QUICConnection {
             if case .raiseMaxStreams(let bidirectional, let unidirectional) = action {
                 Self.grant(group, bidirectional: bidirectional, unidirectional: unidirectional)
             }
+        }
+
+        /// A protocol's credit grant (on the queue): raises the group's limits, never lowers them.
+        func raiseAtLeast(bidirectional: Int, unidirectional: Int) {
+            let group = state.withLock { $0.machine.isTerminal ? nil : $0.group }
+            Self.grant(group, bidirectional: bidirectional, unidirectional: unidirectional)
         }
 
         /// Raises the cumulative stream limits the peer may open (never lowers them).
