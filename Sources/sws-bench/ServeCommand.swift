@@ -37,6 +37,8 @@ enum ServeCommand {
         with the body's length, anything else gets 200 text/plain.
 
         Prints "listening HOST:PORT" on stdout once bound. SIGINT/SIGTERM shut down gracefully.
+
+        With --h3, serves HTTP/3 over QUIC instead (`sws-bench serve --h3 --help`).
         """
 
     struct Settings: Equatable {
@@ -53,6 +55,7 @@ enum ServeCommand {
     }
 
     static func run(_ argv: [String]) async throws -> Int32 {
+        if argv.contains("--h3") { return try await H3ServeCommand.run(argv.filter { $0 != "--h3" }) }
         var args = try Arguments(argv, valueOptions: ["config", "host", "port", "max-connections", "drain-timeout", "body-size", "max-body-size"])
         if args.flag("help") == true { print(usage); return 0 }
         let configPath = args.string("config")
