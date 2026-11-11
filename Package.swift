@@ -36,7 +36,7 @@ struct Library {
 let libraries: [Library] = [
     // Mainline
     Library("HTTPCore"),
-    Library("HTTP1", dependencies: ["HTTPCore"]),
+    Library("HTTP1", dependencies: ["HTTPCore"], testDependencies: ["HTTPTestSupport"]),
     Library("HTTPServer", dependencies: ["HTTPCore", "HTTP1"]),
     Library("NetworkTransport", dependencies: ["HTTPCore"]),
     // Header compression shared by HPACK and QPACK
