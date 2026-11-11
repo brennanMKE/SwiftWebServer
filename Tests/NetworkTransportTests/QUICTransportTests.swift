@@ -147,7 +147,7 @@ import Testing
     @Test(.timeLimit(.minutes(1)))
     func manyClientStreamsStayWithinTheStreamLimit() async throws {
         // The server grants 10 concurrent bidirectional streams and never accepts any: a
-        // client that tries to open 200 cannot make it hold more than the limit (plus the NW
+        // client that tries to open 1,000 cannot make it hold more than the limit (plus the NW
         // client's implicit stream).
         let limit = 10
         let quic = testQUICConfiguration(maxStreamsBidirectional: limit)
@@ -156,7 +156,7 @@ import Testing
         // its credit.
         let opened = Mutex<[QUICStreamTransport]>([])
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for i in 0..<200 {
+            for i in 0..<1000 {
                 group.addTask {
                     guard let stream = try? await client.openBidirectionalStream() else { return }
                     opened.withLock { $0.append(stream) }
