@@ -128,12 +128,15 @@ public final class InMemoryTransport: ByteStreamTransport {
 
         /// Offers one event to the reader, suspending while the pipe is full.
         func write(_ event: Event, byteCount: Int) async throws {
-            guard let queue else { return }
+            // Checked before the scripted early return so an injected peer STOP_SENDING
+            // (`InMemoryMultiplexedTransport`) also refuses captured-only sends.
             try state.withLock { state throws(TransportError) in
                 if state.readerClosed || state.reset { throw .connectionReset }
+                guard queue != nil else { return }
                 state.bufferedBytes += byteCount
                 state.highWater = max(state.highWater, state.bufferedBytes)
             }
+            guard let queue else { return }
             do {
                 try await queue.send(event)
             } catch {
@@ -289,6 +292,8 @@ public final class InMemoryTransport: ByteStreamTransport {
 
         while true {
             try Task.checkCancellation()
+            // A local close takes precedence over a peer reset.
+            try state.withLock { state throws(TransportError) in if state.closed { throw .closed } }
             if inbound.isReset { throw TransportError.connectionReset }
             // Deliver from the current segment, or report a sticky end or error.
             let delivered: Int? = try state.withLock { state throws(TransportError) -> Int? in
@@ -314,9 +319,9 @@ public final class InMemoryTransport: ByteStreamTransport {
 
             guard let event = await inbound.next() else {
                 try Task.checkCancellation()
+                try state.withLock { state throws(TransportError) in if state.closed { throw .closed } }
                 if inbound.isReset { throw TransportError.connectionReset }
-                try state.withLock { state throws(TransportError) in
-                    if state.closed { throw .closed }
+                state.withLock { state in
                     state.inputEnded = true   // peer closed gracefully, or the script ended
                 }
                 return 0
