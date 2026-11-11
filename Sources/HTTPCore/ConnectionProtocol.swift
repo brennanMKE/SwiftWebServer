@@ -62,17 +62,22 @@ public final class ShutdownSignal: Sendable {
     }
 
     private let state = Mutex(State())
+    /// Mirrors `state.triggered` so ``isTriggered`` is one atomic load, cheap enough to check
+    /// per request. Sequentially consistent, so a connection that publishes its state and then
+    /// reads the flag cannot miss a trigger whose waiter reads that state (HTTP/1.1 drain).
+    private let flag = Atomic<Bool>(false)
 
     public init() {}
 
-    /// True once ``trigger()`` has been called.
-    public var isTriggered: Bool { state.withLock { $0.triggered } }
+    /// True once ``trigger()`` has been called. One atomic load, no lock.
+    public var isTriggered: Bool { flag.load(ordering: .sequentiallyConsistent) }
 
     /// Triggers the signal and resumes every waiter. Idempotent.
     public func trigger() {
         let waiters = state.withLock { state -> [CheckedContinuation<Void, Never>] in
             guard !state.triggered else { return [] }
             state.triggered = true
+            flag.store(true, ordering: .sequentiallyConsistent)
             defer { state.waiters = [:] }
             return Array(state.waiters.values)
         }

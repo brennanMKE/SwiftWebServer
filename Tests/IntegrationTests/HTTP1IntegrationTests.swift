@@ -104,6 +104,65 @@ import Testing
         #expect(try await serve.waitForExit(timeout: .seconds(5)) == 0, "stderr: \(serve.stderr)")
     }
 
+    /// #0082 (legacy #0012): a slowloris client writing one header byte per second gets `408`
+    /// and end of stream when the header limit passes, however long it keeps trickling.
+    @Test(.timeLimit(.minutes(1)))
+    func slowlorisIsClosedWithinTheHeaderTimeout() async throws {
+        let listener = try TCPListener(configuration: TCPListener.Configuration(
+            host: "127.0.0.1", port: 0, tcp: TCPConfiguration(allowLocalEndpointReuse: false)))
+        let timeouts = HTTP1Timeouts(header: .seconds(2), linger: .milliseconds(500))
+        let server = Server(configuration: ServerConfiguration(drainTimeout: .milliseconds(200)),
+                            listeners: [listener],
+                            protocols: [HTTP1(configuration: HTTP1Configuration(timeouts: timeouts))],
+                            handler: TextHandler())
+        try await withThrowingTaskGroup { group in
+            group.addTask { try await server.run() }
+            defer { server.requestShutdown() }
+            guard let port = try await server.waitUntilRunning().first?.port else {
+                Issue.record("no address"); return
+            }
+            let client = try await TCPTransport.connect(host: "127.0.0.1", port: port)
+            let head = Array("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Slow: \(String(repeating: "s", count: 60))\r\n\r\n".utf8)
+            let start = ContinuousClock.now
+            let received = await withTaskGroup(of: ByteBuffer?.self) { inner -> ByteBuffer in
+                inner.addTask {
+                    // One byte per second, until the server stops reading or the test is done.
+                    for byte in head {
+                        var one = ByteBuffer()
+                        one.append(contentsOf: [byte])
+                        guard (try? await client.send(one, endOfStream: false)) != nil else { break }
+                        try? await Task.sleep(for: .seconds(1))
+                        if Task.isCancelled { break }
+                    }
+                    return nil
+                }
+                inner.addTask {
+                    var buffer = ByteBuffer()
+                    while (try? await client.receive(into: &buffer, maxLength: 4096)) ?? 0 > 0 {}
+                    return buffer
+                }
+                var result = ByteBuffer()
+                while let next = await inner.next() {
+                    if let next {
+                        result = next
+                        break
+                    }
+                }
+                inner.cancelAll()
+                return result
+            }
+            let elapsed = ContinuousClock.now - start
+            let text = String(decoding: received.withReadableSpan { s in (0..<s.count).map { s[$0] } }, as: UTF8.self)
+            #expect(text.hasPrefix("HTTP/1.1 408 Request Timeout\r\n"), "\(text)")
+            #expect(text.lowercased().contains("connection: close"), "\(text)")
+            #expect(elapsed >= .milliseconds(1500) && elapsed < .seconds(4), "closed after \(elapsed)")
+            await client.close(.normal)
+
+            server.requestShutdown()
+            try await group.waitForAll()
+        }
+    }
+
     /// Runs `/usr/bin/curl` with a deadline and returns its status and combined output.
     func runCurl(_ arguments: [String]) async throws -> (Int32, String) {
         let process = Process()
