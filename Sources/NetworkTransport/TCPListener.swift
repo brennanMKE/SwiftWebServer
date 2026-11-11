@@ -230,6 +230,7 @@ extension TCPListener {
 
         /// `newConnectionHandler`: admit the connection into the bounded queue or cancel it.
         func accept(_ connection: NWConnection) {
+            let handedOverAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             let admitted = state.withLock { state -> Bool in
                 guard case .ready = state.phase, !state.closeCalled, state.pendingCount < limit else {
                     state.rejected += 1
@@ -247,6 +248,7 @@ extension TCPListener {
             }
             let id = ObjectIdentifier(transport)
             box.set(id)
+            transport.core.state.withLock { $0.handedOverAt = handedOverAt }
             state.withLock { $0.preparing[id] = transport }
             transport.startConnection()
         }
