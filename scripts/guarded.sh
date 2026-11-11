@@ -18,14 +18,16 @@ if [ "$1" = "-t" ]; then TIMEOUT="$2"; shift 2; fi
 [ "$1" = "--" ] && shift
 [ "$#" -eq 0 ] && { echo "usage: $0 [-t seconds] -- command..." >&2; exit 2; }
 
-WATCH='SecurityAgent|CoreServicesUIAgent|UserNotificationCenter'
-baseline=$(pgrep -f "$WATCH" | sort | tr '\n' ' ')
+WATCH_NAMES="SecurityAgent CoreServicesUIAgent UserNotificationCenter"
+watch_pids() { for n in $WATCH_NAMES; do pgrep -x "$n"; done | sort -u | tr '\n' ' '; }
+baseline=$(watch_pids)
 
 set -m
 "$@" &
 CMD=$!
 start=$(date +%s)
 status=""
+suspects=""
 
 kill_cmd() {
   kill -TERM -"$CMD" 2>/dev/null || kill -TERM "$CMD" 2>/dev/null
@@ -40,12 +42,23 @@ while kill -0 "$CMD" 2>/dev/null; do
     echo "guarded.sh: TIMEOUT after ${TIMEOUT}s: $*" >&2
     kill_cmd; status=124; break
   fi
-  for pid in $(pgrep -f "$WATCH"); do
+  # A prompt is a watched process (exact name) that was not in the baseline
+  # and is still alive on two consecutive checks; this ignores short-lived
+  # processes that exit before they can show anything.
+  current=""
+  for pid in $(watch_pids); do
     case " $baseline " in *" $pid "*) continue ;; esac
-    echo "guarded.sh: SYSTEM PROMPT DETECTED ($(ps -o comm= -p "$pid" 2>/dev/null)); killing: $*" >&2
-    echo "guarded.sh: a keychain, firewall, or privacy prompt was triggered. Do not retry the same way; see AGENTS.md." >&2
-    kill_cmd; status=125; break 2
+    name=$(ps -o comm= -p "$pid" 2>/dev/null)
+    [ -z "$name" ] && continue
+    current="$current $pid"
+    case " $suspects " in
+      *" $pid "*)
+        echo "guarded.sh: SYSTEM PROMPT DETECTED ($name, pid $pid); killing: $*" >&2
+        echo "guarded.sh: a keychain, firewall, or privacy prompt was triggered. Do not retry the same way; see AGENTS.md." >&2
+        kill_cmd; status=125; break 2 ;;
+    esac
   done
+  suspects="$current"
 done
 
 if [ -z "$status" ]; then wait "$CMD"; status=$?; fi
