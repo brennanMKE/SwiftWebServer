@@ -94,6 +94,10 @@ targets += [
         path: "Sources/sws-bench",
         swiftSettings: modernSwiftSettings),
     .testTarget(
+        name: "SWSBenchTests",
+        dependencies: ["SWSBench"],
+        swiftSettings: modernSwiftSettings),
+    .testTarget(
         name: "IntegrationTests",
         dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HTTPTestSupport"],
         swiftSettings: modernSwiftSettings),
