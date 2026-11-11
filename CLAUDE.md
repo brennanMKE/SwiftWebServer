@@ -23,6 +23,14 @@ Every change merged to `main` must pass both. Milestone-end comprehensive runs a
 - Every optional feature lives in its own target and registers through the extension points in ROADMAP §5.2. Do not add feature code to `HTTPCore`, `HTTP1`, or `HTTPServer`.
 - Tests use Swift Testing (`import Testing`). Protocol logic is tested over in-memory transports; socket tests bind port 0.
 
-## Parallel work
+## Parallel work (worker protocol)
 
-Work happens in git worktrees on branches named `mNN-<item>` (e.g. `m01-bytebuffer`). Keep changes scoped to the targets your issue names to avoid merge conflicts. Do not edit `Package.swift` unless the issue requires it; all targets are pre-declared in M0.
+Work happens in git worktrees, one issue per worker. The orchestrator merges to `main`; workers never merge to or push `main`.
+
+1. **Sync first:** worktrees can start behind local `main`. Run `git checkout -b mNN-<item> && git merge --ff-only main` (or `git rebase main`) before any edit. Re-run `git merge main` before finishing.
+2. Read `docs/ROADMAP.md`, `issues/Issues.md`, and `issues/NNNN.md` (if the issue file is missing, the orchestrator's prompt is the spec).
+3. Stay inside the targets your issue names (and their test targets). Do not edit `Package.swift` unless the issue requires it — all targets are pre-declared. If you must add a dependency edge, keep the diff to that one line.
+4. Verify: `swift build` and `swift test` pass with your new tests visibly running. Add benchmarks to `sws-bench` when the issue touches the hot path.
+5. Commit code as `#NNNN <Verb> <title>`. Then, if `issues/NNNN.md` exists, do the resolve workflow from `issues/Issues.md` (status `resolved`, Closed, Commit, Root cause / Fix / Verification / Files changed / Gotchas) as a second commit `#NNNN Resolve: <title>`. Never touch other issue files.
+6. End every commit message with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+7. Report back in under 10 lines: branch, commits, test counts, benchmark numbers if any, and deviations or follow-ups. If you can't finish, follow "When the subagent can't finish" in `issues/Issues.md` and say why.
