@@ -29,10 +29,24 @@ start=$(date +%s)
 status=""
 suspects=""
 
+# All descendants of a pid, deepest first. Tools such as `swift test` start
+# helpers in their own process groups, so killing our group is not enough.
+descendants() {
+  local child
+  for child in $(pgrep -P "$1"); do
+    descendants "$child"
+    echo "$child"
+  done
+}
+
 kill_cmd() {
+  local tree
+  tree="$(descendants "$CMD")"
   kill -TERM -"$CMD" 2>/dev/null || kill -TERM "$CMD" 2>/dev/null
+  [ -n "$tree" ] && kill -TERM $tree 2>/dev/null
   sleep 2
   kill -KILL -"$CMD" 2>/dev/null || kill -KILL "$CMD" 2>/dev/null
+  [ -n "$tree" ] && kill -KILL $tree 2>/dev/null
 }
 
 while kill -0 "$CMD" 2>/dev/null; do
