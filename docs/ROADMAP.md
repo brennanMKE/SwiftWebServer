@@ -16,8 +16,8 @@ Swift 6, macOS 15+, Network.framework, zero package dependencies. This document 
 | Decision | Choice | Status |
 |---|---|---|
 | Track order | HTTP/3 (Track A) before HTTP/2 (Track B); both are implemented | Taken by default; independent after M5 |
-| Server push (0066) | Recommend drop: browsers no longer accept it | Awaiting owner; issue stays open |
-| h2c `Upgrade` (0068) | Recommend drop: removed by RFC 9113 | Awaiting owner; issue stays open |
+| Server push (0066) | Dropped: browsers no longer accept it | wontfix (owner, 2026-11-11) |
+| h2c `Upgrade` (0068) | Dropped: removed by RFC 9113 | wontfix (owner, 2026-11-11) |
 | `DispatchQueue` | Allowed only where `NWListener`/`NWConnection.start(queue:)` require it (NetworkTransport target) and for signal sources in the executable | Accepted |
 | Actors | None on the request path. Shared HTTP/2 connection state uses `Mutex` (Synchronization) with non-suspending critical sections | Accepted |
 
@@ -271,6 +271,6 @@ Each numbered item is one issue. The legacy server remains the shipped binary un
 | 0063 | keep, moved first | 0.2 then every milestone |
 | 0064 | keep | M6 |
 | 0065 | keep, optional | M10, M13 |
-| 0066 | drop (pending owner) | — |
+| 0066 | wontfix | — |
 | 0067 | keep | M15 |
-| 0068 | drop (pending owner) | — |
+| 0068 | wontfix | — |
