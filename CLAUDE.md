@@ -1,12 +1,16 @@
 # SwiftWebServer — guidance for Claude
 
+**Read `AGENTS.md` first: it lists actions that trigger macOS system prompts (keychain, firewall, privacy, sudo), which are forbidden, and requires running servers/tests through `scripts/guarded.sh`.**
+
+@AGENTS.md
+
 The design and milestone plan is `docs/ROADMAP.md`. Read it before any implementation work. Issue workflow is `issues/Issues.md`.
 
 ## Build and verify
 
 ```bash
 swift build
-swift test            # must show tests executing and a passing summary
+scripts/guarded.sh -t 900 -- swift test   # must show tests executing and a passing summary
 ```
 
 Every change merged to `main` must pass both. Milestone-end comprehensive runs also include the integration tests and `swift run -c release sws-bench` (results recorded in `docs/benchmarks/`).
@@ -21,7 +25,7 @@ Every change merged to `main` must pass both. Milestone-end comprehensive runs a
 - `AsyncStream` only for low-rate signals. Byte and frame flows use demand-driven `AsyncSequence`s or `BoundedAsyncQueue`. Never unbounded buffering.
 - Hot path (per request/frame): no allocations in our code, no `String`/Foundation, no existentials except `.stream` bodies. Parse bytes directly.
 - Every optional feature lives in its own target and registers through the extension points in ROADMAP §5.2. Do not add feature code to `HTTPCore`, `HTTP1`, or `HTTPServer`.
-- **Never touch the user's keychain.** No `security` commands, no keychain add/delete/trust changes. Load TLS identities in memory only (`SecPKCS12Import` with `kSecImportToMemoryOnly: true`). Test certificates and keys live in a gitignored folder created by script.
+- **Never touch the user's keychain** or trigger any system prompt; see `AGENTS.md`. Test certificates and keys live in a gitignored folder created by script and are loaded in memory only.
 - Tests use Swift Testing (`import Testing`). Protocol logic is tested over in-memory transports; socket tests bind port 0.
 
 ## Parallel work (worker protocol)

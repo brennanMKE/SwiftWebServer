@@ -15,6 +15,7 @@ Scripts live in `../scripts/` and can be run from any directory:
 
 | Script | Purpose |
 |---|---|
+| `guarded.sh` | Run a command with a timeout and kill it if a system prompt appears (see AGENTS.md) |
 | `build.sh` | Release build of the `SwiftWebServer` executable |
 | `run.sh` | Run the server in debug, serving `Root/` |
 | `bg.sh` | Run the release server in the background, logging to `server.log` |
