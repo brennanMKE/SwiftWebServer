@@ -1,5 +1,6 @@
 import Foundation
 import HTTPCore
+import HTTPTestSupport
 import NetworkTransport
 import Testing
 
@@ -24,7 +25,7 @@ import Testing
         let status = try await child.waitForExit(timeout: Self.drainTimeout + .seconds(3))
         let elapsed = ContinuousClock.now - start
         #expect(status == 0, "stderr: \(child.stderr)")
-        #expect(child.process.terminationReason == .exit)
+        #expect(child.terminationReason == .exit)
         #expect(elapsed < Self.drainTimeout + .seconds(2))
         #expect(await peerClosed(client))
         await client.close(.normal)
@@ -38,7 +39,7 @@ import Testing
         child.signal(SIGINT)
         let status = try await child.waitForExit(timeout: .seconds(3))
         #expect(status == 0, "stderr: \(child.stderr)")
-        #expect(child.process.terminationReason == .exit)
+        #expect(child.terminationReason == .exit)
     }
 
     @Test(.timeLimit(.minutes(1)))
@@ -81,15 +82,9 @@ import Testing
     }
 }
 
-/// A launched `sws-bench` with captured stdout and stderr.
-final class ChildProcess: @unchecked Sendable {
-    let process: Process
-    private let stdoutPipe = Pipe()
-    private let stderrPipe = Pipe()
-    private let lock = NSLock()
-    private var stdoutData = Data()
-    private var stderrData = Data()
-
+/// `sws-bench` children. The process handling (non-blocking, cancellation-aware, SIGKILL on
+/// every exit path) is `HTTPTestSupport.ChildProcess` (#0114).
+extension ChildProcess {
     static func executable() throws -> URL {
         var candidates: [URL] = []
         for bundle in Bundle.allBundles where bundle.bundleURL.pathExtension == "xctest" {
@@ -99,83 +94,21 @@ final class ChildProcess: @unchecked Sendable {
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         candidates.append(packageRoot.appending(path: ".build/debug/sws-bench"))
         guard let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else {
-            throw ChildError.executableNotFound(candidates.map(\.path))
+            throw Failure.executableNotFound(candidates.map(\.path))
         }
         return found
     }
 
+    /// Starts `sws-bench` with `arguments`.
     static func launch(_ arguments: [String]) throws -> ChildProcess {
-        let child = ChildProcess(executable: try executable(), arguments: arguments)
-        try child.process.run()
-        return child
+        try ChildProcess(executable: executable(), arguments: arguments)
     }
-
-    private init(executable: URL, arguments: [String]) {
-        process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        process.standardInput = FileHandle.nullDevice
-        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard let self else { return }
-            self.lock.withLock { self.stdoutData.append(data) }
-        }
-        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard let self else { return }
-            self.lock.withLock { self.stderrData.append(data) }
-        }
-    }
-
-    var stdout: String { lock.withLock { String(decoding: stdoutData, as: UTF8.self) } }
-    var stderr: String { lock.withLock { String(decoding: stderrData, as: UTF8.self) } }
 
     /// The port from the child's `listening 127.0.0.1:PORT` line.
     func listeningPort(timeout: Duration = .seconds(10)) async throws -> UInt16 {
-        let deadline = ContinuousClock.now + timeout
-        while ContinuousClock.now < deadline {
-            if let line = stdout.split(separator: "\n").first(where: { $0.hasPrefix("listening ") }),
-               let colon = line.lastIndex(of: ":"), let port = UInt16(line[line.index(after: colon)...]) {
-                return port
-            }
-            if !process.isRunning { throw ChildError.exitedEarly(stderr) }
-            try await Task.sleep(for: .milliseconds(10))
+        try await waitForLine(timeout: timeout) { line in
+            guard line.hasPrefix("listening "), let colon = line.lastIndex(of: ":") else { return nil }
+            return UInt16(line[line.index(after: colon)...])
         }
-        throw ChildError.timedOut("no listening line; stderr: \(stderr)")
-    }
-
-    func signal(_ number: Int32) {
-        if process.isRunning { Foundation.kill(process.processIdentifier, number) }
-    }
-
-    /// The exit status, once the child exits within `timeout`.
-    func waitForExit(timeout: Duration) async throws -> Int32 {
-        let deadline = ContinuousClock.now + timeout
-        while process.isRunning {
-            if ContinuousClock.now >= deadline { throw ChildError.timedOut("still running after \(timeout)") }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        process.waitUntilExit()
-        // Let the readability handlers deliver what is left.
-        try await Task.sleep(for: .milliseconds(20))
-        return process.terminationStatus
-    }
-
-    /// Kills the child if it is still running and stops reading its output.
-    func kill() {
-        if process.isRunning {
-            Foundation.kill(process.processIdentifier, SIGKILL)
-            process.waitUntilExit()
-        }
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-    }
-
-    enum ChildError: Error {
-        case executableNotFound([String])
-        case exitedEarly(String)
-        case timedOut(String)
     }
 }

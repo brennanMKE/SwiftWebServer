@@ -2,6 +2,7 @@ import Foundation
 import HTTP1
 import HTTPCore
 import HTTPServer
+import HTTPTestSupport
 import NetworkTransport
 import Testing
 
@@ -104,26 +105,11 @@ import Testing
         #expect(try await serve.waitForExit(timeout: .seconds(5)) == 0, "stderr: \(serve.stderr)")
     }
 
-    /// Runs `/usr/bin/curl` with a deadline and returns its status and combined output.
+    /// Runs `/usr/bin/curl` with a deadline and returns its status and combined output. A
+    /// timeout or a cancellation SIGKILLs curl (#0114).
     func runCurl(_ arguments: [String]) async throws -> (Int32, String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        process.standardInput = FileHandle.nullDevice
-        try process.run()
-        let deadline = ContinuousClock.now + .seconds(15)
-        while process.isRunning {
-            if ContinuousClock.now >= deadline {
-                process.terminate()
-                break
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        process.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+        let output = try await ChildProcess.run(URL(fileURLWithPath: "/usr/bin/curl"), arguments,
+                                                timeout: .seconds(30), mergeStandardError: true)
+        return (output.status, output.stdout)
     }
 }

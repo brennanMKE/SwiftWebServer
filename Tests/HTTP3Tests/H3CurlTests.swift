@@ -12,7 +12,7 @@ import Testing
 struct H3CurlTests {
     @Test func curlHTTP3OnlyGets200WithTheBody() async throws {
         let output = try await withQUICServer(handler: PathHandler()) { port in
-            try runCurl(["--http3-only", "-k", "-s", "-S", "--max-time", "15",
+            try await runCurl(["--http3-only", "-k", "-s", "-S", "--max-time", "15",
                          "-w", "\\n%{http_code} %{http_version}", "https://127.0.0.1:\(port)/hello?q=1"])
         }
         #expect(output == "hello /hello?q=1\n200 3")
@@ -20,7 +20,7 @@ struct H3CurlTests {
 
     @Test func curlEchoesARequestBody() async throws {
         let output = try await withQUICServer(handler: EchoHandler()) { port in
-            try runCurl(["--http3-only", "-k", "-s", "-S", "--max-time", "15",
+            try await runCurl(["--http3-only", "-k", "-s", "-S", "--max-time", "15",
                          "--data-binary", "body over h3", "https://127.0.0.1:\(port)/echo"])
         }
         #expect(output == "body over h3")
@@ -33,7 +33,7 @@ struct H3CurlTests {
             for i in 0..<20 {
                 arguments += ["-o", "/dev/null", "https://127.0.0.1:\(port)/f\(i)"]
             }
-            return try runCurl(arguments)
+            return try await runCurl(arguments)
         }
         let lines = output.split(separator: "\n")
         #expect(lines.count == 20)
@@ -87,17 +87,8 @@ func withQUICServer<H: HTTPHandler, R: Sendable>(
     }
 }
 
-/// Runs curl and returns its stdout. curl enforces its own `--max-time`; the test's time limit
-/// backs it up.
-func runCurl(_ arguments: [String]) throws -> String {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: h3CurlPath)
-    process.arguments = arguments
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = FileHandle.nullDevice
-    try process.run()
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    return String(decoding: data, as: UTF8.self)
+/// Runs curl and returns its stdout. curl enforces its own `--max-time`; a hard deadline and
+/// the test's time limit (cancellation) SIGKILL it otherwise (#0114).
+func runCurl(_ arguments: [String]) async throws -> String {
+    try await ChildProcess.run(URL(fileURLWithPath: h3CurlPath), arguments, timeout: .seconds(40)).stdout
 }
