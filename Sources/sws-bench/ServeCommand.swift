@@ -20,13 +20,15 @@ import NetworkTransport
 /// message on stderr), 2 on a usage error.
 enum ServeCommand {
     static let usage = """
-        usage: sws-bench serve [--config FILE] [--host HOST] [--port PORT]
+        usage: sws-bench serve [--config FILE] [--host HOST] [--port PORT] [--transport nw|bsd]
                                [--max-connections N] [--drain-timeout SECONDS] [--body-size N]
                                [--max-body-size N]
 
-          --config FILE        JSON object with any of "host", "port", "maxConnections",
-                               "drainTimeout" (seconds); flags override it
+          --config FILE        JSON object with any of "host", "port", "transport",
+                               "maxConnections", "drainTimeout" (seconds); flags override it
           --host HOST          numeric address to bind (default 127.0.0.1)
+          --transport T        bsd: POSIX sockets + kqueue (BSDSocketListener, default);
+                               nw: Network.framework (TCPListener)
           --port PORT          port to bind; 0 picks a free one (default 0)
           --max-connections N  connections served at once (default 1024)
           --drain-timeout S    grace period for open connections on shutdown (default 10)
@@ -44,6 +46,7 @@ enum ServeCommand {
     struct Settings: Equatable {
         var host = "127.0.0.1"
         var port: UInt16 = 0
+        var transport = TransportKind.bsd
         var maxConnections = 1024
         var drainTimeout = 10.0
         var bodySize: Int?
@@ -56,11 +59,12 @@ enum ServeCommand {
 
     static func run(_ argv: [String]) async throws -> Int32 {
         if argv.contains("--h3") { return try await H3ServeCommand.run(argv.filter { $0 != "--h3" }) }
-        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "max-connections", "drain-timeout", "body-size", "max-body-size"])
+        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "transport", "max-connections", "drain-timeout", "body-size", "max-body-size"])
         if args.flag("help") == true { print(usage); return 0 }
         let configPath = args.string("config")
         let host = args.string("host")
         let port = try args.int("port")
+        let transport = try args.string("transport").map { argument throws(Arguments.Failure) in try TransportKind(argument: argument) }
         let maxConnections = try args.int("max-connections")
         let drainTimeout = try args.seconds("drain-timeout")
         let bodySize = try args.int("body-size")
@@ -82,6 +86,7 @@ enum ServeCommand {
             }
             settings.port = value
         }
+        if let transport { settings.transport = transport }
         if let maxConnections { settings.maxConnections = maxConnections }
         if let drainTimeout { settings.drainTimeout = drainTimeout }
         if let bodySize {
@@ -118,11 +123,13 @@ enum ServeCommand {
                 settings.host = text
             case ("port", let number as NSNumber) where UInt16(exactly: number.doubleValue) != nil:
                 settings.port = UInt16(number.doubleValue)
+            case ("transport", let text as String) where TransportKind(rawValue: text) != nil:
+                settings.transport = TransportKind(rawValue: text)!
             case ("maxConnections", let number as NSNumber) where Int(exactly: number.doubleValue) != nil:
                 settings.maxConnections = Int(number.doubleValue)
             case ("drainTimeout", let number as NSNumber) where number.doubleValue >= 0:
                 settings.drainTimeout = number.doubleValue
-            case ("host", _), ("port", _), ("maxConnections", _), ("drainTimeout", _):
+            case ("host", _), ("port", _), ("transport", _), ("maxConnections", _), ("drainTimeout", _):
                 throw ConfigError(description: "config file \(path): invalid value for \"\(key)\"")
             default:
                 throw ConfigError(description: "config file \(path): unknown key \"\(key)\"")
@@ -135,16 +142,26 @@ enum ServeCommand {
         let configuration = ServerConfiguration(
             maxConnections: settings.maxConnections,
             drainTimeout: .milliseconds(Int64((settings.drainTimeout * 1000).rounded())))
-        let listener: TCPListener
         do {
             try configuration.validate()
-            listener = try TCPListener(configuration: TCPListener.Configuration(
-                host: settings.host, port: settings.port,
-                tcp: TCPConfiguration(allowLocalEndpointReuse: false)))
+            // Cleartext TCP: POSIX sockets by default, Network.framework on request (#0113).
+            // TLS and QUIC listeners stay on Network.framework.
+            let tcp = TCPConfiguration(allowLocalEndpointReuse: false)
+            switch settings.transport {
+            case .bsd:
+                let listener = try BSDSocketListener(configuration: .init(host: settings.host, port: settings.port, tcp: tcp))
+                return await serve(settings, configuration: configuration, listener: listener)
+            case .nw:
+                let listener = try TCPListener(configuration: .init(host: settings.host, port: settings.port, tcp: tcp))
+                return await serve(settings, configuration: configuration, listener: listener)
+            }
         } catch {
             printError("sws-bench serve: \(error)")
             return 1
         }
+    }
+
+    static func serve<L: TransportListener>(_ settings: Settings, configuration: ServerConfiguration, listener: L) async -> Int32 {
         let server = Server(configuration: configuration, listeners: [listener],
                             protocols: [HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))],
                             handler: ServeHandler(hello: HelloHandler(bodySize: settings.bodySize),

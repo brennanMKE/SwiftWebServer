@@ -7,6 +7,7 @@ dependencies beyond the package.
 | File | Contents |
 |---|---|
 | `M0-baseline.md` | Legacy server load baseline (`scripts/bench-baseline.sh`), with oha and Caddy for scale |
+| `M3-accept.md` | New-connection throughput, Network.framework against BSD sockets (#0113): `sws-bench accept` and `scripts/bench-accept.sh` |
 | `M<N>-<name>.md` | One file per milestone: what changed, results, comparison with the previous record |
 
 ## The rule: a regression over 10% blocks the milestone

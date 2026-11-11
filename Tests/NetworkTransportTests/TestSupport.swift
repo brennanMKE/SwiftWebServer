@@ -97,15 +97,61 @@ func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool) async 
     return condition()
 }
 
-/// A started loopback listener on port 0.
+/// The two cleartext TCP adapters (#0113). The socket tests in `TCPTransportTests` run against
+/// both, so `BSDSocketTransport` passes the same suite as the Network.framework adapter.
+enum TCPKind: String, CaseIterable, Sendable {
+    case nw
+    case bsd
+}
+
+/// A cleartext TCP listener the shared socket tests can drive.
+protocol TestTCPListener: TransportListener where Transport: TestTCPTransport {
+    /// A started loopback listener on port 0. `limit` bounds connections not yet taken.
+    static func makeStarted(limit: Int) async throws -> Self
+    var port: UInt16 { get }
+    var localAddress: TransportAddress? { get }
+}
+
+/// A transport of the same kind as its listener, opened as a client.
+protocol TestTCPTransport: ByteStreamTransport {
+    static func testConnect(port: UInt16) async throws -> Self
+}
+
+extension TCPListener: TestTCPListener {
+    static func makeStarted(limit: Int) async throws -> TCPListener {
+        let listener = try TCPListener(configuration: .init(host: "127.0.0.1", port: 0, pendingConnectionLimit: limit))
+        try await listener.start()
+        return listener
+    }
+}
+
+extension BSDSocketListener: TestTCPListener {
+    static func makeStarted(limit: Int) async throws -> BSDSocketListener {
+        let listener = try BSDSocketListener(configuration: .init(host: "127.0.0.1", port: 0, backlog: Int32(limit)))
+        try await listener.start()
+        return listener
+    }
+}
+
+extension TCPTransport: TestTCPTransport {
+    static func testConnect(port: UInt16) async throws -> TCPTransport {
+        try await connect(host: "127.0.0.1", port: port)
+    }
+}
+
+extension BSDSocketTransport: TestTCPTransport {
+    static func testConnect(port: UInt16) async throws -> BSDSocketTransport {
+        try await connect(host: "127.0.0.1", port: port)
+    }
+}
+
+/// A started loopback Network.framework listener on port 0.
 func makeListener(limit: Int = 64) async throws -> TCPListener {
-    let listener = try TCPListener(configuration: .init(host: "127.0.0.1", port: 0, pendingConnectionLimit: limit))
-    try await listener.start()
-    return listener
+    try await TCPListener.makeStarted(limit: limit)
 }
 
 /// Takes the next accepted connection.
-func accept(_ listener: TCPListener) async throws -> TCPTransport {
+func accept<L: TransportListener>(_ listener: L) async throws -> L.Transport {
     var iterator = listener.connections.makeAsyncIterator()
     guard let transport = try await iterator.next() else { throw TransportError.closed }
     return transport
