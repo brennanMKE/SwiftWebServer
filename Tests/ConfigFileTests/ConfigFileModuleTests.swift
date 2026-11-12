@@ -7,6 +7,6 @@ import ConfigFile
     }
 
     @Test func dependenciesMatchRoadmapLayering() {
-        #expect(ConfigFileModule.dependencies == ["HTTPCore", "HTTP1", "HTTPServer", "StaticFiles"])
+        #expect(ConfigFileModule.dependencies == ["HTTPCore", "HTTP1", "HTTPServer", "StaticFiles", "Compression"])
     }
 }

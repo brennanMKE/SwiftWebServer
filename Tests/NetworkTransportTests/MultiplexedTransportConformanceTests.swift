@@ -156,6 +156,25 @@ private func accept(_ endpoint: MuxEndpoint) async throws -> MuxStream {
     return stream
 }
 
+/// Takes peer streams until inbound iteration ends (`nil`) and returns them; fails the test
+/// with ``TransportError/timedOut`` if it has not ended by `deadline`.
+private func drainInbound(_ endpoint: MuxEndpoint, deadline: Duration) async throws -> [MuxStream] {
+    try await withThrowingTaskGroup(of: [MuxStream]?.self) { group in
+        group.addTask {
+            var taken: [MuxStream] = []
+            while let stream = try await endpoint.acceptInbound() { taken.append(stream) }
+            return taken
+        }
+        group.addTask {
+            try await Task.sleep(for: deadline)
+            return nil
+        }
+        defer { group.cancelAll() }
+        guard let taken = try await group.next() ?? nil else { throw TransportError.timedOut }
+        return taken
+    }
+}
+
 /// Echoes one stream: sends back what arrives, then FIN after the peer's FIN.
 private func echo(_ stream: MuxStream) async throws {
     var buffer = ByteBuffer()
@@ -418,8 +437,29 @@ private func withPair(
                 await pair.server.close(0x101)
                 try await group.waitForAll()
             }
-            let next = try await pair.client.acceptInbound()
-            #expect(next == nil)
+            // The closing side's peer: inbound iteration ends once it learns of the close.
+            // Network.framework's close also emits STOP_SENDING and a FIN on server-initiated
+            // bidirectional stream 1, which the server never opened (nw-transport.md
+            // observations 3 and 7). An NW client usually fails its group first, but under load
+            // that stream can become ready, and be handed over, before (#0115). It is a stream
+            // the peer created on the wire, so the transport surfaces it; allow exactly that
+            // one, dead, and still require iteration to end within the deadline.
+            let extra = try await drainInbound(pair.client, deadline: .seconds(10))
+            switch implementation {
+            case .inMemory:
+                #expect(extra.isEmpty)
+            case .quic:
+                #expect(extra.count <= 1)
+                for phantom in extra {
+                    #expect(phantom.streamID == 1)
+                    var buffer = ByteBuffer()
+                    do {
+                        #expect(try await phantom.receive(into: &buffer, maxLength: 64) == 0)   // its FIN, no data
+                    } catch {
+                        #expect(error as? TransportError == .connectionReset)
+                    }
+                }
+            }
             await #expect(throws: TransportError.closed) { _ = try await pair.server.openUnidirectional() }
             await #expect(throws: TransportError.connectionReset) { _ = try await pair.client.openBidirectional() }
         }
