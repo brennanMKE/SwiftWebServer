@@ -213,6 +213,8 @@ enum ServerMain {
             // discards response bytes Network.framework still buffers for a slow reader.
             var configuration = H3Configuration()
             configuration.timeouts.closeLinger = max(.seconds(1), settings.drainTimeout ?? .seconds(30))
+            configuration.qpackMaxTableCapacity = http3.qpackMaxTableCapacity
+            configuration.qpackBlockedStreams = http3.qpackBlockedStreams
             listeners.append(.multiplexed(name: "h3", protocol: HTTP3(configuration: configuration)) { bind in
                 let port = http3.port ?? bind.boundAddresses[tlsIndex].port
                 return try QUICListener(configuration: .init(host: host, port: port, quic: QUICConfiguration(alpn: bind.alpnTokens)),

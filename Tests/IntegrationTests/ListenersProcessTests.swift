@@ -159,6 +159,25 @@ import Testing
         #expect(try await child.waitForExit(timeout: .seconds(15)) == 0, "\(child.stderr)")
     }
 
+    /// #0124: `http3.qpackMaxTableCapacity` turns the QPACK dynamic table on (#0106); curl's
+    /// encoder may then index headers, and several requests on one connection still work.
+    @Test(.timeLimit(.minutes(1)), .enabled(if: hasH3Curl))
+    func http3WithQPACKDynamicTable() async throws {
+        let http3 = #"{"qpackMaxTableCapacity": 4096, "qpackBlockedStreams": 16}"#
+        let fixture = try ParityTests.Fixture(config: try Self.tlsConfig(http3: http3))
+        let child = try ParityTests.launch(["--config", fixture.configPath, "--port", "0"])
+        defer { child.kill() }
+        let ports = try await Self.ports(child, expecting: 3)
+        #expect(!child.stderr.contains("warning"), "\(child.stderr)")
+        let h3 = try #require(ports.h3)
+        let url = "https://127.0.0.1:\(h3)/"
+        let output = try await curl(["-k", "--http3-only", "-H", "x-custom-header: the same value each time",
+                                     "-w", " %{http_version}\n", url, url, url], h3: true)
+        #expect(output.stdout == String(repeating: "<h1>home</h1> 3\n", count: 3), "\(output.stderr)")
+        child.signal(SIGTERM)
+        #expect(try await child.waitForExit(timeout: .seconds(15)) == 0, "\(child.stderr)")
+    }
+
     /// SIGTERM while an HTTP/3 download is in flight: the server sends GOAWAY, the download
     /// completes, and the process exits 0.
     @Test(.timeLimit(.minutes(1)), .enabled(if: hasH3Curl))

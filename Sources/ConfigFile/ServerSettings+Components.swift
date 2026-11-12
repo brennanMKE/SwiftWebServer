@@ -58,12 +58,20 @@ extension ServerSettings {
     /// With ``hosts`` set, `VirtualHosts` takes the place of the single `StaticFiles` (#0092)
     /// and ``root`` is not opened. With ``auth`` set, an `Authenticator` (#0093) sits between
     /// `ErrorPages` and the files; `environment` supplies `secretEnv`/`usersEnv` values.
+    ///
+    /// The `proxy` mounts (#0124) sit after auth and before the files. With `hosts[].proxy`,
+    /// each site runs its own mounts first, then the server-level ones, then its files.
     public func makeHandler(environment: [String: String] = [:]) throws(ConfigFileError) -> some HTTPHandler {
         let authenticator = try makeAuthenticator(environment: environment)
         let (accessLog, metricsEndpoint) = try makeAccessLog()
         let root = resolvedRoot
         // `StaticFiles` is both a handler and a middleware; as the last element it must be the
         // handler, so it goes in through `EitherHandler`.
+        // #0124: one upstream client (and pool) for every mount, server-level and per site.
+        let mounts = proxyMounts
+        let siteMounts = hosts.contains { !$0.proxy.isEmpty }
+        let client = mounts.isEmpty && !siteMounts ? nil : UpstreamHTTP1Client(configuration: upstreamClientConfiguration)
+        let serverProxy = mounts.isEmpty ? nil : client.map { ReverseProxy(mounts: mounts, client: $0) }
         let terminal: EitherHandler<VirtualHosts, StaticFiles>
         if hosts.isEmpty {
             do {
@@ -77,7 +85,8 @@ extension ServerSettings {
                 }
             }
         } else {
-            terminal = .first(try makeVirtualHosts())
+            // With per-site mounts, the server-level mounts run inside each site after the site's.
+            terminal = .first(try makeVirtualHosts(serverProxy: siteMounts ? serverProxy : nil, client: client))
         }
         let pages: ErrorPages?
         switch errorPages {
@@ -94,8 +103,8 @@ extension ServerSettings {
         }
         // #0091: outermost, so generated error pages are compressed too.
         let compressor = compression.map { Compression(configuration: $0.configuration) }
-        let mounts = proxyMounts
-        let reverseProxy = mounts.isEmpty ? nil : ReverseProxy(mounts: mounts, client: UpstreamHTTP1Client())
+        let reverseProxy = siteMounts ? nil : serverProxy
+        let lifecycle = siteMounts ? serverProxy.map(ProxyMountsLifecycle.init) : nil
         return MiddlewareBuilder.build {
             // #0125: outermost, so it records final statuses (error pages, auth, proxy).
             if let accessLog { accessLog }
@@ -105,11 +114,20 @@ extension ServerSettings {
             if let authenticator { authenticator }
             // #0124: after auth, before the static files terminal.
             if let reverseProxy { reverseProxy }
+            if let lifecycle { lifecycle }
             terminal
         }
     }
 
     static func handler(_ handler: some HTTPHandler) -> some HTTPHandler { handler }
+
+    /// The shared upstream client's settings. The client caps every mount's `pool.maxIdle` at
+    /// its own per-target limit (default 16), so that limit is raised to the largest
+    /// configured `maxIdle`; otherwise a larger setting would be silently ignored.
+    var upstreamClientConfiguration: UpstreamHTTP1Client.Configuration {
+        let configured = (proxy + hosts.flatMap(\.proxy)).map(\.pool.maxIdle).max() ?? 0
+        return UpstreamHTTP1Client.Configuration(maxIdlePerTarget: max(configured, UpstreamPoolPolicy().maxIdle))
+    }
 
     static func describe(_ error: ErrorPages.InitError, root: String, pages: [Int: String]) -> ConfigFileError {
         switch error {

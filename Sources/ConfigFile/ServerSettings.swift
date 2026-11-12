@@ -94,7 +94,8 @@ public struct ServerSettings: Sendable, Equatable {
     /// `"tls": {"identity": "server.p12", "password": "…", "port": 8443}`.
     public var tls: TLSSettings?
     /// The HTTP/3 (QUIC) listener (#0089, #0103). `nil` (the default) serves no HTTP/3. Needs
-    /// ``tls``. In the file: `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`.
+    /// ``tls``. In the file: `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400,
+    /// "qpackMaxTableCapacity": 4096, "qpackBlockedStreams": 16}`.
     public var http3: HTTP3Settings?
     /// HTTP/2 (#0119). On by default: TLS listeners offer `h2` and `http/1.1` via ALPN.
     /// `nil` (`"http2": false`) serves HTTP/1.1 only. Cleartext h2c is a separate opt-in
@@ -128,8 +129,9 @@ public struct ServerSettings: Sendable, Equatable {
     /// `"auth": [{"paths": ["/admin"], "realm": "Admin", "basic": {"file": "users.htpasswd"}}]`.
     public var auth: [AuthSettings] = []
 
-    /// Reverse-proxy mounts (#0124). Parsed and validated; serving lands with #0121. In the file:
-    /// `"proxy": [{"path": "/api", "upstream": "http://127.0.0.1:9000"}]`.
+    /// Reverse-proxy mounts (#0124), after auth and before the static files. In the file:
+    /// `"proxy": [{"path": "/api", "upstream": "http://127.0.0.1:9000"}]`. Sites of ``hosts``
+    /// can have their own (`hosts[].proxy`), tried before these.
     public var proxy: [ProxySettings] = []
 
     /// The access log (#0125): `AccessLog` outermost in the chain, so it records the final
@@ -169,10 +171,20 @@ public struct ServerSettings: Sendable, Equatable {
         public var port: UInt16?
         /// `ma` of the `Alt-Svc` header sent on TLS responses, in seconds. Default 86400.
         public var altSvcMaxAge: Int = 86_400
+        /// QPACK dynamic table capacity offered to clients' encoders, in bytes (#0106,
+        /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`). 0 (the default) decodes with the static table
+        /// only.
+        public var qpackMaxTableCapacity: Int = 0
+        /// Request streams that may wait for QPACK inserts at once
+        /// (`SETTINGS_QPACK_BLOCKED_STREAMS`). Default 0; only used with a table capacity.
+        public var qpackBlockedStreams: Int = 0
 
-        public init(port: UInt16? = nil, altSvcMaxAge: Int = 86_400) {
+        public init(port: UInt16? = nil, altSvcMaxAge: Int = 86_400,
+                    qpackMaxTableCapacity: Int = 0, qpackBlockedStreams: Int = 0) {
             self.port = port
             self.altSvcMaxAge = altSvcMaxAge
+            self.qpackMaxTableCapacity = qpackMaxTableCapacity
+            self.qpackBlockedStreams = qpackBlockedStreams
         }
     }
 
