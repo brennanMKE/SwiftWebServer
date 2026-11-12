@@ -1,6 +1,6 @@
 # M4 cut-over: shipped SwiftWebServer load and memory
 
-Recorded by `scripts/bench-baseline.sh` on 2026-11-12T00:32:31Z at commit `177a569`.
+Recorded by `scripts/bench-baseline.sh` on 2026-11-12T00:32:31Z on the code of commit `639ad03` (measured before the squash, from an identical tree).
 Compared with the M0 legacy baseline ([M0-baseline.md](M0-baseline.md)); the legacy server
 itself was deleted in #0086.
 
