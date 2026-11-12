@@ -18,7 +18,7 @@ extension ReverseProxy {
         let attempts = idempotent ? 1 + policy.retries : 1
         let deadline = policy.timeouts.total.map { ContinuousClock.now + $0 }
         let options = UpstreamSendOptions(timeouts: policy.timeouts, deadline: deadline,
-                                          retriesStaleConnection: policy.retries > 0)
+                                          retriesStaleConnection: policy.retries > 0, pool: policy.pool)
         var lastError = UpstreamError.connectFailed("no upstream")
         for attempt in 0..<attempts {
             let index = order[attempt % order.count]
@@ -33,7 +33,8 @@ extension ReverseProxy {
             } catch let error as UpstreamError {
                 // The client went away: nothing to answer, and not the upstream's fault.
                 if Task.isCancelled { throw CancellationError() }
-                if error != .cancelled { mount.balancer.recordFailure(index) }
+                // A full pool is load, not a failed upstream.
+                if error != .cancelled && error != .poolExhausted { mount.balancer.recordFailure(index) }
                 lastError = error
                 // Only a request that never reached an upstream is sent again.
                 guard error.isConnectFailure else { break }
@@ -46,22 +47,37 @@ extension ReverseProxy {
                 break
             }
         }
+        if lastError == .poolExhausted { return HTTPResponse(status: .serviceUnavailable) }
         return HTTPResponse(status: lastError.isTimeout ? .gatewayTimeout : .badGateway)
     }
 }
 
 extension ReverseProxy: ServerComponent {
-    /// Runs the active health checks of mounts with a `checkPath` until cancelled; returns at
-    /// once when no mount has one.
+    /// Runs the active health checks of mounts with a `checkPath`, and the sweep that closes
+    /// idle pooled connections past their idle timeout or closed by the upstream (#0120),
+    /// until cancelled. Closes every idle connection on the way out.
     public func run(server: ServerHandle) async throws {
         let checked = mounts.filter { $0.config.policy.health.checkPath != nil && !$0.config.upstreams.isEmpty }
-        guard !checked.isEmpty else { return }
         let client = client
+        let interval = Self.sweepInterval(mounts.map(\.config.policy.pool.idleTimeout))
         await withTaskGroup(of: Void.self) { group in
             for mount in checked {
                 group.addTask { await Self.healthLoop(mount, client: client) }
             }
+            group.addTask {
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: interval) } catch { break }
+                    await client.evictIdleConnections(all: false)
+                }
+            }
         }
+        await client.evictIdleConnections(all: true)
+    }
+
+    /// Half the shortest idle timeout, between 1 and 30 seconds.
+    static func sweepInterval(_ idleTimeouts: [Duration?]) -> Duration {
+        let shortest = idleTimeouts.compactMap { $0 }.min() ?? .seconds(60)
+        return min(max(shortest / 2, .seconds(1)), .seconds(30))
     }
 
     static func healthLoop(_ mount: CompiledMount, client: any UpstreamClient) async {

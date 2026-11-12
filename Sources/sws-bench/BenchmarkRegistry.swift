@@ -16,6 +16,7 @@ func registerAllBenchmarks() {
     registerVirtualHostsBenchmarks()   // M6: VirtualHostsBench.swift
     registerAuthBenchmarks()   // M6: AuthBench.swift
     registerWebSocketBenchmarks()   // M15: WebSocketBench.swift (#0110)
+    registerProxyBenchmarks()   // M17: ProxyBench.swift (#0120, #0121)
     registerSelfTimedSuites()
 }
 

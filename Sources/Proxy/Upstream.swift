@@ -77,6 +77,9 @@ public enum UpstreamError: Error, Sendable, Equatable {
     case cancelled
     /// The connect timeout passed before the connection was established (#0122): `504`.
     case connectTimeout
+    /// Every connection to the upstream is busy and the wait queue is full, or the wait timed
+    /// out (#0120): `503`.
+    case poolExhausted
 }
 
 /// Sends requests to upstreams. Implemented by the pooled HTTP/1.1 client (#0120).
@@ -85,6 +88,9 @@ public protocol UpstreamClient: Sendable {
     /// Sends with per-mount timeouts and retry permission (#0122). The default ignores `options`.
     func send(_ request: UpstreamRequest, body: HTTPRequestBody, to target: UpstreamTarget,
               options: UpstreamSendOptions) async throws -> UpstreamResponse
+    /// Closes pooled connections idle longer than their pool's idle timeout and those the
+    /// upstream has closed; with `all`, every idle connection (#0120). The default does nothing.
+    func evictIdleConnections(all: Bool) async
 }
 
 extension UpstreamClient {
@@ -92,6 +98,8 @@ extension UpstreamClient {
                      options: UpstreamSendOptions) async throws -> UpstreamResponse {
         try await send(request, body: body, to: target)
     }
+
+    public func evictIdleConnections(all: Bool) async {}
 }
 
 /// One proxied mount (#0121), as configured (#0124).
@@ -109,6 +117,13 @@ public struct ProxyMount: Sendable {
     public var websocket: Bool
     /// Timeouts, retries and upstream health (#0122).
     public var policy: UpstreamPolicy = UpstreamPolicy()
+    /// Peers whose `X-Forwarded-*` and `Forwarded` fields are trusted (#0121): their chain is
+    /// extended (`X-Forwarded-For` and `Forwarded` appended to; `X-Forwarded-Proto` and
+    /// `X-Forwarded-Host` kept when present). From any other peer those fields are replaced.
+    public var trustedProxies: [IPAddressRange] = []
+    /// With `stripPrefix`, rewrite the `Path` attribute of `Set-Cookie` from the upstream's path
+    /// space back to the client's (the mount prefix added, the base path removed) (#0121).
+    public var rewriteCookiePath = false
     public init(path: String, hosts: [String] = [], upstreams: [UpstreamTarget],
                 stripPrefix: Bool = false, preserveHost: Bool = false,
                 forwardedHeaders: ForwardedHeaders = .xForwarded,

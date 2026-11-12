@@ -250,17 +250,7 @@ enum UpstreamTunnel {
     /// The request head; the target already carries the base path. Bodies are not sent.
     static func serializeHead(_ request: UpstreamRequest) -> ByteBuffer {
         var buffer = ByteBuffer(capacity: 512)
-        buffer.append(contentsOf: "\(request.method) \(request.target) HTTP/1.1\r\nhost: \(request.host)\r\n".utf8)
-        let h = request.headers
-        for i in 0..<h.count {
-            let name = h.nameString(at: i).lowercased()
-            if name == "host" || name == "content-length" || name == "transfer-encoding" { continue }
-            h.withName(at: i) { buffer.append(contentsOf: $0) }
-            buffer.append(contentsOf: ": ".utf8)
-            h.withValue(at: i) { buffer.append(contentsOf: $0) }
-            buffer.append(contentsOf: "\r\n".utf8)
-        }
-        buffer.append(contentsOf: "\r\n".utf8)
+        UpstreamHTTP1Client.writeHead(request, framing: .none, keepConnection: true, into: &buffer)
         return buffer
     }
 

@@ -3,11 +3,17 @@ import HTTP1
 import NetworkTransport
 import Synchronization
 
-/// One upstream connection with its unread bytes.
+/// One upstream connection with its unread bytes. Used by one exchange at a time.
 final class UpstreamConnection: @unchecked Sendable {
     let transport: BSDSocketTransport
     var pending: [UInt8] = []
     var eof = false
+    /// Reused for every receive and every request head, so a kept-alive connection does not
+    /// allocate them per request.
+    private var readBuffer = ByteBuffer()
+    var headBuffer = ByteBuffer()
+
+    static let readSize = 16 * 1024
 
     init(transport: BSDSocketTransport) { self.transport = transport }
 
@@ -16,19 +22,22 @@ final class UpstreamConnection: @unchecked Sendable {
     /// receive closes the transport.
     func fill(limit: Duration? = nil) async throws -> Bool {
         if eof { return false }
-        let buffer: ByteBuffer
+        var buffer = readBuffer
+        readBuffer = ByteBuffer()
+        buffer.clear()
         if let limit {
             let transport = transport
+            let start = buffer
+            buffer = ByteBuffer()
             buffer = try await withUpstreamTimeout(limit) {
-                var b = ByteBuffer(capacity: 16 * 1024)
-                _ = try await transport.receive(into: &b, maxLength: 16 * 1024)
+                var b = start
+                _ = try await transport.receive(into: &b, maxLength: Self.readSize)
                 return b
             }
         } else {
-            var b = ByteBuffer(capacity: 16 * 1024)
-            _ = try await transport.receive(into: &b, maxLength: 16 * 1024)
-            buffer = b
+            _ = try await transport.receive(into: &buffer, maxLength: Self.readSize)
         }
+        defer { readBuffer = buffer }
         if buffer.readableBytes == 0 { eof = true; return false }
         buffer.withUnsafeReadableBytes { pending.append(contentsOf: $0) }
         return true
@@ -38,9 +47,18 @@ final class UpstreamConnection: @unchecked Sendable {
 }
 
 /// A pooled HTTP/1.1 client for upstream app servers (#0120).
+///
+/// Per upstream address it keeps up to ``UpstreamPoolPolicy/maxIdle`` keep-alive connections,
+/// opens at most ``UpstreamPoolPolicy/maxConnections`` at once and queues the requests over
+/// that limit (bounded, with a timeout; ``UpstreamError/poolExhausted`` when full). A pooled
+/// connection is reused only after a complete, well-framed exchange, when it is younger than
+/// ``UpstreamPoolPolicy/idleTimeout`` and a non-blocking peek finds it still open with
+/// nothing unread (so a request does not go out on a connection the upstream already closed).
+/// The policy comes with each request (``UpstreamSendOptions/pool``), so mounts configure it.
 public final class UpstreamHTTP1Client: UpstreamClient {
     public struct Configuration: Sendable {
-        /// Idle keep-alive connections kept per target.
+        /// Idle keep-alive connections kept per target, an upper bound on the per-request
+        /// ``UpstreamPoolPolicy/maxIdle``.
         public var maxIdlePerTarget: Int
         public var parserLimits: UpstreamResponseParserLimits
         public init(maxIdlePerTarget: Int = 16, parserLimits: UpstreamResponseParserLimits = UpstreamResponseParserLimits()) {
@@ -50,7 +68,7 @@ public final class UpstreamHTTP1Client: UpstreamClient {
     }
 
     public let configuration: Configuration
-    private let idle = Mutex<[UpstreamAddress: [UpstreamConnection]]>([:])
+    let pools = UpstreamPools()
     private let opened = Atomic<Int>(0)
     /// Test seam: runs before every connect (loopback cannot black-hole a SYN on macOS, so
     /// tests delay here to exercise the connect timeout).
@@ -70,41 +88,62 @@ public final class UpstreamHTTP1Client: UpstreamClient {
     public var connectionsOpened: Int { opened.load(ordering: .relaxed) }
 
     /// Number of idle pooled connections for `address`.
-    public func idleCount(for address: UpstreamAddress) -> Int {
-        idle.withLock { $0[address]?.count ?? 0 }
-    }
+    public func idleCount(for address: UpstreamAddress) -> Int { pools.idleCount(address) }
+
+    /// Connections open (or being opened) to `address`, idle ones included.
+    public func openCount(for address: UpstreamAddress) -> Int { pools.openCount(address) }
+
+    /// Requests waiting for a connection to `address`.
+    public func waitingCount(for address: UpstreamAddress) -> Int { pools.waiterCount(address) }
 
     /// Closes every idle connection.
     public func shutdown() async {
-        let all = idle.withLock { state -> [UpstreamConnection] in
-            let a = state.values.flatMap { $0 }
-            state.removeAll()
-            return a
-        }
-        for c in all { await c.close() }
+        await evictIdleConnections(all: true)
     }
 
-    private func checkout(_ address: UpstreamAddress) -> UpstreamConnection? {
-        idle.withLock { state in
-            guard var list = state[address], !list.isEmpty else { return nil }
-            let c = list.removeLast()
-            state[address] = list
-            return c
-        }
+    public func evictIdleConnections(all: Bool) async {
+        for c in pools.takeIdle(all: all, now: .now) { await c.close() }
     }
 
-    private func checkin(_ connection: UpstreamConnection, _ address: UpstreamAddress) async {
-        guard connection.pending.isEmpty, !connection.eof else {
-            await connection.close(); return
+    private func effective(_ policy: UpstreamPoolPolicy) -> UpstreamPoolPolicy {
+        var p = policy
+        p.maxIdle = min(p.maxIdle, configuration.maxIdlePerTarget)
+        return p
+    }
+
+    /// A live pooled connection, or nil with a slot reserved for opening a new one.
+    private func acquire(_ address: UpstreamAddress, policy: UpstreamPoolPolicy) async throws -> UpstreamConnection? {
+        // Expired idle connections close when released at the end of this call.
+        var expired: [UpstreamConnection] = []
+        var grant: UpstreamPoolState.Grant
+        switch pools.checkout(address, policy: policy, now: .now, expired: &expired) {
+        case .grant(let g): grant = g
+        case .full: throw UpstreamError.poolExhausted
+        case .wait: grant = try await pools.wait(address, policy: policy)
         }
-        let accepted = idle.withLock { state -> Bool in
-            var list = state[address] ?? []
-            guard list.count < configuration.maxIdlePerTarget else { return false }
-            list.append(connection)
-            state[address] = list
-            return true
+        while case .connection(let connection) = grant {
+            if connection.pending.isEmpty, !connection.eof, connection.transport.isIdleAndOpen { return connection }
+            // The upstream closed it (or sent something unasked) while it sat idle.
+            await connection.close()
+            pools.releaseSlot(address)
+            switch pools.checkout(address, policy: policy, now: .now, expired: &expired) {
+            case .grant(let g): grant = g
+            case .full: throw UpstreamError.poolExhausted
+            case .wait: grant = try await pools.wait(address, policy: policy)
+            }
         }
-        if !accepted { await connection.close() }
+        return nil
+    }
+
+    /// Releases a connection after its exchange: pooled when `reuse`, closed otherwise.
+    func release(_ connection: UpstreamConnection, _ address: UpstreamAddress, reuse: Bool,
+                 policy: UpstreamPoolPolicy) async {
+        if reuse, connection.pending.isEmpty, !connection.eof {
+            if let close = pools.checkin(connection, address, policy: policy, now: .now) { await close.close() }
+        } else {
+            await connection.close()
+            pools.releaseSlot(address)
+        }
     }
 
     private func connect(_ address: UpstreamAddress, limit: Duration?) async throws -> UpstreamConnection {
@@ -136,26 +175,53 @@ public final class UpstreamHTTP1Client: UpstreamClient {
         }
     }
 
-    static func serializeHead(_ request: UpstreamRequest, target: UpstreamTarget, framing: UpstreamBodyFraming) -> ByteBuffer {
-        var buffer = ByteBuffer(capacity: 512)
-        // `request.target` is final: the proxy already prepended `target.basePath` (#0122).
-        let path = request.target
-        buffer.append(contentsOf: "\(request.method) \(path) HTTP/1.1\r\nhost: \(request.host)\r\n".utf8)
-        let h = request.headers
-        for i in 0..<h.count {
-            let name = h.nameString(at: i).lowercased()
-            if name == "host" || name == "content-length" || name == "transfer-encoding" || name == "connection" { continue }
-            h.withName(at: i) { buffer.append(contentsOf: $0) }
-            buffer.append(contentsOf: ": ".utf8)
-            h.withValue(at: i) { buffer.append(contentsOf: $0) }
-            buffer.append(contentsOf: "\r\n".utf8)
+    /// Writes the request head straight from the request's bytes: no `String` building and no
+    /// lowercasing (field names are matched by their resolved ``HTTPFieldName``). `Host`,
+    /// framing and (unless `keepConnection`) `Connection` fields are replaced by the client's.
+    static func writeHead(_ request: UpstreamRequest, framing: UpstreamBodyFraming, keepConnection: Bool = false,
+                          into buffer: inout ByteBuffer) {
+        request.method.append(to: &buffer)
+        buffer.append(UInt8(ascii: " "))
+        buffer.append(contentsOf: request.target.utf8)
+        buffer.append(" HTTP/1.1\r\nhost: ")
+        buffer.append(contentsOf: request.host.utf8)
+        buffer.append("\r\n")
+        request.headers.withFieldStorage { index, arena in
+            let names = index.names
+            let nameViews = index.nameViews
+            let valueViews = index.valueViews
+            for i in 0..<index.count {
+                let name = names[i]
+                switch name {
+                case .host, .contentLength, .transferEncoding: continue
+                case .connection where !keepConnection: continue
+                case .unknown: buffer.append(nameViews[i], from: arena)
+                default: buffer.append(name.canonicalName)
+                }
+                buffer.append(": ")
+                buffer.append(valueViews[i], from: arena)
+                buffer.append("\r\n")
+            }
         }
         switch framing {
-        case .length(let n): buffer.append(contentsOf: "content-length: \(n)\r\n".utf8)
-        case .chunked: buffer.append(contentsOf: "transfer-encoding: chunked\r\n".utf8)
+        case .length(let n):
+            buffer.append("content-length: ")
+            buffer.append(decimal: n)
+            buffer.append("\r\n")
+        case .chunked: buffer.append("transfer-encoding: chunked\r\n")
         case .none, .close: break
         }
-        buffer.append(contentsOf: "\r\n".utf8)
+        buffer.append("\r\n")
+    }
+
+    /// For `sws-bench`: ``writeHead(_:framing:keepConnection:into:)`` for a bodiless request.
+    @_spi(Benchmark) public static func benchWriteHead(_ request: UpstreamRequest, into buffer: inout ByteBuffer) {
+        writeHead(request, framing: .none, into: &buffer)
+    }
+
+    static func serializeHead(_ request: UpstreamRequest, target: UpstreamTarget, framing: UpstreamBodyFraming) -> ByteBuffer {
+        var buffer = ByteBuffer(capacity: 512)
+        writeHead(request, framing: framing, into: &buffer)
         return buffer
     }
 
@@ -167,31 +233,49 @@ public final class UpstreamHTTP1Client: UpstreamClient {
                      options: UpstreamSendOptions) async throws -> UpstreamResponse {
         let timeouts = options.timeouts
         let deadline = options.deadline ?? timeouts.total.map { ContinuousClock.now + $0 }
-        // A pooled connection may have been closed by the upstream. Resend once on a fresh one
-        // only for an idempotent method with no request body, and only when the pooled
-        // connection failed before a single response byte arrived (#0122).
+        let policy = effective(options.pool)
+        let address = target.address
+        // A pooled connection may have been closed by the upstream after the liveness check.
+        // Resend once on a fresh one only for an idempotent method with no request body, and
+        // only when the pooled connection failed before a single response byte arrived (#0122).
         let bodiless = body.isEmpty || body.knownLength == 0
         let mayRetry = options.retriesStaleConnection && request.method.isIdempotent && bodiless
-        if let pooled = checkout(target.address) {
+        var connection = try await acquire(address, policy: policy)
+        if let pooled = connection {
             do {
-                return try await exchange(request, body: body, target: target, connection: pooled,
-                                          timeouts: timeouts, deadline: deadline, pooled: true)
+                return try await exchange(request, body: body, address: address, connection: pooled,
+                                          timeouts: timeouts, deadline: deadline, policy: policy, pooled: true)
             } catch is StaleConnection {
                 guard mayRetry else { throw UpstreamError.closedEarly }
+                // `exchange` gave the slot back; take another (no further stale retry).
+                connection = try await acquire(address, policy: policy)
             }
         }
-        let limit = try UpstreamTimeouts.limit(timeouts.connect, deadline: deadline, error: .connectTimeout)
-        let fresh = try await connect(target.address, limit: limit)
-        return try await exchange(request, body: body, target: target, connection: fresh,
-                                  timeouts: timeouts, deadline: deadline, pooled: false)
+        if connection == nil {
+            // Holding a slot: open a connection, or give the slot back when that fails.
+            do {
+                let limit = try UpstreamTimeouts.limit(timeouts.connect, deadline: deadline, error: .connectTimeout)
+                connection = try await connect(address, limit: limit)
+            } catch {
+                pools.releaseSlot(address)
+                throw error
+            }
+        }
+        do {
+            return try await exchange(request, body: body, address: address, connection: connection!,
+                                      timeouts: timeouts, deadline: deadline, policy: policy, pooled: false)
+        } catch is StaleConnection {
+            throw UpstreamError.closedEarly
+        }
     }
 
     /// A pooled connection failed before any response byte arrived.
     struct StaleConnection: Error {}
 
-    private func exchange(_ request: UpstreamRequest, body: HTTPRequestBody, target: UpstreamTarget,
+    private func exchange(_ request: UpstreamRequest, body: HTTPRequestBody, address: UpstreamAddress,
                           connection: UpstreamConnection, timeouts: UpstreamTimeouts,
-                          deadline: ContinuousClock.Instant?, pooled: Bool) async throws -> UpstreamResponse {
+                          deadline: ContinuousClock.Instant?, policy: UpstreamPoolPolicy,
+                          pooled: Bool) async throws -> UpstreamResponse {
         let framing: UpstreamBodyFraming
         if let n = body.knownLength {
             framing = n == 0 ? .none : .length(n)
@@ -201,16 +285,26 @@ public final class UpstreamHTTP1Client: UpstreamClient {
             framing = .chunked
         }
         do {
-            try await connection.transport.send(Self.serializeHead(request, target: target, framing: framing), endOfStream: false)
+            var head = connection.headBuffer
+            connection.headBuffer = ByteBuffer()
+            head.clear()
+            Self.writeHead(request, framing: framing, into: &head)
+            try await connection.transport.send(head, endOfStream: false)
+            connection.headBuffer = head
             if framing != .none {
                 for try await chunk in body {
                     if chunk.readableBytes == 0 { continue }
                     if framing == .chunked {
-                        var b = ByteBuffer(capacity: chunk.readableBytes + 16)
-                        b.append(contentsOf: (String(chunk.readableBytes, radix: 16) + "\r\n").utf8)
-                        b.append(chunk)
-                        b.append(contentsOf: "\r\n".utf8)
-                        try await connection.transport.send(b, endOfStream: false)
+                        // Framed in the connection's reused buffer: one copy, one send.
+                        var framed = connection.headBuffer
+                        connection.headBuffer = ByteBuffer()
+                        framed.clear()
+                        framed.append(hex: UInt64(chunk.readableBytes))
+                        framed.append("\r\n")
+                        framed.append(chunk)
+                        framed.append("\r\n")
+                        try await connection.transport.send(framed, endOfStream: false)
+                        connection.headBuffer = framed
                     } else {
                         try await connection.transport.send(chunk, endOfStream: false)
                     }
@@ -219,17 +313,20 @@ public final class UpstreamHTTP1Client: UpstreamClient {
                     try await connection.transport.send(ByteBuffer("0\r\n\r\n"), endOfStream: false)
                 }
             }
-            // Read the head, skipping interim 1xx responses, within the response timeout
-            // (measured from the end of the request) and the total deadline.
+            // Read the final head within the response timeout (measured from the end of the
+            // request) and the total deadline. Interim 1xx responses other than 101 (`100
+            // Continue`, `103 Early Hints`) are consumed here and not relayed: the downstream
+            // protocols answer `Expect: 100-continue` themselves and have no interim-response
+            // API, and early hints are advisory.
             let headDeadline = timeouts.response.map { ContinuousClock.now + $0 }
             let parser = UpstreamResponseParser(limits: configuration.parserLimits)
-            var head: UpstreamResponseHead
+            var responseHead: UpstreamResponseHead
             var received = false
             while true {
                 if let (h, used) = try parser.parseHead(connection.pending, requestMethod: request.method) {
                     connection.pending.removeFirst(used)
                     if (100..<200).contains(h.status.code) && h.status.code != 101 { continue }
-                    head = h
+                    responseHead = h
                     break
                 }
                 let limit = try UpstreamTimeouts.limit(
@@ -240,10 +337,11 @@ public final class UpstreamHTTP1Client: UpstreamClient {
                 }
                 received = true
             }
-            return makeResponse(head, connection: connection, address: target.address,
-                                idle: timeouts.idle, deadline: deadline)
+            return await makeResponse(responseHead, connection: connection, address: address,
+                                      idle: timeouts.idle, deadline: deadline, policy: policy)
         } catch {
             await connection.close()
+            pools.releaseSlot(address)
             if error is StaleConnection { throw error }
             if let e = error as? UpstreamError { throw e }
             if error is CancellationError { throw UpstreamError.cancelled }
@@ -257,22 +355,20 @@ public final class UpstreamHTTP1Client: UpstreamClient {
     }
 
     private func makeResponse(_ head: UpstreamResponseHead, connection: UpstreamConnection, address: UpstreamAddress,
-                              idle: Duration?, deadline: ContinuousClock.Instant?) -> UpstreamResponse {
-        let reader = BodyReader(framing: head.framing, connection: connection, reusable: !head.closeAfter,
-                                idle: idle, deadline: deadline) { [self] conn, reuse in
-            if reuse { await self.checkin(conn, address) } else { await conn.close() }
-        }
-        let knownLength: Int? = switch head.framing {
-        case .none: 0
-        case .length(let n): n
-        default: nil
-        }
+                              idle: Duration?, deadline: ContinuousClock.Instant?,
+                              policy: UpstreamPoolPolicy) async -> UpstreamResponse {
         if head.framing == .none {
-            let reuse = !head.closeAfter
             // Body is empty: return the connection right away.
-            Task { await reader.finish(reuse: reuse) }
+            await release(connection, address, reuse: !head.closeAfter, policy: policy)
             return UpstreamResponse(status: head.status, headers: head.headers, body: .empty)
         }
+        let pools = pools
+        let reader = BodyReader(framing: head.framing, connection: connection, reusable: !head.closeAfter,
+                                idle: idle, deadline: deadline,
+                                abandoned: { pools.releaseSlot(address) }) { [self] conn, reuse in
+            await self.release(conn, address, reuse: reuse, policy: policy)
+        }
+        let knownLength: Int? = if case .length(let n) = head.framing { n } else { nil }
         return UpstreamResponse(status: head.status, headers: head.headers,
                                 body: UpstreamResponseBody(knownLength: knownLength,
                                                            next: { try await reader.next() },
@@ -281,7 +377,10 @@ public final class UpstreamHTTP1Client: UpstreamClient {
 }
 
 /// Streams one response body off a connection, then releases the connection.
-actor BodyReader {
+///
+/// Single consumer: the response writer calls ``next()`` until it returns nil, or ``finish(reuse:)``
+/// to abandon the body; calls do not overlap (an overlapping one fails with `closedEarly`).
+final class BodyReader: @unchecked Sendable {
     enum State { case length(Int), chunked(ChunkedDecoder), close, done }
     private var state: State
     private var connection: UpstreamConnection?
@@ -290,10 +389,16 @@ actor BodyReader {
     /// Limit between two body reads, and the end of the whole exchange (#0122).
     private let idle: Duration?
     private let deadline: ContinuousClock.Instant?
+    private let busy = Atomic<Bool>(false)
+    /// Called from `deinit` when the body was neither read to the end nor discarded (the
+    /// response was dropped unsent): gives the pool slot back. The connection closes with it.
+    private let abandoned: (@Sendable () -> Void)?
 
     init(framing: UpstreamBodyFraming, connection: UpstreamConnection, reusable: Bool,
          idle: Duration? = nil, deadline: ContinuousClock.Instant? = nil,
+         abandoned: (@Sendable () -> Void)? = nil,
          release: @escaping @Sendable (UpstreamConnection, Bool) async -> Void) {
+        self.abandoned = abandoned
         self.idle = idle
         self.deadline = deadline
         switch framing {
@@ -307,7 +412,23 @@ actor BodyReader {
         self.release = release
     }
 
+    deinit {
+        if connection != nil { abandoned?() }
+    }
+
+    private func enter() -> Bool {
+        busy.compareExchange(expected: false, desired: true, ordering: .acquiring).exchanged
+    }
+
+    private func leave() { busy.store(false, ordering: .releasing) }
+
     func finish(reuse: Bool) async {
+        guard enter() else { return }
+        defer { leave() }
+        await finishLocked(reuse: reuse)
+    }
+
+    private func finishLocked(reuse: Bool) async {
         state = .done
         guard let c = connection else { return }
         connection = nil
@@ -315,12 +436,14 @@ actor BodyReader {
     }
 
     func next() async throws -> ByteBuffer? {
+        guard enter() else { throw UpstreamError.closedEarly }
+        defer { leave() }
         guard let c = connection else { return nil }
         do {
             while true {
                 switch state {
                 case .done:
-                    await finish(reuse: true)
+                    await finishLocked(reuse: true)
                     return nil
                 case .length(let remaining):
                     if c.pending.isEmpty {
@@ -330,11 +453,11 @@ actor BodyReader {
                     let out = ByteBuffer(bytes: c.pending[0..<take])
                     c.pending.removeFirst(take)
                     state = remaining - take == 0 ? .done : .length(remaining - take)
-                    if case .done = state { await finish(reuse: true) }
+                    if case .done = state { await finishLocked(reuse: true) }
                     return out
                 case .close:
                     if c.pending.isEmpty {
-                        guard try await c.fill(limit: UpstreamTimeouts.limit(idle, deadline: deadline)) else { await finish(reuse: false); return nil }
+                        guard try await c.fill(limit: UpstreamTimeouts.limit(idle, deadline: deadline)) else { await finishLocked(reuse: false); return nil }
                     }
                     let out = ByteBuffer(bytes: c.pending)
                     c.pending.removeAll(keepingCapacity: true)
@@ -343,7 +466,7 @@ actor BodyReader {
                     if c.pending.isEmpty {
                         guard try await c.fill(limit: UpstreamTimeouts.limit(idle, deadline: deadline)) else { throw UpstreamError.closedEarly }
                     }
-                    let step = ByteBuffer(bytes: c.pending).withReadableSpan { decoder.decode($0) }
+                    let step = c.pending.withUnsafeBufferPointer { decoder.decode($0.span) }
                     state = .chunked(decoder)
                     switch step.kind {
                     case .data:
@@ -362,7 +485,7 @@ actor BodyReader {
                 }
             }
         } catch {
-            await finish(reuse: false)
+            await finishLocked(reuse: false)
             if let e = error as? UpstreamError { throw e }
             throw UpstreamError.closedEarly
         }
