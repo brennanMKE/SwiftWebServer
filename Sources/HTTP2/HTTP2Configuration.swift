@@ -69,6 +69,11 @@ public struct HTTP2Configuration: Sendable, Hashable {
     public var maxLingerSize: Int
     /// Rate limits and timeouts against denial-of-service patterns (#0056).
     public var abuseLimits: HTTP2AbuseLimits
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` (RFC 8441 §3, #0067): extended CONNECT requests
+    /// (`:protocol`) are accepted. ``HTTP2`` turns it on for a connection whose handler chain
+    /// holds an `ExtendedConnectProvider` (the WebSocket component); otherwise the setting is
+    /// not sent and a request with `:protocol` is reset with `PROTOCOL_ERROR`.
+    public var enableConnectProtocol: Bool = false
 
     public static let defaultMaxConcurrentStreams = 100
     public static let defaultInitialWindowSize: UInt32 = 65_535
@@ -158,6 +163,7 @@ public struct HTTP2Configuration: Sendable, Hashable {
             initialWindowSize: initialWindowSize,
             maxFrameSize: UInt32(maxFrameSize),
             maxHeaderListSize: UInt32(maxHeaderListSize),
+            enableConnectProtocol: enableConnectProtocol ? true : nil,
             noRFC7540Priorities: true)
     }
 

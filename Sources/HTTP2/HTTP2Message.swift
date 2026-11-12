@@ -60,6 +60,11 @@ struct HTTP2RequestFieldSink: HPACKFieldSink {
     var scheme = ByteView.empty
     var authority = ByteView.empty
     var path = ByteView.empty
+    /// The `:protocol` of an extended CONNECT (RFC 8441 §4); empty otherwise.
+    var connectProtocol = ByteView.empty
+    /// Whether we advertised SETTINGS_ENABLE_CONNECT_PROTOCOL (#0067): without it a request
+    /// with `:protocol` is malformed (RFC 8441 §3).
+    var allowsExtendedConnect = false
     var host: ByteView?
     var contentLength: Int?
     /// The first `cookie` field's name and value; later crumbs in ``moreCookies``.
@@ -99,7 +104,8 @@ struct HTTP2RequestFieldSink: HPACKFieldSink {
         case .pseudoScheme: scheme = valueView
         case .pseudoAuthority: authority = valueView
         case .pseudoPath: path = valueView
-        case .pseudoMethod, .pseudoProtocol: break
+        case .pseudoProtocol: connectProtocol = valueView
+        case .pseudoMethod: break
         case .cookie:
             // Joined in `head(endStream:)` once every crumb is known.
             if cookieName == nil {
@@ -121,6 +127,9 @@ struct HTTP2RequestFieldSink: HPACKFieldSink {
         if let failure { return .failure(failure) }
         if let violation = validator.finish() { return .failure(.field(violation)) }
         guard let method = validator.method else { return .failure(.field(.missingPseudoHeader(.pseudoMethod))) }
+        if validator.hasSeen(.pseudoProtocol) && !allowsExtendedConnect {
+            return .failure(.field(.pseudoHeaderNotAllowed(.pseudoProtocol)))
+        }
         if endStream, let contentLength, contentLength > 0 { return .failure(.contentLengthWithoutBody) }
         if let host, validator.hasSeen(.pseudoAuthority), !sameAuthority(host, authority) {
             return .failure(.hostMismatch)
@@ -138,7 +147,7 @@ struct HTTP2RequestFieldSink: HPACKFieldSink {
         }
         let request = HTTPRequest(
             method: method, scheme: scheme, authority: authority, path: path, query: query,
-            headers: storage.fieldsView)
+            headers: storage.fieldsView, version: .http2, connectProtocol: connectProtocol)
         return .success(HTTP2RequestHead(request: request, contentLength: contentLength))
     }
 

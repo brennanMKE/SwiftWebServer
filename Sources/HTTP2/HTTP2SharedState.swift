@@ -129,6 +129,9 @@ struct HTTP2SharedState: Sendable {
     var bodies: [UInt32: HTTP2BodyChannel] = [:]
     /// The handler task of every dispatched stream, until it ends (#0051): a reset cancels it.
     var tasks: [UInt32: HTTP2StreamTask] = [:]
+    /// Streams running an extended CONNECT tunnel (#0067): a reset ends the tunnel through its
+    /// body and sends instead of cancelling its task.
+    var tunnels: Set<UInt32> = []
     /// Tasks waiting for the ACK of our PING, by opaque data (#0050).
     var pingWaiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
     /// The opaque data of the last PING sent.
@@ -179,7 +182,9 @@ struct HTTP2SharedState: Sendable {
             // handler is cancelled.
             if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
             if let task = tasks[id.rawValue] {
-                wakeups.cancelledTasks.append(task)
+                // A running tunnel (#0067) sees the reset in its receive and send and ends
+                // itself (a WebSocket reports 1006); anything else is cancelled.
+                if !tunnels.contains(id.rawValue) { wakeups.cancelledTasks.append(task) }
                 // A reset while the handler runs costs a task and its cancellation (rapid reset).
                 if let flood = recordAbuse(.resetStreams, wakeups: &wakeups) { return flood }
             }
@@ -262,7 +267,7 @@ struct HTTP2SharedState: Sendable {
             }
             // The stream is over: its body ends and its handler, if still running, is cancelled.
             if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
-            if let task = tasks[id.rawValue] { wakeups.cancelledTasks.append(task) }
+            if let task = tasks[id.rawValue], !tunnels.contains(id.rawValue) { wakeups.cancelledTasks.append(task) }
             HTTP2FrameEncoder.encodeRSTStream(streamID: id, code, into: &outbound.ordered)
             if let increment {
                 HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: increment, into: &outbound.priority)
@@ -645,6 +650,7 @@ struct HTTP2SharedState: Sendable {
         // DATA that still arrives has no reader: the reader credits it at once.
         bodies.removeValue(forKey: streamID.rawValue)
         tasks.removeValue(forKey: streamID.rawValue)
+        tunnels.remove(streamID.rawValue)
         if isOpen { _ = handle(.responseFinished(streamID: streamID), wakeups: &wakeups) }
         if draining && activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
     }
