@@ -42,7 +42,8 @@ public struct ServerSettings: Sendable, Equatable {
         /// A small generated HTML page. The default.
         case generated
         /// Pages from files: status code to a path relative to ``ServerSettings/root``;
-        /// statuses without a file get the generated page.
+        /// statuses without a file get the generated page. With ``ServerSettings/hosts``, each
+        /// site looks in its own root first, then ``ServerSettings/root`` (#0129).
         case files([Int: String])
     }
 

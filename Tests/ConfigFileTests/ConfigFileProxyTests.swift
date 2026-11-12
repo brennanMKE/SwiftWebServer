@@ -91,6 +91,45 @@ import Testing
         expectError(#"{"proxy": [{"upstream": "http://h:1", "health": {"failures": 1.5}}]}"#, key: "proxy[0].health.failures")
     }
 
+    /// #0128: `0` and `null` turn each limit off; a positive value sets it; absent keeps the default.
+    @Test(arguments: ["connect", "response", "idle", "total"])
+    func zeroOrNullDisablesEachTimeout(key: String) throws {
+        func limit(_ policy: UpstreamPolicy) -> Duration? {
+            switch key {
+            case "connect": policy.timeouts.connect
+            case "response": policy.timeouts.response
+            case "idle": policy.timeouts.idle
+            default: policy.timeouts.total
+            }
+        }
+        let defaults = UpstreamPolicy(timeouts: UpstreamTimeouts())
+        for value in ["0", "null", "0.0"] {
+            let file = try parse(#"{"proxy": [{"upstream": "http://127.0.0.1:9000", "timeouts": {"\#(key)": \#(value)}}]}"#)
+            #expect(file.warnings.isEmpty, "\(file.warnings)")
+            let policy = file.settings.proxyMounts[0].policy
+            #expect(limit(policy) == nil, "\(key): \(value)")
+            // The other limits keep their defaults.
+            var expected = UpstreamTimeouts()
+            switch key {
+            case "connect": expected.connect = nil
+            case "response": expected.response = nil
+            case "idle": expected.idle = nil
+            default: expected.total = nil
+            }
+            #expect(policy.timeouts == expected)
+            #expect(policy.tunnelIdleTimeout == (key == "idle" ? .zero : nil))
+        }
+        let positive = try parse(#"{"proxy": [{"upstream": "http://127.0.0.1:9000", "timeouts": {"\#(key)": 2.5}}]}"#)
+        #expect(limit(positive.settings.proxyMounts[0].policy) == .milliseconds(2500))
+        let absent = try parse(#"{"proxy": [{"upstream": "http://127.0.0.1:9000", "timeouts": {}}]}"#)
+        #expect(limit(absent.settings.proxyMounts[0].policy) == limit(defaults))
+        // Values stay bounded: negative and more than a year are rejected.
+        expectError(#"{"proxy": [{"upstream": "http://h:1", "timeouts": {"\#(key)": -1}}]}"#, key: "proxy[0].timeouts.\(key)",
+                    contains: "0 or null turns it off")
+        expectError(#"{"proxy": [{"upstream": "http://h:1", "timeouts": {"\#(key)": 40000000}}]}"#, key: "proxy[0].timeouts.\(key)")
+        expectError(#"{"proxy": [{"upstream": "http://h:1", "timeouts": {"\#(key)": "5"}}]}"#, key: "proxy[0].timeouts.\(key)")
+    }
+
     @Test func singleObjectIsAccepted() throws {
         let file = try parse(#"{"proxy": {"upstream": "http://127.0.0.1:9000"}}"#)
         #expect(file.settings.proxyMounts.map(\.path) == ["/"])

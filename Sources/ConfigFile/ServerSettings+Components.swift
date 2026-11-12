@@ -94,6 +94,11 @@ extension ServerSettings {
             pages = nil
         case .generated:
             pages = ErrorPages()
+        case .files(let map) where !hosts.isEmpty:
+            // #0129: each site renders its own pages (ConfigFile+Hosts); this outer layer covers
+            // what no site answers (`421`, auth) from the top-level root when it has the files,
+            // generated pages otherwise. That root need not exist.
+            pages = (try? ErrorPages(roots: [root], pages: map, requireAll: false)) ?? ErrorPages()
         case .files(let map):
             do {
                 pages = try ErrorPages(root: root, pages: map)
