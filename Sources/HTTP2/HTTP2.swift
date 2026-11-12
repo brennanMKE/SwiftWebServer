@@ -56,10 +56,14 @@ import Darwin
 ///
 /// A request whose HEADERS do not end the stream gets a body (``HTTP2BodyChannel``) that the
 /// reader fills with DATA payloads (padding removed) and ends at END_STREAM, with the trailer
-/// section if one follows. The bound is the stream's receive window: credit (stream and
-/// connection WINDOW_UPDATE, batched at half a window) goes back only as the handler consumes
-/// bytes, so a handler that does not read stalls only its own stream. A DATA total that differs
-/// from `content-length`, invalid trailers, or DATA past the stream window reset the stream.
+/// section if one follows. The bound is the stream's receive window (#0053, see
+/// ``HTTP2Connection``): credit (stream and connection WINDOW_UPDATE, each batched at half its
+/// window) goes back only as the handler consumes bytes, so a handler that does not read stalls
+/// only its own stream. The connection window (``HTTP2Configuration/connectionWindowSize``,
+/// 1 MiB) is larger than a stream window (``HTTP2Configuration/initialWindowSize``), so several
+/// streams can upload at once. A DATA total that differs from `content-length`, invalid
+/// trailers, or DATA past the stream window (`FLOW_CONTROL_ERROR`) reset the stream; DATA past
+/// the connection window is a connection `FLOW_CONTROL_ERROR`.
 /// DATA the server does not deliver (ignored streams, padding, a body whose handler returned)
 /// is credited at once, and a stream still sending when its response ends is reset with
 /// `NO_ERROR` (§8.1).
@@ -114,7 +118,7 @@ import Darwin
 ///
 /// ## Not yet
 ///
-/// The full inbound window policy (#0053), fair window waiting (#0054), extended CONNECT
+/// Fair window waiting (#0054), extended CONNECT
 /// (#0067: `.tunnel` answers `501`).
 public struct HTTP2: ConnectionProtocol {
     public var configuration: HTTP2Configuration
@@ -450,12 +454,6 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         var endStream: Bool
     }
 
-    /// The stream receive window the peer may fill before our SETTINGS are acknowledged and
-    /// after: the larger of the default and the advertised one.
-    var streamReceiveWindow: Int {
-        Swift.max(Int(configuration.initialWindowSize), Int(HTTP2Connection.defaultWindowSize))
-    }
-
     /// Reads the preface and then frames until end of input, a transport error, or a
     /// connection error.
     func runReader(streams: inout DiscardingTaskGroup) async {
@@ -681,7 +679,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// Passes accepted DATA payload to the stream's body, or credits it when nobody reads it.
     func deliver(_ payload: UnsafeRawBufferPointer, to target: DataTarget) {
         guard let body = target.body else {
-            bodyConsumed(streamID: target.streamID, length: payload.count, streamIncrement: nil)
+            bodyConsumed(streamID: target.streamID, length: payload.count)
             return
         }
         switch body.receive(payload) {
@@ -690,8 +688,6 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         case .malformed:
             // More DATA than `content-length` (RFC 9113 §8.1.1).
             handle(.sendReset(streamID: target.streamID, .protocolError))
-        case .flowControlError:
-            handle(.sendReset(streamID: target.streamID, .flowControlError))
         }
     }
 
@@ -779,8 +775,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         var request = head.request
         var body: HTTP2BodyChannel?
         if !block.endStream {
-            let channel = HTTP2BodyChannel(
-                streamID: id, declaredLength: head.contentLength, window: streamReceiveWindow, credit: self)
+            let channel = HTTP2BodyChannel(streamID: id, declaredLength: head.contentLength, credit: self)
             request.body = HTTPRequestBody(source: channel, request: channel.requestID, length: head.contentLength)
             body = channel
         }
@@ -957,8 +952,8 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
 }
 
 extension HTTP2ConnectionDriver: HTTP2ReceiveCredit {
-    func bodyConsumed(streamID: HTTP2StreamID, length: Int, streamIncrement: UInt32?) {
-        handle(.bodyConsumed(streamID: streamID, length: length, streamIncrement: streamIncrement))
+    func bodyConsumed(streamID: HTTP2StreamID, length: Int) {
+        handle(.bodyConsumed(streamID: streamID, length: length))
     }
 }
 
