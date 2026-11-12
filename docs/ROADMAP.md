@@ -233,6 +233,12 @@ Each numbered item is one issue. The legacy server was the shipped binary until 
 - **M14** RFC 6455 over `.tunnel`: handshake, frame parser, connection state machine, fragmentation, UTF-8 validation, ping/pong, close. Exit: `URLSessionWebSocketTask` echo tests; Autobahn when Docker available.
 - **M15** permessage-deflate (optional); RFC 8441 over h2 (after M12); RFC 9220 over h3 (after M9). Exit: extended CONNECT echo on each.
 
+### Track D: Reverse proxy (after M4)
+
+The goal is to replace an Apache `mod_proxy` front end: this server terminates TLS and serves HTTP/1.1, HTTP/2 and HTTP/3 publicly, serves a static site at `/`, and forwards configured path prefixes (for example `/cgi-bin`) or hosts to app servers on localhost (for example Go `net/http`) over TCP or Unix sockets.
+
+- **M17** 17.1 upstream HTTP/1.1 client with a connection pool (#0120); 17.2 `ReverseProxy` component with path-prefix and host mounts, forwarded headers, hop-by-hop removal, streaming and Location rewriting (#0121); 17.3 timeouts, 502/504, retries, health (#0122); 17.4 WebSocket and Upgrade passthrough (#0123); 17.5 `proxy` config key, example config and docs, benchmark vs Apache mod_proxy and nginx (#0124). Exit: the shipped binary serves `/` from disk and `/cgi-bin/*` from a localhost app over h1, h2 and h3.
+
 ## 9. Legacy issue mapping (0001–0068)
 
 | Issue | Disposition | New home |

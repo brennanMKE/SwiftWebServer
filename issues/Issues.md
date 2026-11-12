@@ -362,6 +362,7 @@ Legacy issues 0001–0068 that ROADMAP §9 merges into newer issues stay `open` 
 | M13 | HTTP/2 flow control and limits (Track B) | #0053–#0056, #0061, #0062 (h2), #0065 (optional) | M12 | `h2spec` passes; `h2load` numbers |
 | M14 | WebSockets (Track C) | #0108–#0109 | M3 (and #0083) | `URLSessionWebSocketTask` echo tests; Autobahn when Docker is available |
 | M15 | WebSocket extensions (Track C) | #0110 (optional), #0067 (RFC 8441 over h2), #0111 (RFC 9220 over h3) | M14; M12 for #0067; M9 for #0111 | Extended CONNECT echo on each |
+| M17 | Reverse proxy | #0120–#0124 | M3, M4, #0113 (and M14 for #0123) | Static site at `/` plus `/cgi-bin` proxied to a localhost app over h1/h2/h3; WebSocket passthrough; benchmark vs Apache mod_proxy and nginx |
 | — | Per-milestone benchmarks | #0063 | #0070 | Each milestone records a `sws-bench` run; a regression over 10% blocks it |
 | — | Won't fix | #0066 (server push), #0068 (h2c Upgrade) | — | Status `wontfix` by owner decision (ROADMAP §2) |
 

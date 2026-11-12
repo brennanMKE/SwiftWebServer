@@ -30,6 +30,7 @@ M3 numbers (load average about 8–34): parse.head 10 headers 133 ns (was 369 ns
 Final check at b6fc9a6: 1479 debug and 1478 release tests pass ([M-final-micro](benchmarks/M-final-micro.md)). Server comparison: [SERVER-COMPARISON.md](SERVER-COMPARISON.md).
 
 Remaining:
+- **M17 Reverse proxy** (#0120–#0124): filed 2026-11-11, not started. A static site at `/` plus path prefixes such as `/cgi-bin` proxied to localhost apps.
 - #0072 local CA, #0062 and #0105 browser interop: need the owner to trust a local CA by hand.
 - #0106 QPACK dynamic table (optional).
 - Proposed M16 performance milestone (awaiting owner): CPU-per-request metric, same-thread executor resume, SO_REUSEPORT per-core listeners, writev, full-response cache, specialized protocol runners (#0083 boundary cost).
