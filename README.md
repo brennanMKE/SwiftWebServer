@@ -1,13 +1,17 @@
 # SwiftWebServer
 
-A static-file web server written in Swift 6 with Swift Concurrency, with no package
-dependencies. It runs on **macOS 15 or later only**. It uses Darwin and Network.framework
+A modular HTTP/1.1, HTTP/2 and HTTP/3 server written in Swift 6 with Swift Concurrency, with no
+package dependencies. It runs on **macOS 15 or later only**. It uses Darwin and Network.framework
 APIs and is not built or tested on Linux.
 
-The shipped `SwiftWebServer` executable serves **HTTP/1.1** over cleartext TCP and, when
-configured, over **TLS**, plus **HTTP/3** over QUIC, all at once from one config. The package
-also holds the HTTP/2 and WebSocket work in progress (see [ROADMAP](docs/ROADMAP.md)), which is
-not part of the executable yet.
+The shipped `SwiftWebServer` executable serves **HTTP/1.1** over cleartext TCP, **HTTP/1.1 and
+HTTP/2** over **TLS** (chosen by ALPN), and **HTTP/3** over QUIC, all at once from one config.
+The server core is small. Every other feature is an optional component that is compiled
+into the middleware chain only when registered (see [docs/MIDDLEWARE.md](docs/MIDDLEWARE.md)).
+
+On this machine's benchmarks it serves kept-alive connections faster than nginx, h2o, Apache and
+Caddy, behind only lighttpd. It passes the h2spec HTTP/2 conformance suite (146/146). See
+[docs/SERVER-COMPARISON.md](docs/SERVER-COMPARISON.md).
 
 ## Features
 
@@ -40,6 +44,22 @@ not part of the executable yet.
   drain cover every listener; on SIGTERM HTTP/3 connections get `GOAWAY` and finish their
   requests. HTTPS responses carry `Alt-Svc: h3=":PORT"; ma=SECONDS` so clients discover
   HTTP/3; cleartext and HTTP/3 responses do not.
+- **HTTP/2**: offered on HTTPS via ALPN (`http2` key), and as prior-knowledge h2c on cleartext
+  when enabled. It provides HPACK, per-stream and connection flow control with fair
+  scheduling, RFC 9218 priorities, graceful `GOAWAY`, and limits against known HTTP/2 attacks
+  (rapid reset, CONTINUATION, PING/SETTINGS/empty-frame floods, slow reads). Passes h2spec.
+- **HTTP/3**: QPACK (static table), control streams, `GOAWAY` drain, RFC 9218 priorities, and
+  abuse limits. Network.framework does not send our application close code (see
+  [docs/notes/nw-transport.md](docs/notes/nw-transport.md)).
+- **Optional components** (each in its own target):
+  - Wired into the config file: `StaticFiles`, `ErrorPages`, `Compression` (gzip, br, deflate),
+    `VirtualHosts`, `Auth` (Basic with PBKDF2, HS256 JWT, static tokens) and `AltSvc`.
+  - Library components, not configurable from `http-config.json` yet: `AccessLog` (CLF,
+    Combined, JSON lines, plus lock-free metrics and a Prometheus `/metrics` endpoint),
+    `Router` (a segment trie with `:params` and wildcards, allocation-free matching) and
+    `WebSockets` (RFC 6455 with permessage-deflate, over HTTP/1.1, over HTTP/2 via RFC 8441 and
+    over HTTP/3 via RFC 9220). Use them from Swift through the `Server` builder, or try them with
+    `sws-bench serve --access-log`, `--metrics` or `--websocket-echo PATH`.
 
 ## Running
 
@@ -110,7 +130,7 @@ Relative paths resolve against the directory that holds the config file.
 | `http3` | off | HTTP/3 over QUIC; needs `tls`. `true`, or `{"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`. `port` (UDP) defaults to the TLS port number, even when that was `0`. `altSvcMaxAge` is the `ma` of the `Alt-Svc` header on HTTPS responses |
 | `hosts` | `[]` | Virtual hosts: `[{"names": ["a.test", "*.a.test"], "root": "sites/a"}, {"default": true, "root": "Public"}]`. Each site serves its own `root` (the other file keys are shared); `root` at the top level is then unused. Names match `Host`/`:authority` without the port, case-insensitively; `*.a.test` matches any subdomain. An unknown host gets the `default` site, or `421` without one |
 | `auth` | `[]` | Authentication for path prefixes: `[{"paths": ["/admin"], "realm": "Admin", "basic": {"file": "users.htpasswd"}}]`. `basic` takes a credential file of `user:$pbkdf2-sha256$…` lines (make one with `scripts/hash-password.sh USER`), inline `"users"` lines, or `"usersEnv": "VAR"`; plaintext passwords are refused. `jwt` verifies HS256 bearer tokens: `{"keys": [{"id": "k1", "secretEnv": "JWT_KEY"}], "issuer": "…", "audience": "api", "leeway": 60}` (keys ≥ 32 bytes, `secret` inline or `secretEnv`; `exp` required unless `"requireExp": false`). `tokens` are static bearer tokens by SHA-256: `[{"name": "ci", "sha256": "…"}]`. Missing or wrong credentials get `401` with `WWW-Authenticate`; repeated failures from one address get `429` |
-| `accessLog` | | Reserved for a component still in progress (#0090). It is accepted with a warning and ignored |
+| `accessLog` | | Reserved. The `AccessLog` component exists (#0090), but the config file does not wire it yet. The key is accepted with a warning and ignored; use the `Server` builder or `sws-bench serve --access-log` |
 | `compression` | off | Response compression (#0091): `true`, or `{"encodings": ["br", "gzip", "deflate"], "minimumSize": 1024, "level": 4, "precompressionLevel": 9, "mimeTypes": ["text/*", "application/json", …], "precompress": true, "sidecars": true}`. Negotiates `Accept-Encoding` (q-values; `br` > `gzip` > `deflate` at equal weight) and adds `Vary: Accept-Encoding`. Small static files are compressed once into the file cache (`precompress`), `file.br`/`file.gz` next to a file are served as its variants (`sidecars`), and everything else of a listed type is compressed per response, streamed for large files. Encoded variants get a suffixed `ETag` (`"…-gz"`). Never applied to `206`, `304`, `HEAD`, already-encoded responses or bodies under `minimumSize`. The legacy `enableCompression: true` is the same as `true` |
 | `enableETags` | | Legacy key with no effect: ETags are always sent. Accepted with a warning |
 
@@ -125,11 +145,17 @@ a component that is turned off is never registered.
 ## Architecture
 
 The design, the target layout and the milestone plan are in
-[docs/ROADMAP.md](docs/ROADMAP.md). In brief, `Server` (HTTPServer) runs listeners from
-`NetworkTransport` and connection protocols such as `HTTP1`. Requests pass through a
-middleware chain built with a result builder from components such as `StaticFiles` and
-`ErrorPages` (see [docs/MIDDLEWARE.md](docs/MIDDLEWARE.md)). `ConfigFile` maps
-`http-config.json` onto all of these.
+[docs/ROADMAP.md](docs/ROADMAP.md). In brief:
+
+- `Server` (HTTPServer) runs listeners from `NetworkTransport`: BSD sockets + kqueue for
+  cleartext TCP, and Network.framework for TLS and QUIC.
+- Each connection is handled by a protocol: `HTTP1`, `HTTP2` or `HTTP3`, chosen once per
+  connection by ALPN or by reading the first bytes.
+- Each protocol is a set of value-type state machines driven by one task per connection, with
+  no actors on the request path.
+- Requests pass through a middleware chain built with a result builder from optional components
+  (see [docs/MIDDLEWARE.md](docs/MIDDLEWARE.md)).
+- `ConfigFile` maps `http-config.json` onto all of these.
 
 - Issues and their workflow: [issues/Issues.md](issues/Issues.md)
 - Milestone status: [docs/PROGRESS.md](docs/PROGRESS.md)
