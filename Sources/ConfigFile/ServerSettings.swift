@@ -88,7 +88,84 @@ public struct ServerSettings: Sendable, Equatable {
     /// `true`, `false`, or `{"404": "errors/404.html"}`.
     public var errorPages = ErrorPagesSetting.generated
 
+    /// The TLS listener (#0089). `nil` (the default) serves cleartext only. In the file:
+    /// `"tls": {"identity": "server.p12", "password": "…", "port": 8443}`.
+    public var tls: TLSSettings?
+    /// The HTTP/3 (QUIC) listener (#0089, #0103). `nil` (the default) serves no HTTP/3. Needs
+    /// ``tls``. In the file: `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`.
+    public var http3: HTTP3Settings?
+
+    /// The TLS listener's identity and port.
+    public struct TLSSettings: Sendable, Equatable {
+        /// Where the PKCS#12 password comes from.
+        public enum Password: Sendable, Equatable {
+            /// The password itself (`"password"`).
+            case literal(String)
+            /// The name of an environment variable holding it (`"passwordEnv"`).
+            case environment(String)
+        }
+
+        /// PKCS#12 identity file (certificate and private key), relative to
+        /// ``ServerSettings/baseDirectory``. Loaded in memory only; never added to a keychain.
+        public var identity: String
+        /// The identity's password.
+        public var password: Password
+        /// TCP port of the TLS listener. Default 8443; 0 picks a free one.
+        public var port: UInt16 = 8443
+
+        public init(identity: String, password: Password, port: UInt16 = 8443) {
+            self.identity = identity
+            self.password = password
+            self.port = port
+        }
+    }
+
+    /// The HTTP/3 listener's port and its `Alt-Svc` advertisement.
+    public struct HTTP3Settings: Sendable, Equatable {
+        /// UDP port of the QUIC listener; `nil` (the default) is the TLS listener's port number,
+        /// including the one picked when the TLS port is 0.
+        public var port: UInt16?
+        /// `ma` of the `Alt-Svc` header sent on TLS responses, in seconds. Default 86400.
+        public var altSvcMaxAge: Int = 86_400
+
+        public init(port: UInt16? = nil, altSvcMaxAge: Int = 86_400) {
+            self.port = port
+            self.altSvcMaxAge = altSvcMaxAge
+        }
+    }
+
     public init() {}
+
+    /// The TLS identity path resolved against ``baseDirectory``.
+    public var resolvedIdentityPath: String? {
+        tls.map { Self.resolve($0.identity, against: baseDirectory) }
+    }
+
+    /// The TLS identity's password, reading `environment` for `passwordEnv`. Throws when the
+    /// variable is not set.
+    public func tlsPassword(environment: [String: String]) throws(ConfigFileError) -> String? {
+        guard let tls else { return nil }
+        switch tls.password {
+        case .literal(let password):
+            return password
+        case .environment(let name):
+            guard let password = environment[name] else {
+                throw ConfigFileError(key: "tls.passwordEnv", "\"tls.passwordEnv\": environment variable \(name) is not set")
+            }
+            return password
+        }
+    }
+
+    /// Checks the settings as a whole, after command-line overrides: HTTP/3 needs TLS, and the
+    /// cleartext and TLS listeners (both TCP) need different ports.
+    public func validate() throws(ConfigFileError) {
+        if http3 != nil, tls == nil {
+            throw ConfigFileError(key: "http3", "\"http3\" needs \"tls\": HTTP/3 uses the TLS identity")
+        }
+        if let tls, tls.port != 0, tls.port == port {
+            throw ConfigFileError(key: "tls.port", "\"tls.port\" \(tls.port) is the cleartext port too; both are TCP")
+        }
+    }
 
     /// ``root`` resolved against ``baseDirectory``.
     public var resolvedRoot: String {

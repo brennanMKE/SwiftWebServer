@@ -4,9 +4,10 @@ A static-file web server written in Swift 6 with Swift Concurrency, with no pack
 dependencies. It runs on **macOS 15 or later only**. It uses Darwin and Network.framework
 APIs and is not built or tested on Linux.
 
-The shipped `SwiftWebServer` executable serves cleartext **HTTP/1.1**. The package also holds
-the HTTP/2, HTTP/3 (QUIC), TLS and WebSocket work in progress (see [ROADMAP](docs/ROADMAP.md)).
-None of it is part of the executable yet.
+The shipped `SwiftWebServer` executable serves **HTTP/1.1** over cleartext TCP and, when
+configured, over **TLS**, plus **HTTP/3** over QUIC, all at once from one config. The package
+also holds the HTTP/2 and WebSocket work in progress (see [ROADMAP](docs/ROADMAP.md)), which is
+not part of the executable yet.
 
 ## Features
 
@@ -33,6 +34,11 @@ None of it is part of the executable yet.
   within a grace period, and exit 0. A bad config, a missing root or a port in use exits 1
   with a message on stderr.
 - **Transports**: POSIX sockets with kqueue by default, or Network.framework.
+- **HTTPS and HTTP/3**: a TLS listener (Network.framework, ALPN from the registered
+  protocols) and a QUIC listener serving HTTP/3, by default on the TLS port number over UDP.
+  The identity is a PKCS#12 file loaded in memory only. One connection limit and one graceful
+  drain cover every listener; on SIGTERM HTTP/3 connections get `GOAWAY` and finish their
+  requests.
 
 ## Running
 
@@ -53,9 +59,20 @@ SwiftWebServer [--config FILE] [--root DIR] [--host HOST] [--port PORT]
   `./http-config.json` if that file exists, otherwise it uses the defaults.
 - `--root DIR`, `--host HOST`, `--port PORT`: override the config. `--root` is relative to the
   working directory, and `--port 0` picks a free port.
-- Once bound, the server prints `listening HOST:PORT` on stdout.
+- Once bound, the server prints `listening HOST:PORT` on stdout, then
+  `listening HOST:PORT (https)` and `listening HOST:PORT (h3)` when those are configured.
 - Exit status: 0 after a graceful stop, 1 on a configuration or startup error, 2 on a usage
   error.
+
+For local HTTPS and HTTP/3, create the test identity and use the example config:
+
+```bash
+scripts/make-test-identity.sh            # .test-identity/server.p12 (gitignored), self-signed
+swift run SwiftWebServer --config Root/http-config.tls.json
+curl http://127.0.0.1:8080/
+curl -k https://127.0.0.1:8443/
+/opt/homebrew/opt/curl/bin/curl --http3-only -k https://127.0.0.1:8443/
+```
 
 The default host is `127.0.0.1`, so the server is only reachable from this Mac. Set
 `"host": "0.0.0.0"` (or `::`) to serve the network. macOS may then ask whether to accept
@@ -86,7 +103,9 @@ Relative paths resolve against the directory that holds the config file.
 | `drainTimeout` | `10` | Seconds a graceful stop waits for open connections; `null` waits indefinitely |
 | `transport` | `"bsd"` | `"bsd"` (POSIX sockets + kqueue) or `"nw"` (Network.framework) |
 | `errorPages` | `true` | `true`: generated HTML pages; `false`: none; or files by status, e.g. `{"404": "Custom/404.html"}` (relative to `root`) |
-| `tls`, `accessLog` | | Reserved for components still in progress (#0087, #0090). They are accepted with a warning and ignored |
+| `tls` | off | HTTPS listener: `{"identity": "server.p12", "password": "…", "port": 8443}`. `identity` is a PKCS#12 file (relative to the config file), loaded in memory only. Use `"passwordEnv": "VAR"` instead of `password` to read it from an environment variable. `port` defaults to `8443`; `0` picks a free one |
+| `http3` | off | HTTP/3 over QUIC; needs `tls`. `true`, or `{"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`. `port` (UDP) defaults to the TLS port number, even when that was `0`. `altSvcMaxAge` is the `ma` of the `Alt-Svc` header on HTTPS responses |
+| `accessLog` | | Reserved for a component still in progress (#0090). It is accepted with a warning and ignored |
 | `enableETags`, `enableCompression` | | Legacy keys with no effect: ETags are always sent, and compression is not implemented yet. They are accepted with a warning |
 
 A config containing only `{"port": 0}` starts a server with every other default. The shipped
