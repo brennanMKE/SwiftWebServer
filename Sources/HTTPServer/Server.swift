@@ -25,6 +25,10 @@ import Synchronization
 /// connection closes. A component that throws shuts the server down, and `run()` rethrows the
 /// error after draining.
 ///
+/// ``ConnectionObserver``s (per-connection state: an access log's buffer and counters) are
+/// found the same way; each connection is opened with them before its protocol runs and
+/// closed with them after its transport closed (#0090).
+///
 /// ## Task tree
 ///
 /// `run()` is the root: one child task per component, one per listener, and under each listener
@@ -54,6 +58,9 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
     let components: [any ServerComponent]
     /// The chain reads ``RequestContext/startTime``, so the runners stamp each request.
     let recordsRequestStartTime: Bool
+    /// Elements with per-connection state (an access log): the `components:` that are
+    /// observers, then those found in the chain.
+    let connectionObservers: ConnectionObservers
 
     /// Triggers when draining starts; handed to every connection.
     let shutdownSignal = ShutdownSignal()
@@ -102,6 +109,9 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         self.handler = handler
         self.components = components + MiddlewareChainInspector.serverComponents(in: handler)
         self.recordsRequestStartTime = MiddlewareChainInspector.needsRequestStartTime(handler)
+        self.connectionObservers = ConnectionObservers(
+            components.compactMap { $0 as? any ConnectionObserver }
+                + MiddlewareChainInspector.connectionObservers(in: handler))
     }
 
     /// - Parameters:
@@ -417,10 +427,12 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
     }
 
     private func serveConnection(_ transport: Listener.Transport) async {
-        let context = ConnectionContext(info: transport.info, shutdown: shutdownSignal,
+        var context = ConnectionContext(info: transport.info, shutdown: shutdownSignal,
                                         recordsRequestStartTime: recordsRequestStartTime)
+        if !connectionObservers.isEmpty { connectionObservers.connectionWillStart(&context) }
         await protocols.serve(transport, handler: handler, context: context)
         await transport.close(.normal)
+        if !connectionObservers.isEmpty { connectionObservers.connectionDidEnd(context) }
     }
 
     /// A listener or component failed while running: remember the first error, then shut down.

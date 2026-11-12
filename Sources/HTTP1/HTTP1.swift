@@ -353,7 +353,7 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         self.transport = transport
         self.handler = handler
         self.shutdown = context.shutdown
-        self.requestContext = RequestContext(connection: context.info)
+        self.requestContext = context.requestContext
         self.recordsStartTime = context.recordsRequestStartTime
         self.configuration = configuration
         self.watchdog = watchdog
