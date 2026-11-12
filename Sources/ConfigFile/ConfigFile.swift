@@ -18,9 +18,8 @@ public struct ConfigFileError: Error, Sendable, Equatable, CustomStringConvertib
 /// - Every key is optional; missing keys keep their default (or the `defaults` passed in).
 /// - Unknown keys do not fail: each adds a line to ``warnings``.
 /// - A value of the wrong type or out of range throws ``ConfigFileError`` naming the key.
-/// - Keys reserved for components that are not built yet (`accessLog`) and legacy
-///   keys that no longer do anything (`enableETags`) are accepted with a
-///   warning, so the AccessLog work can claim it without breaking old files.
+/// - Legacy keys that no longer do anything (`enableETags`) are accepted with a warning.
+/// - `accessLog` (#0125) adds the `AccessLog` component (and optionally `MetricsEndpoint`).
 /// - `tls` and `http3` (#0089) add the TLS and HTTP/3 listeners; HTTP/3 needs TLS.
 ///
 /// Foundation is used here: the file is read once at startup, never on the request path.
@@ -31,7 +30,7 @@ public struct ConfigFile: Sendable {
     public var warnings: [String]
     /// The top-level keys present in the file.
     public var keys: Set<String>
-    /// Values of reserved keys (`accessLog`), as JSON objects, for the components that
+    /// Values of reserved keys (none at present), as JSON objects, for the components that
     /// will read them.
     public var reserved: [String: ReservedValue]
 
@@ -42,7 +41,8 @@ public struct ConfigFile: Sendable {
     }
 
     /// Keys whose components are not built yet; accepted and passed through.
-    public static let reservedKeys: Set<String> = ["accessLog"]
+    /// `accessLog` was reserved until #0125 claimed it.
+    public static let reservedKeys: Set<String> = []
     /// Legacy keys that have no effect any more.
     public static let ignoredLegacyKeys: [String: String] = [
         "enableETags": "ETags are always sent (metadata-based, no hashing)",
@@ -186,6 +186,8 @@ struct Parser {
                 settings.auth = try auth(value, key)
             case "proxy":
                 settings.proxy = try proxy(value, key)
+            case "accessLog":
+                settings.accessLog = try accessLog(value, key)
             case "tls":
                 settings.tls = try tls(value, key)
             case "http3":

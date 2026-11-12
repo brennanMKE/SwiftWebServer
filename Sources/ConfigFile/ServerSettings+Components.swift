@@ -11,6 +11,7 @@ import Compression
 import VirtualHosts
 import Auth
 import Proxy
+import AccessLog
 
 // Settings to the server's configuration values and middleware chain (docs/ROADMAP.md §5.2).
 // Components are registered with the middleware builder only when enabled, so a disabled
@@ -59,6 +60,7 @@ extension ServerSettings {
     /// `ErrorPages` and the files; `environment` supplies `secretEnv`/`usersEnv` values.
     public func makeHandler(environment: [String: String] = [:]) throws(ConfigFileError) -> some HTTPHandler {
         let authenticator = try makeAuthenticator(environment: environment)
+        let (accessLog, metricsEndpoint) = try makeAccessLog()
         let root = resolvedRoot
         // `StaticFiles` is both a handler and a middleware; as the last element it must be the
         // handler, so it goes in through `EitherHandler`.
@@ -95,6 +97,9 @@ extension ServerSettings {
         let mounts = proxyMounts
         let reverseProxy = mounts.isEmpty ? nil : ReverseProxy(mounts: mounts, client: UpstreamHTTP1Client())
         return MiddlewareBuilder.build {
+            // #0125: outermost, so it records final statuses (error pages, auth, proxy).
+            if let accessLog { accessLog }
+            if let metricsEndpoint { metricsEndpoint }
             if let compressor { compressor }
             if let pages { pages }
             if let authenticator { authenticator }
