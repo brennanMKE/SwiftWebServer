@@ -276,7 +276,8 @@ struct Parser {
         return ServerSettings.TLSSettings(identity: identity, password: password, port: port)
     }
 
-    /// `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`; `true` alone is
+    /// `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400, "qpackMaxTableCapacity": 0,
+    /// "qpackBlockedStreams": 0}`; `true` alone is
     /// HTTP/3 on the TLS port; `false`, `null` or `"enabled": false` turns it off.
     mutating func http3(_ value: Any, _ key: String) throws(ConfigFileError) -> ServerSettings.HTTP3Settings? {
         if value is NSNull { return nil }
@@ -295,6 +296,11 @@ struct Parser {
                 settings.port = element is NSNull ? nil : UInt16(try integer(element, path, in: 0...65535))
             case "altSvcMaxAge":
                 settings.altSvcMaxAge = try integer(element, path, in: 0...Int(Int32.max))
+            case "qpackMaxTableCapacity":
+                // #0106: the decoder's dynamic table; 0 keeps it off.
+                settings.qpackMaxTableCapacity = try integer(element, path, in: 0...1_048_576)
+            case "qpackBlockedStreams":
+                settings.qpackBlockedStreams = try integer(element, path, in: 0...1_000)
             default:
                 warn("unknown key \"\(path)\" ignored")
             }

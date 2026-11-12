@@ -73,6 +73,41 @@ import Testing
         #expect(try await Self.status(fallback, "c.test", "/only-a.txt") == 404)
     }
 
+    /// #0124: `hosts[].proxy` mounts apply to their site only, and the server-level mounts
+    /// still apply inside every site. Upstreams are a closed loopback port, so a proxied path
+    /// answers 502 and a path that falls through to the files answers 200 or 404.
+    @Test(.timeLimit(.minutes(1))) func perHostProxyMounts() async throws {
+        let directory = try Directory()
+        try directory.write("a\n", to: "sites/a/only-a.txt")
+        try directory.write("b\n", to: "sites/b/only-b.txt")
+        let file = try parse("""
+            {"proxy": [{"path": "/shared", "upstream": "http://127.0.0.1:1", "retries": 0}],
+             "hosts": [{"names": ["a.test"], "root": "sites/a",
+                        "proxy": [{"path": "/api", "upstream": "http://127.0.0.1:1/base", "retries": 0}]},
+                       {"names": ["b.test"], "root": "sites/b"}]}
+            """, base: directory.path)
+        #expect(file.warnings.isEmpty, "\(file.warnings)")
+        let site = try #require(file.settings.hosts.first)
+        #expect(site.proxy.count == 1)
+        #expect(site.proxy.first?.mount.upstreams.first?.basePath == "/base")
+        let handler = try file.settings.makeHandler()
+        #expect(try await Self.status(handler, "a.test", "/api/items") == 502)
+        #expect(try await Self.status(handler, "b.test", "/api/items") == 404)
+        #expect(try await Self.status(handler, "a.test", "/shared/x") == 502)
+        #expect(try await Self.status(handler, "b.test", "/shared/x") == 502)
+        #expect(try await Self.status(handler, "a.test", "/only-a.txt") == 200)
+        #expect(try await Self.status(handler, "b.test", "/only-b.txt") == 200)
+    }
+
+    @Test(arguments: [
+        (#"{"hosts": [{"names": ["a.test"], "root": "x", "proxy": [{"path": "/api"}]}]}"#, "hosts[0].proxy[0]"),
+        (#"{"hosts": [{"names": ["a.test"], "root": "x", "proxy": [{"upstream": "ftp://x"}]}]}"#, "hosts[0].proxy[0].upstream"),
+        (#"{"hosts": [{"names": ["a.test"], "root": "x", "proxy": 3}]}"#, "hosts[0].proxy"),
+    ])
+    func badHostProxyNamesTheKey(json: String, key: String) {
+        #expect(error(json)?.key == key, "\(json): \(String(describing: error(json)))")
+    }
+
     static func status(_ handler: some HTTPHandler, _ host: String, _ path: String) async throws -> Int {
         let storage = HTTPRequestStorage(bufferCapacity: 256, fieldCapacity: 2)
         func add(_ text: String) -> ByteView {

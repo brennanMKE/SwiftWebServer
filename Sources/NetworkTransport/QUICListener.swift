@@ -244,8 +244,11 @@ extension QUICListener {
             if admitted {
                 onUsable = { [self] usable in self.settled(box.id, usable: usable) }
             }
+            // The peer's address, so requests see it from the start (a proxy's
+            // X-Forwarded-For, #0124); streams fill it in later otherwise.
+            let remote = (group.descriptor as? NWMultiplexGroup)?.members.first
             let connection = QUICConnection(
-                group: group, configuration: configuration.quic, remote: nil, onUsable: onUsable)
+                group: group, configuration: configuration.quic, remote: remote, onUsable: onUsable)
             guard admitted else {
                 // Start it so it can be closed: an unstarted group cannot send anything.
                 connection.startGroup()

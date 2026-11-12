@@ -246,6 +246,29 @@ import Testing
         #expect(ServerSettings.HTTP3Settings().altSvcMaxAge == 86_400)
     }
 
+    /// #0106/#0124: the QPACK dynamic table is off unless `http3` sets a capacity.
+    @Test func http3QPACKDynamicTableKeys() throws {
+        let tls = #""tls": {"identity": "a.p12", "password": "p"}"#
+        let defaults = try #require(try parse("{\(tls), \"http3\": true}").settings.http3)
+        #expect(defaults.qpackMaxTableCapacity == 0)
+        #expect(defaults.qpackBlockedStreams == 0)
+        let file = try parse("{\(tls), \"http3\": {\"qpackMaxTableCapacity\": 4096, \"qpackBlockedStreams\": 16}}")
+        #expect(file.warnings.isEmpty, "\(file.warnings)")
+        let http3 = try #require(file.settings.http3)
+        #expect(http3.qpackMaxTableCapacity == 4096)
+        #expect(http3.qpackBlockedStreams == 16)
+        for bad in [#"{"qpackMaxTableCapacity": -1}"#, #"{"qpackMaxTableCapacity": 2000000}"#,
+                    #"{"qpackMaxTableCapacity": "4k"}"#] {
+            #expect(throws: ConfigFileError.self, "\(bad)") { try parse("{\(tls), \"http3\": \(bad)}") }
+        }
+        do {
+            _ = try parse("{\(tls), \"http3\": {\"qpackBlockedStreams\": 5000}}")
+            Issue.record("accepted qpackBlockedStreams 5000")
+        } catch {
+            #expect(error.key == "http3.qpackBlockedStreams", "\(error)")
+        }
+    }
+
     @Test(arguments: [
         (#"{"http3": true}"#, "http3"),
         (#"{"tls": {"identity": "a", "password": "b"}, "http3": 1}"#, "http3"),

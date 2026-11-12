@@ -13,6 +13,35 @@ import Testing
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }.map { URL(fileURLWithPath: $0) }
     }
 
+    /// Builds `Examples/go-api` into `directory` and starts it on 127.0.0.1 port 0. Returns
+    /// nil (after recording an issue) when the build fails. Caches stay under $TMPDIR; no
+    /// network (`GOPROXY=off`, `GOTOOLCHAIN=local`).
+    static func startGoAPI(go: URL, in directory: URL) async throws -> (ChildProcess, UInt16)? {
+        let cache = FileManager.default.temporaryDirectory.appending(path: "sws-go-cache")
+        let binary = directory.appending(path: "go-api")
+        let build = try await ChildProcess.run(
+            URL(fileURLWithPath: "/usr/bin/env"),
+            ["GOCACHE=\(cache.path)/build", "GOPATH=\(cache.path)/path", "GOTOOLCHAIN=local", "GOPROXY=off",
+             go.path, "build", "-C", ParityTests.packageRoot.appending(path: "Examples/go-api").path,
+             "-o", binary.path, "."],
+            timeout: .seconds(120), mergeStandardError: true)
+        #expect(build.status == 0, "go build: \(build.stdout)")
+        guard build.status == 0 else { return nil }
+
+        // Port 0: the app logs its bound address ("go-api listening on 127.0.0.1:NNNN").
+        let api = try ChildProcess(executable: binary, arguments: ["-addr", "127.0.0.1:0"], mergeStandardError: true)
+        do {
+            let port = try await api.waitForLine { line -> UInt16? in
+                guard let range = line.range(of: "listening on 127.0.0.1:") else { return nil }
+                return UInt16(line[range.upperBound...].prefix { $0.isNumber })
+            }
+            return (api, port)
+        } catch {
+            api.kill()
+            throw error
+        }
+    }
+
     func curl(_ arguments: [String]) async throws -> String {
         let output = try await ChildProcess.run(URL(fileURLWithPath: "/usr/bin/curl"),
                                                 ["-sS", "--max-time", "10"] + arguments,
@@ -29,25 +58,8 @@ import Testing
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temp) }
 
-        // Build go-api into the temp directory; caches stay under $TMPDIR, no network.
-        let cache = FileManager.default.temporaryDirectory.appending(path: "sws-go-cache")
-        let binary = temp.appending(path: "go-api")
-        let build = try await ChildProcess.run(
-            URL(fileURLWithPath: "/usr/bin/env"),
-            ["GOCACHE=\(cache.path)/build", "GOPATH=\(cache.path)/path", "GOTOOLCHAIN=local", "GOPROXY=off",
-             go.path, "build", "-C", ParityTests.packageRoot.appending(path: "Examples/go-api").path,
-             "-o", binary.path, "."],
-            timeout: .seconds(120), mergeStandardError: true)
-        #expect(build.status == 0, "go build: \(build.stdout)")
-        guard build.status == 0 else { return }
-
-        // Port 0: the app logs its bound address ("go-api listening on 127.0.0.1:NNNN").
-        let api = try ChildProcess(executable: binary, arguments: ["-addr", "127.0.0.1:0"], mergeStandardError: true)
+        guard let (api, apiPort) = try await Self.startGoAPI(go: go, in: temp) else { return }
         defer { api.kill() }
-        let apiPort = try await api.waitForLine { line -> UInt16? in
-            guard let range = line.range(of: "listening on 127.0.0.1:") else { return nil }
-            return UInt16(line[range.upperBound...].prefix { $0.isNumber })
-        }
 
         let config = temp.appending(path: "http-config.json")
         let root = ParityTests.packageRoot.appending(path: "Root/Public").path
