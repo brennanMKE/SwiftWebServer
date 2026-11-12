@@ -93,8 +93,9 @@ public final class UpstreamHTTP1Client: UpstreamClient {
                 opened.add(1, ordering: .relaxed)
                 return UpstreamConnection(transport: t)
             case .unix(let path):
-                // TODO(#0120): Unix-domain connect in NetworkTransport.
-                throw UpstreamError.connectFailed("unix sockets not supported yet: \(path)")
+                let t = try await BSDSocketTransport.connect(unixPath: path)
+                opened.add(1, ordering: .relaxed)
+                return UpstreamConnection(transport: t)
             }
         } catch let e as UpstreamError {
             throw e
