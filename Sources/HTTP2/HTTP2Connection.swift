@@ -96,8 +96,14 @@ public struct HTTP2Connection: Sendable {
         /// A stream task finished its response. If the peer is still sending the request,
         /// the stream is reset with `NO_ERROR` (§8.1) so its DATA stops.
         case responseFinished(streamID: HTTP2StreamID)
-        /// The server drains: send GOAWAY(NO_ERROR) with the last stream processed.
+        /// The server drains (or the connection was idle): send the first GOAWAY(NO_ERROR) with
+        /// the largest stream identifier (§6.8), so the client stops opening streams while
+        /// streams already in flight are still accepted. The runtime then waits for a PING
+        /// round trip and sends ``finishShutdown``.
         case shutdown
+        /// Send the final GOAWAY(NO_ERROR) with the last stream processed; streams above it
+        /// are refused from now on.
+        case finishShutdown
         /// Send a PING (for a round-trip measurement or the graceful shutdown) whose ACK must
         /// echo `opaqueData`.
         case sendPing(opaqueData: UInt64)
@@ -141,8 +147,10 @@ public struct HTTP2Connection: Sendable {
         case windowChanged
         /// Send GOAWAY for a connection error, then close the connection.
         case goaway(lastStreamID: HTTP2StreamID, HTTP2Error)
-        /// Send GOAWAY(NO_ERROR) and keep serving the streams at or below `lastStreamID`.
-        case gracefulGoaway(lastStreamID: HTTP2StreamID)
+        /// Send GOAWAY(NO_ERROR) and keep serving the streams at or below `lastStreamID`. When
+        /// `final`, close once the last of them ends; otherwise (the first of a graceful
+        /// shutdown's two GOAWAYs) streams are still accepted.
+        case gracefulGoaway(lastStreamID: HTTP2StreamID, final: Bool)
         /// A local HEADERS or RST_STREAM may be sent.
         case send
         /// Send DATA of `length` bytes with END_STREAM when `endStream`.
@@ -181,8 +189,10 @@ public struct HTTP2Connection: Sendable {
 
     /// Set once a connection error was answered with GOAWAY: everything after is ignored.
     public private(set) var failed: HTTP2Error?
-    /// Set once the graceful GOAWAY was sent.
+    /// Set once the final graceful GOAWAY was sent.
     public private(set) var goawaySent: HTTP2StreamID?
+    /// Set once the first graceful GOAWAY was sent (or the final one).
+    public private(set) var shutdownStarted = false
     /// The peer's GOAWAY, if any.
     public private(set) var peerGoaway: (lastStreamID: HTTP2StreamID, code: HTTP2ErrorCode)?
     /// Opaque data of our PINGs awaiting an ACK.
@@ -253,7 +263,9 @@ public struct HTTP2Connection: Sendable {
         case .goaway(let last, let code):
             if let error = requirePeerSettings() { return error }
             peerGoaway = (last, code)
-            return .none
+            // The peer is closing the connection: answer with our final GOAWAY, refuse new
+            // streams, let the ones in flight finish, then close.
+            return finishShutdown()
 
         case .windowUpdate(let id, let increment):
             if let error = requirePeerSettings() { return error }
@@ -280,12 +292,19 @@ public struct HTTP2Connection: Sendable {
 
         case .headers(let id, let endStream, let trailers):
             if let error = requirePeerSettings() { return error }
+            let opensStream = id.isClientInitiated && id > streams.highestClientStreamID
             switch streams.handle(.received(id, .headers(endStream: endStream))) {
             case .proceed:
                 if trailers { return .acceptTrailers(streamID: id) }
                 sendWindows[id.rawValue] = peerInitialWindowSize
                 return .dispatch(streamID: id, endStream: endStream)
-            case .ignore: return .none
+            case .ignore:
+                // A new stream above our final GOAWAY is not processed (§6.8). Refusing it tells
+                // the client it may retry the request on a new connection (§8.7).
+                if opensStream, let last = goawaySent, id > last {
+                    return .resetStream(streamID: id, .refusedStream, windowIncrement: nil)
+                }
+                return .none
             case .streamError(let code): return reset(id, code)
             case .connectionError(let code): return fail(.connection(code, reason: "HEADERS on stream \(id)"))
             }
@@ -344,13 +363,26 @@ public struct HTTP2Connection: Sendable {
             return .resetStream(streamID: id, .noError, windowIncrement: nil)
 
         case .shutdown:
-            guard goawaySent == nil else { return .none }
-            let last = streams.highestClientStreamID
-            goawaySent = last
-            _ = streams.handle(.goawaySent(lastStreamID: last))
-            for id in sendWindows.keys where id > last.rawValue { sendWindows.removeValue(forKey: id) }
-            return .gracefulGoaway(lastStreamID: last)
+            guard goawaySent == nil, !shutdownStarted else { return .none }
+            shutdownStarted = true
+            return .gracefulGoaway(lastStreamID: HTTP2StreamID(HTTP2StreamID.maxValue), final: false)
+
+        case .finishShutdown:
+            return finishShutdown()
         }
+    }
+
+    // MARK: Shutdown
+
+    /// The final GOAWAY: the last stream processed bounds the streams served.
+    private mutating func finishShutdown() -> Action {
+        guard goawaySent == nil else { return .none }
+        shutdownStarted = true
+        let last = streams.highestClientStreamID
+        goawaySent = last
+        _ = streams.handle(.goawaySent(lastStreamID: last))
+        for id in sendWindows.keys where id > last.rawValue { sendWindows.removeValue(forKey: id) }
+        return .gracefulGoaway(lastStreamID: last, final: true)
     }
 
     // MARK: Settings

@@ -402,30 +402,7 @@ struct H2ConnectionTests {
         }
     }
 
-    // MARK: Shutdown
-
-    @Test func shutdownSendsGoawayAndClosesAfterTheLastStream() async throws {
-        let shutdown = ShutdownSignal()
-        let gate = Gate()
-        let handler = ClosureHandler { _ in
-            await gate.wait()
-            return HTTPResponse(body: .bytes(ByteBuffer("done")))
-        }
-        try await withH2Connection(handler: handler, shutdown: shutdown) { client in
-            try await client.handshake()
-            try await client.send(F.headers(1, block: client.requests.get("/")))
-            try await Task.sleep(for: .milliseconds(20))
-            shutdown.trigger()
-            #expect(try await client.frames(until: \.isGoaway).last == .goaway(last: 1, .noError, debug: ""))
-            // A stream above the last one is not served.
-            try await client.send(F.headers(3, block: client.requests.get("/late")))
-            gate.open()
-            let response = try await client.response(on: 1)
-            #expect(String(decoding: response.body, as: UTF8.self) == "done")
-            let rest = try await client.framesUntilClosed()
-            #expect(!rest.contains { if case .headers = $0 { return true }; return false }, "\(rest)")
-        }
-    }
+    // Graceful shutdown: H2GoawayTests (#0052).
 }
 
 /// A one-shot gate handlers can wait on.

@@ -39,6 +39,24 @@ public struct HTTP2Configuration: Sendable, Hashable {
     public var maxContinuationFrames: Int
     /// Largest piece of a `.file` response body read per DATA frame batch.
     public var fileChunkSize: Int
+    /// How long a graceful shutdown waits for the PING round trip between its first
+    /// GOAWAY (largest stream identifier) and the final one (last stream processed), so streams
+    /// the client opened before it saw the first GOAWAY are still served (RFC 9113 §6.8).
+    public var shutdownPingTimeout: Duration
+    /// How long streams in flight may run after the final GOAWAY before they are reset with
+    /// `CANCEL` and the connection closes. `nil` leaves the limit to the server's drain
+    /// deadline, which cancels the connection.
+    public var drainTimeout: Duration?
+    /// A connection with no stream running for this long shuts down gracefully (GOAWAY).
+    /// `nil` keeps idle connections open.
+    public var idleTimeout: Duration?
+    /// Lingering close: after its last frame (a GOAWAY), the server shuts down its sending side
+    /// and keeps reading, discarding input, until the client closes or this much time passed,
+    /// so the client reads the GOAWAY instead of a reset caused by unread data. `nil` closes at
+    /// once.
+    public var lingerTimeout: Duration?
+    /// The most bytes a lingering close discards after a connection error.
+    public var maxLingerSize: Int
 
     public static let defaultMaxConcurrentStreams = 100
     public static let defaultInitialWindowSize: UInt32 = 65_535
@@ -60,7 +78,12 @@ public struct HTTP2Configuration: Sendable, Hashable {
         outboundQueueSize: Int = 64 * 1024,
         maxQueuedControlFrames: Int = 1_000,
         maxContinuationFrames: Int = 32,
-        fileChunkSize: Int = 16 * 1024
+        fileChunkSize: Int = 16 * 1024,
+        shutdownPingTimeout: Duration = .seconds(1),
+        drainTimeout: Duration? = nil,
+        idleTimeout: Duration? = nil,
+        lingerTimeout: Duration? = .seconds(2),
+        maxLingerSize: Int = 1024 * 1024
     ) {
         precondition((0...HTTP2StreamTable.Configuration.maxSupportedConcurrentStreams).contains(maxConcurrentStreams),
                      "maxConcurrentStreams out of range")
@@ -74,6 +97,10 @@ public struct HTTP2Configuration: Sendable, Hashable {
         precondition(receiveSize > 0 && outboundQueueSize > 0 && maxQueuedControlFrames > 0 && fileChunkSize > 0,
                      "HTTP2Configuration sizes must be positive")
         if let settingsTimeout { precondition(settingsTimeout > .zero, "settingsTimeout must be positive") }
+        precondition(shutdownPingTimeout >= .zero && maxLingerSize >= 0, "shutdown limits must not be negative")
+        for timeout in [drainTimeout, idleTimeout, lingerTimeout] {
+            if let timeout { precondition(timeout > .zero, "HTTP2Configuration timeouts must be positive") }
+        }
         self.cleartext = cleartext
         self.maxConcurrentStreams = maxConcurrentStreams
         self.initialWindowSize = initialWindowSize
@@ -88,6 +115,11 @@ public struct HTTP2Configuration: Sendable, Hashable {
         self.maxQueuedControlFrames = maxQueuedControlFrames
         self.maxContinuationFrames = maxContinuationFrames
         self.fileChunkSize = fileChunkSize
+        self.shutdownPingTimeout = shutdownPingTimeout
+        self.drainTimeout = drainTimeout
+        self.idleTimeout = idleTimeout
+        self.lingerTimeout = lingerTimeout
+        self.maxLingerSize = maxLingerSize
     }
 
     /// The SETTINGS frame the server sends first. `SETTINGS_ENABLE_PUSH` is omitted: a server

@@ -113,8 +113,12 @@ struct HTTP2SharedState: Sendable {
     var nextWaiterID: UInt64 = 0
     /// Streams whose handler task is running.
     var activeStreams = 0
-    /// The graceful GOAWAY was sent: close once the last stream finishes.
+    /// The final graceful GOAWAY was sent: close once the last stream finishes.
     var draining = false
+    /// Since when no stream task has run, when ``HTTP2Configuration/idleTimeout`` is set
+    /// (``tracksIdleTime``); `nil` while one runs.
+    var idleSince: ContinuousClock.Instant?
+    let tracksIdleTime: Bool
     /// Request bodies of streams whose handler runs and whose peer may still send DATA
     /// (#0048). The reader adds and completes them; a reset or the end of the handler removes
     /// them.
@@ -131,6 +135,8 @@ struct HTTP2SharedState: Sendable {
         encoder = HTTP2ResponseHeadEncoder(tableCapacity: configuration.responseHeaderTableSize)
         outbound = HTTP2OutboundQueue(
             capacity: configuration.outboundQueueSize, maxControlFrames: configuration.maxQueuedControlFrames)
+        tracksIdleTime = configuration.idleTimeout != nil
+        if tracksIdleTime { idleSince = .now }
     }
 
     /// Whether frames can still be enqueued.
@@ -164,6 +170,7 @@ struct HTTP2SharedState: Sendable {
             // Counted in the same critical section as the decision, so a graceful shutdown
             // never closes under a stream it already promised to serve (GOAWAY last-stream-ID).
             activeStreams += 1
+            idleSince = nil
 
         case .sendPreface(let settings, let increment):
             HTTP2FrameEncoder.encodeSettings(settings, into: &outbound.ordered)
@@ -225,13 +232,15 @@ struct HTTP2SharedState: Sendable {
             HTTP2FrameEncoder.encodeGoaway(lastStreamID: last, error: error, into: &outbound.ordered)
             close(error.code == .settingsTimeout ? .timeout : .protocolError, wakeups: &wakeups)
 
-        case .gracefulGoaway(let last):
+        case .gracefulGoaway(let last, let final):
             HTTP2FrameEncoder.encodeGoaway(
                 lastStreamID: last, .noError, debugData: UnsafeRawBufferPointer(start: nil, count: 0),
                 into: &outbound.ordered)
-            draining = true
             wakeWriter(&wakeups)
-            if activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
+            if final {
+                draining = true
+                if activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
+            }
         }
         return action
     }
@@ -354,12 +363,16 @@ struct HTTP2SharedState: Sendable {
     /// graceful drain after the last stream.
     mutating func streamEnded(_ streamID: HTTP2StreamID, wakeups: inout HTTP2Wakeups) {
         activeStreams -= 1
+        if activeStreams == 0 && tracksIdleTime { idleSince = .now }
         // DATA that still arrives has no reader: the reader credits it at once.
         bodies.removeValue(forKey: streamID.rawValue)
         tasks.removeValue(forKey: streamID.rawValue)
         if isOpen { _ = handle(.responseFinished(streamID: streamID), wakeups: &wakeups) }
         if draining && activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
     }
+
+    /// The stream tasks to cancel when the drain deadline passes.
+    var runningTasks: [HTTP2StreamTask] { Array(tasks.values) }
 
     // MARK: Waiters
 

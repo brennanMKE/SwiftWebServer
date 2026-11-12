@@ -95,11 +95,27 @@ import Darwin
 /// idle stream is a connection `PROTOCOL_ERROR`. ``HTTP2ConnectionDriver/liveStreamTasks``
 /// counts the stream tasks running, for leak tests.
 ///
+/// ## GOAWAY and closing (#0052)
+///
+/// - A connection error is answered with one `GOAWAY(last stream processed, code, debug
+///   data)`; the streams stop, and the connection closes lingering.
+/// - Graceful shutdown, when the server drains (`context.shutdown`) or the connection was idle
+///   for ``HTTP2Configuration/idleTimeout``: `GOAWAY(2³¹−1, NO_ERROR)`, a PING round trip (at
+///   most ``HTTP2Configuration/shutdownPingTimeout``), then the final `GOAWAY(last stream
+///   processed, NO_ERROR)`. Streams at or below it finish (or are reset with `CANCEL` after
+///   ``HTTP2Configuration/drainTimeout``); new streams above it get
+///   `RST_STREAM(REFUSED_STREAM)`. The connection closes after the last stream.
+/// - A GOAWAY from the peer is answered with the final GOAWAY, and the connection drains the
+///   same way.
+/// - Lingering close: after the last frame the writer shuts down its sending side and waits
+///   (at most ``HTTP2Configuration/lingerTimeout``) for the peer to close, while the reader
+///   keeps reading (discarding input after a connection error, up to
+///   ``HTTP2Configuration/maxLingerSize``), so the peer reads the GOAWAY rather than a reset.
+///
 /// ## Not yet
 ///
-/// The PING round-trip on shutdown and idle
-/// timeouts (#0052), the full inbound window policy (#0053), fair window waiting (#0054),
-/// extended CONNECT (#0067: `.tunnel` answers `501`).
+/// The full inbound window policy (#0053), fair window waiting (#0054), extended CONNECT
+/// (#0067: `.tunnel` answers `501`).
 public struct HTTP2: ConnectionProtocol {
     public var configuration: HTTP2Configuration
 
@@ -134,6 +150,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     let state: Mutex<HTTP2SharedState>
     /// Stream tasks running (``liveStreamTasks``).
     let liveStreams = Atomic<Int>(0)
+    /// Triggers when the reader stopped: the peer closed, the transport failed, or a lingering
+    /// close finished discarding. The writer's lingering close waits for it.
+    let readerDone = ShutdownSignal()
 
     init(transport: Transport, handler: Handler, context: ConnectionContext, configuration: HTTP2Configuration) {
         self.transport = transport
@@ -154,17 +173,17 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                 let shutdown = context.shutdown
                 streams.addTask {
                     await shutdown.wait()
-                    if shutdown.isTriggered { self.handle(.shutdown) }
+                    if shutdown.isTriggered { await self.shutDownGracefully() }
+                }
+                if let idle = configuration.idleTimeout {
+                    streams.addTask {
+                        if await self.waitForIdle(idle) { await self.shutDownGracefully() }
+                    }
                 }
                 await runReader(streams: &streams)
-                // End of input, a connection error, or the writer closed the transport: end the
-                // request bodies and stop the handlers and timers.
-                let bodies = state.withLock { shared in
-                    defer { shared.bodies.removeAll() }
-                    return Array(shared.bodies.values)
-                }
-                for body in bodies { body.fail(TransportError.closed) }
-                streams.cancelAll()
+                readerDone.trigger()
+                // End of input, a connection error, or the writer closed the transport.
+                stopStreams(&streams)
             }
             // Nothing will be enqueued any more: the writer flushes and closes the transport.
             closeOutbound(.normal)
@@ -248,6 +267,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                     return
                 }
             case .close(let reason):
+                if !reason.isAbortive { await linger() }
                 await transport.close(reason)
                 return
             case .wait:
@@ -281,6 +301,70 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             writer?.resume()
         }
         return .wait
+    }
+
+    /// Lingering close (the writer's half): everything is flushed, so shut down the sending
+    /// side (the peer reads end of stream after the GOAWAY) and wait for the reader to see the
+    /// peer close, for at most ``HTTP2Configuration/lingerTimeout``. Closing at once could make
+    /// TCP reset the connection over unread input and destroy the GOAWAY in flight.
+    func linger() async {
+        guard let limit = configuration.lingerTimeout, !readerDone.isTriggered else { return }
+        do {
+            try await transport.send(ByteBuffer(), endOfStream: true)
+        } catch {
+            return
+        }
+        let readerDone = self.readerDone
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await readerDone.wait() }
+            group.addTask { try? await Task.sleep(for: limit) }
+            await group.next()
+            group.cancelAll()
+        }
+    }
+
+    // MARK: Shutdown
+
+    /// Graceful shutdown (RFC 9113 §6.8), for a draining server or an idle connection:
+    /// GOAWAY with the largest stream identifier, a PING round trip (so streams the client
+    /// opened before it saw that GOAWAY arrive first), then the final GOAWAY with the last
+    /// stream processed. Streams at or below it finish; later ones are refused. After
+    /// ``HTTP2Configuration/drainTimeout`` the streams still running are cancelled. The
+    /// connection closes when the last stream ends.
+    func shutDownGracefully() async {
+        guard case .gracefulGoaway = handle(.shutdown) else { return }
+        _ = await ping(timeout: configuration.shutdownPingTimeout)
+        guard !Task.isCancelled else { return }
+        handle(.finishShutdown)
+        guard let limit = configuration.drainTimeout else { return }
+        do {
+            try await Task.sleep(for: limit)
+        } catch {
+            return
+        }
+        // Each cancelled stream resets itself with CANCEL; the last one to end closes the
+        // connection.
+        for task in state.withLock({ $0.runningTasks }) { task.cancel() }
+    }
+
+    /// Returns `true` once no stream has run for `limit`; `false` when cancelled.
+    func waitForIdle(_ limit: Duration) async -> Bool {
+        while true {
+            let now = ContinuousClock.now
+            let sleep: Duration
+            if let since = state.withLock({ $0.idleSince }) {
+                let deadline = since.advanced(by: limit)
+                if deadline <= now { return true }
+                sleep = now.duration(to: deadline)
+            } else {
+                sleep = limit  // A stream is running: look again later.
+            }
+            do {
+                try await Task.sleep(for: sleep)
+            } catch {
+                return false
+            }
+        }
     }
 
     // MARK: PING
@@ -376,7 +460,10 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// connection error.
     func runReader(streams: inout DiscardingTaskGroup) async {
         var buffer = ByteBuffer(capacity: configuration.receiveSize)
-        guard await readPreface(into: &buffer) else { return }
+        guard await readPreface(into: &buffer) else {
+            if state.withLock({ $0.machine.isFailed }) { await discardInput(streams: &streams, buffer: &buffer) }
+            return
+        }
 
         var parser = HTTP2FrameParser(configuration: .init(role: .server))
         var assembler = HeaderBlockAssembler(configuration: .init(
@@ -408,6 +495,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                 case .proceed:
                     break
                 case .stop:
+                    await discardInput(streams: &streams, buffer: &buffer)
                     return
                 case .serve(let id, let request, let storage, let body, let task):
                     streams.addTask { await self.runStream(id, request: request, storage: storage, body: body, task: task) }
@@ -420,6 +508,33 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                 return
             }
         }
+    }
+
+    /// Ends every request body and cancels the handlers and timers.
+    func stopStreams(_ streams: inout DiscardingTaskGroup) {
+        let bodies = state.withLock { shared in
+            defer { shared.bodies.removeAll() }
+            return Array(shared.bodies.values)
+        }
+        for body in bodies { body.fail(TransportError.closed) }
+        streams.cancelAll()
+    }
+
+    /// Lingering close (the reader's half), after a connection error was answered with
+    /// GOAWAY: the streams stop, and input is read and discarded until the peer closes, the
+    /// writer closes the transport (``HTTP2Configuration/lingerTimeout``), or
+    /// ``HTTP2Configuration/maxLingerSize`` bytes were discarded.
+    func discardInput(streams: inout DiscardingTaskGroup, buffer: inout ByteBuffer) async {
+        stopStreams(&streams)
+        guard configuration.lingerTimeout != nil else { return }
+        var discarded = 0
+        while discarded <= configuration.maxLingerSize {
+            buffer.clear()
+            guard let count = try? await transport.receive(into: &buffer, maxLength: configuration.receiveSize),
+                  count > 0 else { break }
+            discarded += count
+        }
+        buffer.clear()
     }
 
     /// Reads and checks the 24-octet client preface. On a mismatch the connection ends with

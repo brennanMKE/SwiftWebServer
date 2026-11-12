@@ -236,4 +236,32 @@ struct H2CurlTests {
             #expect(status2 == 0 && output2 == "quick", "\(output2)")
         }
     }
+    // MARK: Graceful shutdown (#0052)
+
+    /// 20 chunks of 1,000 bytes, 25 ms apart.
+    struct SlowHandler: HTTPHandler {
+        func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse {
+            HTTPResponse(body: .stream(length: 20_000) { writer in
+                for _ in 0..<20 {
+                    try await writer.write(ByteBuffer(bytes: Array(repeating: 0x63, count: 1_000)))
+                    try await Task.sleep(for: .milliseconds(25))
+                }
+            })
+        }
+    }
+
+    /// The server drains while curl downloads: the download completes (GOAWAY lets it
+    /// finish), and the server's `run()` returns.
+    @Test func curlDownloadSurvivesServerShutdown() async throws {
+        try await Self.withServer(tls: false, handler: SlowHandler()) { port, server in
+            async let result = Self.curl([
+                "-sS", "--http2-prior-knowledge", "--max-time", "10", "-o", "/dev/null",
+                "-w", "%{http_code} %{http_version} %{size_download}", "http://127.0.0.1:\(port)/slow"])
+            try await Task.sleep(for: .milliseconds(150))
+            server.requestShutdown()
+            let (status, output) = try await result
+            #expect(status == 0, "\(output)")
+            #expect(output == "200 2 20000", "\(output)")
+        }
+    }
 }
