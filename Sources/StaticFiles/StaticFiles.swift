@@ -3,6 +3,7 @@ import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #endif
+import Compression
 public import HTTPCore
 
 /// Serves files under a root directory (#0084, docs/ROADMAP.md §5.2).
@@ -51,6 +52,7 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
         let customMIMETypes: [(ext: [UInt8], type: [UInt8])]
         let cacheControl: [UInt8]?
         let smallFileLimit: Int
+        let precompression: Precompression?
 
         init(resolver: PathResolver, configuration: StaticFilesConfiguration) {
             self.resolver = resolver
@@ -62,6 +64,9 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
             customMIMETypes = configuration.mimeTypes.map { (Array($0.key.utf8).map(ASCII.lowercased), Array($0.value.utf8)) }
             cacheControl = configuration.effectiveCacheControl.map { Array($0.utf8) }
             smallFileLimit = configuration.smallFileLimit
+            precompression = configuration.compression.map {
+                Precompression($0, sidecars: configuration.precompressedSidecars)
+            }
         }
     }
 
@@ -109,6 +114,21 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
         case .file(let file): entry = file
         case .response(let response): return response
         case .notFound: return nil
+        }
+        // Precompressed variants (#0091): negotiated per request, rendered once. A Range
+        // request is answered from the unencoded representation.
+        if !entry.variants.isEmpty, !(isGet && request.headers.contains(.range)),
+           let coding = AcceptEncoding.negotiate(request.headers, available: entry.variantCodings),
+           let variant = entry.variant(coding) {
+            if ConditionalRequest.hasPreconditions(request.headers) {
+                switch ConditionalRequest.evaluate(method: request.method, fields: request.headers,
+                                                   etag: variant.etag, lastModified: entry.lastModifiedSeconds) {
+                case .proceed: break
+                case .notModified: return variant.notModified
+                case .preconditionFailed: return Self.preconditionFailed
+                }
+            }
+            return variant.response
         }
         if ConditionalRequest.hasPreconditions(request.headers) {
             switch ConditionalRequest.evaluate(method: request.method, fields: request.headers,
@@ -178,7 +198,8 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
             do {
                 let file = try contentType.withUnsafeBufferPointer { type throws(CachedFile.OpenError) in
                     try CachedFile(key: key, path: path, contentType: type.span,
-                                   cacheControl: core.cacheControl, smallFileLimit: core.smallFileLimit)
+                                   cacheControl: core.cacheControl, smallFileLimit: core.smallFileLimit,
+                                   precompression: core.precompression)
                 }
                 return .file(file)
             } catch .forbidden {

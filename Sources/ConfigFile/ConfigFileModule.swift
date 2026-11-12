@@ -1,6 +1,7 @@
 import HTTP1
 import HTTPCore
 import HTTPServer
+import Compression
 import StaticFiles
 
 /// JSON configuration file to components (Foundation; CLI only, #0086).
@@ -13,6 +14,6 @@ public enum ConfigFileModule {
 
     /// Direct dependencies; referencing them checks the target graph at compile time.
     public static let dependencies: [String] = [
-        HTTPCoreModule.name, HTTP1Module.name, HTTPServerModule.name, StaticFilesModule.name,
+        HTTPCoreModule.name, HTTP1Module.name, HTTPServerModule.name, StaticFilesModule.name, CompressionModule.name,
     ]
 }

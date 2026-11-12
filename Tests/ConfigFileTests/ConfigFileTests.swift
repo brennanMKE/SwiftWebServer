@@ -1,4 +1,5 @@
 import Foundation
+import Compression
 import HTTPCore
 import StaticFiles
 import Testing
@@ -111,7 +112,7 @@ import Testing
              "blockList": ["http-config.json", ".git", ".DS_Store"]}
             """
         let file = try parse(legacy)
-        #expect(file.warnings.count == 2)
+        #expect(file.warnings.count == 1)   // enableETags; enableCompression: false is honoured (#0091)
         #expect(file.settings.mimeTypes == ["html": "text/html", "htm": "text/html"])
     }
 
@@ -388,6 +389,55 @@ import Testing
         #expect(try components(#"{"errorPages": false}"#) == (0, 1))
         #expect(try components("{}") == (1, 1))
         #expect(try components(#"{"errorPages": {"404": "404.html"}}"#) == (1, 1))
+    }
+
+    // MARK: Compression (#0091)
+
+    @Test func compressionKeyAndLegacyAlias() throws {
+        #expect(try parse("{}").settings.compression == nil)
+        #expect(try parse(#"{"compression": true}"#).settings.compression == ServerSettings.CompressionSettings())
+        #expect(try parse(#"{"compression": false}"#).settings.compression == nil)
+        #expect(try parse(#"{"compression": {"enabled": false}}"#).settings.compression == nil)
+        let legacy = try parse(#"{"enableCompression": true}"#)
+        #expect(legacy.settings.compression == ServerSettings.CompressionSettings())
+        #expect(legacy.warnings.isEmpty)
+        #expect(try parse(#"{"enableCompression": false}"#).settings.compression == nil)
+        let both = try parse(#"{"enableCompression": true, "compression": false}"#)
+        #expect(both.settings.compression == nil)
+        #expect(both.warnings.count == 1)
+
+        let full = try #require(try parse("""
+            {"compression": {"encodings": ["gzip", "br"], "minimumSize": 10, "level": 6, "precompressionLevel": 8,
+             "mimeTypes": ["text/*"], "precompress": false, "sidecars": true}}
+            """).settings.compression)
+        #expect(full.configuration.encodings == [.gzip, .brotli])
+        #expect(full.configuration.minimumSize == 10)
+        #expect(full.configuration.level == 6)
+        #expect(full.configuration.precompressionLevel == 8)
+        #expect(full.configuration.mimeTypes == ["text/*"])
+        #expect(!full.precompress)
+        #expect(full.sidecars)
+
+        #expect(error(#"{"compression": {"encodings": ["zstd"]}}"#)?.key == "compression.encodings")
+        #expect(error(#"{"compression": {"level": 0}}"#)?.key == "compression.level")
+        #expect(error(#"{"compression": 3}"#)?.key == "compression")
+    }
+
+    @Test func compressionIsRegisteredOnlyWhenEnabled() throws {
+        let directory = try Directory()
+        func count(_ json: String) throws -> (compression: Int, precompression: Bool) {
+            var defaults = ServerSettings()
+            defaults.root = directory.path
+            let settings = try ConfigFile.parse(Data(json.utf8), defaults: defaults).settings
+            var count = 0
+            MiddlewareChainInspector.visit(try settings.makeHandler()) { element in
+                if element is Compression { count += 1 }
+            }
+            return (count, settings.staticFilesConfiguration.compression != nil)
+        }
+        #expect(try count("{}") == (0, false))
+        #expect(try count(#"{"compression": true}"#) == (1, true))
+        #expect(try count(#"{"compression": {"precompress": false, "sidecars": false}}"#) == (1, false))
     }
 
     @Test func unusableRootOrPageNamesTheKey() throws {

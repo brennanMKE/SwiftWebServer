@@ -1,3 +1,4 @@
+import Compression
 import HTTPCore
 
 /// Optional static file serving with conditional requests and Range.
@@ -8,5 +9,5 @@ public enum StaticFilesModule {
     public static let name = "StaticFiles"
 
     /// Direct dependencies; referencing them checks the target graph at compile time.
-    public static let dependencies: [String] = [HTTPCoreModule.name]
+    public static let dependencies: [String] = [HTTPCoreModule.name, CompressionModule.name]
 }
