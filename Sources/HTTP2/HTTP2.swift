@@ -74,6 +74,15 @@ import Darwin
 /// before HEADERS is a `500`; a body that fails after them is `RST_STREAM(INTERNAL_ERROR)`.
 /// `HTTPResponse` has no trailers, so none are sent.
 ///
+/// ## PING and PRIORITY (#0050)
+///
+/// A PING is answered with a PING ACK carrying the same eight octets, in the priority lane
+/// ahead of queued DATA; an ACK for a PING the server did not send is ignored. The server's own
+/// PINGs (``HTTP2ConnectionDriver/ping(timeout:)``, for round-trip time and the graceful
+/// shutdown) are matched to their ACK by opaque data. PRIORITY frames and the PRIORITY flag on
+/// HEADERS are parsed, length-checked and otherwise ignored (SETTINGS_NO_RFC7540_PRIORITIES is
+/// 1); a stream that depends on itself is a stream `PROTOCOL_ERROR`.
+///
 /// ## Not yet
 ///
 /// Per-stream cancellation on RST_STREAM (#0051), the PING round-trip on shutdown and idle
@@ -258,6 +267,55 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             writer?.resume()
         }
         return .wait
+    }
+
+    // MARK: PING
+
+    /// Sends a PING and waits up to `timeout` for its ACK (RFC 9113 §6.7). Returns the round
+    /// trip, or `nil` when no ACK came in time, the connection closed, or the task was
+    /// cancelled.
+    func ping(timeout: Duration) async -> Duration? {
+        let data = state.withLock { shared -> UInt64 in
+            shared.lastPingData &+= 1
+            return shared.lastPingData
+        }
+        let start = ContinuousClock.now
+        let acknowledged = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await self.awaitPingAck(data) }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        guard acknowledged else {
+            handle(.pingAbandoned(opaqueData: data))
+            return nil
+        }
+        return ContinuousClock.now - start
+    }
+
+    /// Sends the PING with `data` and suspends until its ACK (`true`), or until the connection
+    /// closes or the task is cancelled (`false`).
+    func awaitPingAck(_ data: UInt64) async -> Bool {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                var wakeups = HTTP2Wakeups()
+                let sent = state.withLock { shared -> Bool in
+                    guard shared.isOpen, !Task.isCancelled,
+                          case .sendPing = shared.handle(.sendPing(opaqueData: data), wakeups: &wakeups)
+                    else { return false }
+                    shared.pingWaiters[data] = continuation
+                    return true
+                }
+                wakeups.resume()
+                if !sent { continuation.resume(returning: false) }
+            }
+        } onCancel: {
+            state.withLock { $0.pingWaiters.removeValue(forKey: data) }?.resume(returning: false)
+        }
     }
 
     // MARK: Timers
@@ -577,7 +635,10 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         let storage = HTTPRequestStorage(bufferCapacity: Swift.max(block.size * 2, 256), fieldCapacity: 16)
         var sink = HTTP2RequestFieldSink(storage: storage)
         try assembler.decode(block, fragment: fragment, with: &decoder, into: &sink)
-        guard case .success(let head) = sink.head(endStream: block.endStream) else {
+        // A stream that depends on itself (the deprecated PRIORITY flag, RFC 9113 §5.3.1) is a
+        // stream PROTOCOL_ERROR; otherwise the priority fields are ignored.
+        let selfDependent = block.priority?.dependency == id
+        guard !selfDependent, case .success(let head) = sink.head(endStream: block.endStream) else {
             // Malformed (RFC 9113 §8.1.1): a stream error. The stream was counted as served
             // when it was dispatched.
             handle(.sendReset(streamID: id, .protocolError))

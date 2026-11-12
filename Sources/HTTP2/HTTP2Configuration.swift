@@ -91,14 +91,16 @@ public struct HTTP2Configuration: Sendable, Hashable {
     }
 
     /// The SETTINGS frame the server sends first. `SETTINGS_ENABLE_PUSH` is omitted: a server
-    /// never sends it (and never pushes).
+    /// never sends it (and never pushes). `SETTINGS_NO_RFC7540_PRIORITIES` is 1 (RFC 9218 §2.1):
+    /// the RFC 7540 priority signals are parsed, validated and ignored (#0050).
     public var localSettings: HTTP2Settings {
         HTTP2Settings(
             headerTableSize: UInt32(headerTableSize),
             maxConcurrentStreams: UInt32(maxConcurrentStreams),
             initialWindowSize: initialWindowSize,
             maxFrameSize: UInt32(maxFrameSize),
-            maxHeaderListSize: UInt32(maxHeaderListSize))
+            maxHeaderListSize: UInt32(maxHeaderListSize),
+            noRFC7540Priorities: true)
     }
 
     /// The connection state machine's configuration.

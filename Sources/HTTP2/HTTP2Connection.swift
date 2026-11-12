@@ -98,6 +98,11 @@ public struct HTTP2Connection: Sendable {
         case responseFinished(streamID: HTTP2StreamID)
         /// The server drains: send GOAWAY(NO_ERROR) with the last stream processed.
         case shutdown
+        /// Send a PING (for a round-trip measurement or the graceful shutdown) whose ACK must
+        /// echo `opaqueData`.
+        case sendPing(opaqueData: UInt64)
+        /// The PING with `opaqueData` will not be awaited any more (timed out or cancelled).
+        case pingAbandoned(opaqueData: UInt64)
     }
 
     /// What the runtime does. Exactly one per event.
@@ -113,6 +118,10 @@ public struct HTTP2Connection: Sendable {
         /// header table limits to the frame parser and HPACK decoder.
         case applyLocalSettings(HTTP2Settings)
         case sendPingAck(opaqueData: UInt64)
+        /// Send a PING (not an ACK) with `opaqueData`.
+        case sendPing(opaqueData: UInt64)
+        /// The peer acknowledged our PING with `opaqueData`.
+        case pingAcknowledged(opaqueData: UInt64)
         /// Send a connection WINDOW_UPDATE of `connectionIncrement` and a WINDOW_UPDATE of
         /// `streamIncrement` on `streamID`, each when set.
         case sendWindowUpdate(connectionIncrement: UInt32?, streamID: HTTP2StreamID, streamIncrement: UInt32?)
@@ -176,6 +185,10 @@ public struct HTTP2Connection: Sendable {
     public private(set) var goawaySent: HTTP2StreamID?
     /// The peer's GOAWAY, if any.
     public private(set) var peerGoaway: (lastStreamID: HTTP2StreamID, code: HTTP2ErrorCode)?
+    /// Opaque data of our PINGs awaiting an ACK.
+    public private(set) var outstandingPings: [UInt64] = []
+    /// The most PINGs this endpoint has in flight at once.
+    public static let maxOutstandingPings = 4
 
     public init(configuration: Configuration = Configuration()) {
         self.configuration = configuration
@@ -222,7 +235,20 @@ public struct HTTP2Connection: Sendable {
 
         case .ping(let ack, let data):
             if let error = requirePeerSettings() { return error }
-            return ack ? .none : .sendPingAck(opaqueData: data)
+            guard ack else { return .sendPingAck(opaqueData: data) }
+            // An ACK for a PING we did not send (or no longer wait for) is ignored (§6.7).
+            guard let index = outstandingPings.firstIndex(of: data) else { return .none }
+            outstandingPings.remove(at: index)
+            return .pingAcknowledged(opaqueData: data)
+
+        case .sendPing(let data):
+            guard outstandingPings.count < Self.maxOutstandingPings, !outstandingPings.contains(data) else { return .none }
+            outstandingPings.append(data)
+            return .sendPing(opaqueData: data)
+
+        case .pingAbandoned(let data):
+            outstandingPings.removeAll { $0 == data }
+            return .none
 
         case .goaway(let last, let code):
             if let error = requirePeerSettings() { return error }

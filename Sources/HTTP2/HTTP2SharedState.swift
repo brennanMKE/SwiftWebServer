@@ -74,12 +74,15 @@ struct HTTP2Wakeups: Sendable {
     var waiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
     /// Bodies of streams that were reset.
     var resetBodies: [HTTP2BodyChannel] = []
+    /// PING waiters and whether their ACK arrived.
+    var pings: [(CheckedContinuation<Bool, Never>, Bool)] = []
 
     init() {}
 
     func resume() {
         writer?.resume()
         for waiter in waiters.values { waiter.resume() }
+        for (waiter, acknowledged) in pings { waiter.resume(returning: acknowledged) }
         for body in resetBodies { body.fail(TransportError.connectionReset) }
     }
 }
@@ -112,6 +115,10 @@ struct HTTP2SharedState: Sendable {
     /// (#0048). The reader adds and completes them; a reset or the end of the handler removes
     /// them.
     var bodies: [UInt32: HTTP2BodyChannel] = [:]
+    /// Tasks waiting for the ACK of our PING, by opaque data (#0050).
+    var pingWaiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
+    /// The opaque data of the last PING sent.
+    var lastPingData: UInt64 = 0x5357_5300_0000_0000
 
     init(configuration: HTTP2Configuration) {
         machine = HTTP2Connection(configuration: configuration.connection)
@@ -171,6 +178,14 @@ struct HTTP2SharedState: Sendable {
             HTTP2FrameEncoder.encodePing(opaqueData: data, ack: true, into: &outbound.priority)
             if let flood = countControlFrame(wakeups: &wakeups) { return flood }
             wakeWriter(&wakeups)
+
+        case .sendPing(let data):
+            // Our own PING: ahead of DATA, so the round trip does not include queued responses.
+            HTTP2FrameEncoder.encodePing(opaqueData: data, ack: false, into: &outbound.priority)
+            wakeWriter(&wakeups)
+
+        case .pingAcknowledged(let data):
+            if let waiter = pingWaiters.removeValue(forKey: data) { wakeups.pings.append((waiter, true)) }
 
         case .sendWindowUpdate(let connectionIncrement, let id, let streamIncrement):
             // Neither has an ordering constraint with other frames: the priority lane.
@@ -307,6 +322,13 @@ struct HTTP2SharedState: Sendable {
         if outbound.closeReason == nil { outbound.closeReason = reason }
         wakeWriter(&wakeups)
         wakeWaiters(&wakeups)
+        failPings(&wakeups)
+    }
+
+    /// No ACK can arrive any more: every PING waiter gets `false`.
+    mutating func failPings(_ wakeups: inout HTTP2Wakeups) {
+        for waiter in pingWaiters.values { wakeups.pings.append((waiter, false)) }
+        pingWaiters.removeAll()
     }
 
     /// The writer's send failed: drop everything queued and stop every writer.
@@ -315,6 +337,7 @@ struct HTTP2SharedState: Sendable {
         outbound.ordered = ByteBuffer()
         outbound.closeReason = .abort
         wakeWaiters(&wakeups)
+        failPings(&wakeups)
     }
 
     /// A stream task ended. Resets the stream if the peer is still sending, and finishes a
