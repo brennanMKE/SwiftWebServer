@@ -7,6 +7,7 @@ public import HTTP1
 public import HTTPCore
 public import HTTPServer
 public import StaticFiles
+import Compression
 import VirtualHosts
 import Auth
 
@@ -37,6 +38,13 @@ extension ServerSettings {
         configuration.defaultMIMEType = defaultMimeType
         configuration.mimeTypes = mimeTypes
         configuration.maxAge = maxAge
+        if let compression, compression.precompress || compression.sidecars {
+            var precompression = compression.configuration
+            // Sidecars only: nothing is compressed by the cache itself.
+            if !compression.precompress { precompression.minimumSize = .max }
+            configuration.compression = precompression
+            configuration.precompressedSidecars = compression.sidecars
+        }
         return configuration
     }
 
@@ -81,7 +89,10 @@ extension ServerSettings {
                 throw Self.describe(error, root: root, pages: map)
             }
         }
+        // #0091: outermost, so generated error pages are compressed too.
+        let compressor = compression.map { Compression(configuration: $0.configuration) }
         return MiddlewareBuilder.build {
+            if let compressor { compressor }
             if let pages { pages }
             if let authenticator { authenticator }
             terminal

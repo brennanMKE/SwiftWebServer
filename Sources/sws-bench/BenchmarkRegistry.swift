@@ -11,6 +11,7 @@ func registerAllBenchmarks() {
     registerParserBenchmarks()   // M1.3: ParserBench.swift
     registerSerializerBenchmarks()   // M1.4: SerializerBench.swift
     registerStaticFilesBenchmarks()   // M4.2: StaticFilesBench.swift
+    registerCompressionBenchmarks()   // M6: CompressionBench.swift (#0091)
     registerRouterBenchmarks()   // M6: RouterBench.swift
     registerVirtualHostsBenchmarks()   // M6: VirtualHostsBench.swift
     registerAuthBenchmarks()   // M6: AuthBench.swift

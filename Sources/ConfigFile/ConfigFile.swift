@@ -1,3 +1,4 @@
+import Compression
 public import Foundation
 
 /// An error in a config file. The description names the file and, for a bad value, the key.
@@ -18,7 +19,7 @@ public struct ConfigFileError: Error, Sendable, Equatable, CustomStringConvertib
 /// - Unknown keys do not fail: each adds a line to ``warnings``.
 /// - A value of the wrong type or out of range throws ``ConfigFileError`` naming the key.
 /// - Keys reserved for components that are not built yet (`accessLog`) and legacy
-///   keys that no longer do anything (`enableETags`, `enableCompression`) are accepted with a
+///   keys that no longer do anything (`enableETags`) are accepted with a
 ///   warning, so the AccessLog work can claim it without breaking old files.
 /// - `tls` and `http3` (#0089) add the TLS and HTTP/3 listeners; HTTP/3 needs TLS.
 ///
@@ -45,7 +46,6 @@ public struct ConfigFile: Sendable {
     /// Legacy keys that have no effect any more.
     public static let ignoredLegacyKeys: [String: String] = [
         "enableETags": "ETags are always sent (metadata-based, no hashing)",
-        "enableCompression": "compression is not available yet (#0091)",
     ]
 
     /// Reads and parses the file at `path`. ``ServerSettings/baseDirectory`` becomes the file's
@@ -188,6 +188,14 @@ struct Parser {
                 settings.tls = try tls(value, key)
             case "http3":
                 settings.http3 = try http3(value, key)
+            case "compression":
+                settings.compression = try compression(value, key)
+            case "enableCompression":
+                if object["compression"] != nil {
+                    warn("\"enableCompression\" ignored because \"compression\" is set")
+                    continue
+                }
+                settings.compression = try bool(value, key) ? ServerSettings.CompressionSettings() : nil
             case _ where ConfigFile.reservedKeys.contains(key):
                 reserved[key] = ConfigFile.ReservedValue(json: Self.json(value))
                 warn("\"\(key)\" is reserved for a component that is not available yet; ignored")
@@ -286,6 +294,52 @@ struct Parser {
             }
         }
         return enabled ? settings : nil
+    }
+
+    /// `"compression": {"enabled": true, "encodings": ["br", "gzip", "deflate"], "minimumSize": 1024,
+    /// "level": 4, "precompressionLevel": 9, "mimeTypes": ["text/*", …], "precompress": true,
+    /// "sidecars": true}`; `true` alone is every default; `false`, `null` or `"enabled": false`
+    /// turns it off (#0091).
+    mutating func compression(_ value: Any, _ key: String) throws(ConfigFileError) -> ServerSettings.CompressionSettings? {
+        if value is NSNull { return nil }
+        if Self.isBool(value) { return try bool(value, key) ? ServerSettings.CompressionSettings() : nil }
+        let object = try dictionary(value, key, expectation: "must be true, false or an object")
+        var enabled = true
+        var result = ServerSettings.CompressionSettings()
+        for name in object.keys.sorted() {
+            let path = "\(key).\(name)"
+            let element = object[name]!
+            switch name {
+            case "enabled":
+                enabled = try bool(element, path)
+            case "encodings":
+                var codings: [ContentCoding] = []
+                for text in try strings(element, path) {
+                    guard let coding = ContentCoding(name: text) else {
+                        throw fail(path, "must list \"br\", \"gzip\" or \"deflate\" (not \"\(text)\")")
+                    }
+                    if !codings.contains(coding) { codings.append(coding) }
+                }
+                result.configuration.encodings = codings
+            case "minimumSize":
+                result.configuration.minimumSize = try integer(element, path, in: 0...Int(Int32.max))
+            case "level":
+                result.configuration.level = try integer(element, path, in: 1...9)
+            case "precompressionLevel":
+                result.configuration.precompressionLevel = try integer(element, path, in: 1...9)
+            case "mimeTypes":
+                let types = try strings(element, path)
+                guard !types.contains(where: \.isEmpty) else { throw fail(path, "must not contain empty types") }
+                result.configuration.mimeTypes = types
+            case "precompress":
+                result.precompress = try bool(element, path)
+            case "sidecars":
+                result.sidecars = try bool(element, path)
+            default:
+                warn("unknown key \"\(path)\" ignored")
+            }
+        }
+        return enabled ? result : nil
     }
 
     mutating func timeouts(_ value: Any, _ key: String) throws(ConfigFileError) {

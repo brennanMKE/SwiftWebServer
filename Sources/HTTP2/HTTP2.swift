@@ -56,10 +56,14 @@ import Darwin
 ///
 /// A request whose HEADERS do not end the stream gets a body (``HTTP2BodyChannel``) that the
 /// reader fills with DATA payloads (padding removed) and ends at END_STREAM, with the trailer
-/// section if one follows. The bound is the stream's receive window: credit (stream and
-/// connection WINDOW_UPDATE, batched at half a window) goes back only as the handler consumes
-/// bytes, so a handler that does not read stalls only its own stream. A DATA total that differs
-/// from `content-length`, invalid trailers, or DATA past the stream window reset the stream.
+/// section if one follows. The bound is the stream's receive window (#0053, see
+/// ``HTTP2Connection``): credit (stream and connection WINDOW_UPDATE, each batched at half its
+/// window) goes back only as the handler consumes bytes, so a handler that does not read stalls
+/// only its own stream. The connection window (``HTTP2Configuration/connectionWindowSize``,
+/// 1 MiB) is larger than a stream window (``HTTP2Configuration/initialWindowSize``), so several
+/// streams can upload at once. A DATA total that differs from `content-length`, invalid
+/// trailers, or DATA past the stream window (`FLOW_CONTROL_ERROR`) reset the stream; DATA past
+/// the connection window is a connection `FLOW_CONTROL_ERROR`.
 /// DATA the server does not deliver (ignored streams, padding, a body whose handler returned)
 /// is credited at once, and a stream still sending when its response ends is reset with
 /// `NO_ERROR` (§8.1).
@@ -112,10 +116,43 @@ import Darwin
 ///   keeps reading (discarding input after a connection error, up to
 ///   ``HTTP2Configuration/maxLingerSize``), so the peer reads the GOAWAY rather than a reset.
 ///
+/// ## Outbound flow control (#0054)
+///
+/// A DATA frame is the smallest of the chunk, the stream's send window, the connection's send
+/// window and the peer's MAX_FRAME_SIZE. A writer that cannot send does not buffer: it waits
+/// for its turn (``HTTP2SharedState`` "Fair waiting"). A writer whose stream window is closed
+/// waits for that stream's WINDOW_UPDATE (or an INITIAL_WINDOW_SIZE change, which can make
+/// windows negative, §6.9.2); writers that need queue space or connection window wait in one
+/// FIFO queue, and only the first one that can proceed is woken. A writer that sent a frame and
+/// wants to send more while others wait goes to the back, so responses take turns frame by
+/// frame. A WINDOW_UPDATE of 0 is a `PROTOCOL_ERROR`, and a window above 2³¹−1 a
+/// `FLOW_CONTROL_ERROR` (on the stream, or the connection).
+///
+/// ## Limits (#0055)
+///
+/// - A HEADERS frame past SETTINGS_MAX_CONCURRENT_STREAMS gets `RST_STREAM(REFUSED_STREAM)`;
+///   its block is still decoded.
+/// - A request head over SETTINGS_MAX_HEADER_LIST_SIZE is answered `431` without the handler
+///   (`RST_STREAM(PROTOCOL_ERROR)` when a field before the limit was malformed). Blocks are
+///   decoded up to ``HTTP2Configuration/headerBlockLimit``; past it the connection closes.
+/// - A response head over the peer's SETTINGS_MAX_HEADER_LIST_SIZE becomes a bare `500`.
+/// - A request body over ``HTTP2Configuration/maxRequestBodySize`` is answered `413`.
+/// - A stream error on an idle stream (a PRIORITY frame that depends on itself) closes the
+///   connection, because RST_STREAM must not be sent on an idle stream (§6.4).
+///
+/// ## Denial of service (#0056)
+///
+/// ``HTTP2AbuseLimits`` (``HTTP2Configuration/abuseLimits``) rate-limits rapid reset, control,
+/// empty, WINDOW_UPDATE and window-limited small DATA frames (`GOAWAY(ENHANCE_YOUR_CALM)`),
+/// resets responses stalled on a zero window, and shuts a connection down gracefully after
+/// ``HTTP2AbuseLimits/maxStreamsPerConnection`` streams. Handler tasks of reset streams count
+/// against twice MAX_CONCURRENT_STREAMS. The CONTINUATION flood, HPACK bomb, reply-queue flood
+/// and slow preface are bounded by the header block limits, `maxQueuedControlFrames` and
+/// `settingsTimeout`.
+///
 /// ## Not yet
 ///
-/// The full inbound window policy (#0053), fair window waiting (#0054), extended CONNECT
-/// (#0067: `.tunnel` answers `501`).
+/// Extended CONNECT (#0067: `.tunnel` answers `501`).
 public struct HTTP2: ConnectionProtocol {
     public var configuration: HTTP2Configuration
 
@@ -153,6 +190,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// Triggers when the reader stopped: the peer closed, the transport failed, or a lingering
     /// close finished discarding. The writer's lingering close waits for it.
     let readerDone = ShutdownSignal()
+    /// Triggers when ``HTTP2AbuseLimits/maxStreamsPerConnection`` streams were dispatched: the
+    /// connection shuts down gracefully, so the client moves to a new one (#0056).
+    let streamLimit = ShutdownSignal()
 
     init(transport: Transport, handler: Handler, context: ConnectionContext, configuration: HTTP2Configuration) {
         self.transport = transport
@@ -180,6 +220,16 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                         if await self.waitForIdle(idle) { await self.shutDownGracefully() }
                     }
                 }
+                if configuration.abuseLimits.maxStreamsPerConnection != nil {
+                    let limit = streamLimit
+                    streams.addTask {
+                        await limit.wait()
+                        if limit.isTriggered { await self.shutDownGracefully() }
+                    }
+                }
+                if let stall = configuration.abuseLimits.windowStallTimeout {
+                    streams.addTask { await self.runWindowStallWatchdog(stall) }
+                }
                 await runReader(streams: &streams)
                 readerDone.trigger()
                 // End of input, a connection error, or the writer closed the transport.
@@ -201,50 +251,78 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         return action
     }
 
+    /// ``handle(_:)`` after counting the frame as `kind` (#0056), in one critical section.
+    /// Over the limit the connection closes and the event is not handled.
+    func handle(_ event: HTTP2Connection.Event, counting kind: HTTP2AbuseKind?) -> HTTP2Connection.Action {
+        guard let kind else { return handle(event) }
+        var wakeups = HTTP2Wakeups()
+        let action = state.withLock { shared -> HTTP2Connection.Action in
+            if let flood = shared.recordAbuse(kind, wakeups: &wakeups) { return flood }
+            return shared.handle(event, wakeups: &wakeups)
+        }
+        wakeups.resume()
+        return action
+    }
+
+    /// Counts one frame as `kind` (#0056). Returns false when that closed the connection.
+    func countAbuse(_ kind: HTTP2AbuseKind) -> Bool {
+        var wakeups = HTTP2Wakeups()
+        let flood = state.withLock { $0.recordAbuse(kind, wakeups: &wakeups) }
+        wakeups.resume()
+        return flood == nil
+    }
+
     func closeOutbound(_ reason: CloseReason) {
         var wakeups = HTTP2Wakeups()
         state.withLock { $0.close(reason, wakeups: &wakeups) }
         wakeups.resume()
     }
 
-    /// Suspends until the shared state's generation moves past `generation` (queue space or
-    /// window became available, or the connection is closing) or the task is cancelled.
-    func waitForProgress(since generation: UInt64) async {
-        let id = state.withLock { shared -> UInt64 in
-            defer { shared.nextWaiterID &+= 1 }
-            return shared.nextWaiterID
-        }
+    /// Suspends until it is `ticket`'s turn (``HTTP2SharedState/grantNext(_:)``), its stream
+    /// window opened or closed, the connection is closing, or the task is cancelled.
+    func waitForTurn(_ ticket: UInt64) async {
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let resumeNow = state.withLock { shared -> Bool in
-                    if shared.generation != generation || !shared.isOpen || Task.isCancelled { return true }
-                    shared.waiters[id] = continuation
-                    return false
+                let waiting = state.withLock { shared -> Bool in
+                    !Task.isCancelled && shared.parkWaiter(ticket, continuation)
                 }
-                if resumeNow { continuation.resume() }
+                if !waiting { continuation.resume() }
             }
         } onCancel: {
-            state.withLock { $0.waiters.removeValue(forKey: id) }?.resume()
+            cancelWaiter(ticket)
         }
     }
 
-    /// Repeats `attempt` (a critical section) until it sends or drops, waiting in between.
-    /// Returns the sent length and END_STREAM, or `nil` when dropped or cancelled.
+    /// Forgets `ticket` and passes its turn on, if it had one.
+    func cancelWaiter(_ ticket: UInt64) {
+        var wakeups = HTTP2Wakeups()
+        state.withLock { $0.cancelWaiter(ticket, wakeups: &wakeups) }
+        wakeups.resume()
+    }
+
+    /// Repeats `attempt` (a critical section) until it sends or drops, waiting for its turn in
+    /// between (#0054). Returns the sent length and END_STREAM, or `nil` when dropped or
+    /// cancelled.
     func enqueue(
-        _ attempt: (inout HTTP2SharedState, inout HTTP2Wakeups) -> HTTP2SharedState.StreamStep
+        _ attempt: (inout HTTP2SharedState, UInt64?, inout HTTP2Wakeups) -> HTTP2SharedState.StreamStep
     ) async -> (length: Int, endStream: Bool)? {
+        var ticket: UInt64?
         while true {
             var wakeups = HTTP2Wakeups()
-            let step = state.withLock { attempt(&$0, &wakeups) }
+            let step = state.withLock { attempt(&$0, ticket, &wakeups) }
             wakeups.resume()
             switch step {
             case .sent(let length, let endStream):
                 return (length, endStream)
             case .dropped:
                 return nil
-            case .wait(let generation):
-                await waitForProgress(since: generation)
-                if Task.isCancelled { return nil }
+            case .wait(let next):
+                ticket = next
+                await waitForTurn(next)
+                if Task.isCancelled {
+                    cancelWaiter(next)
+                    return nil
+                }
             }
         }
     }
@@ -418,6 +496,26 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
 
     // MARK: Timers
 
+    /// Zero-window stall (#0056): every quarter of `limit`, resets streams (or closes the
+    /// connection) whose response waited longer than `limit` for send window.
+    func runWindowStallWatchdog(_ limit: Duration) async {
+        while true {
+            do {
+                try await Task.sleep(for: limit / 4)
+            } catch {
+                return
+            }
+            var wakeups = HTTP2Wakeups()
+            let cutoff = ContinuousClock.now - limit
+            let open = state.withLock { shared -> Bool in
+                shared.expireStalledWriters(before: cutoff, wakeups: &wakeups)
+                return shared.isOpen
+            }
+            wakeups.resume()
+            if !open { return }
+        }
+    }
+
     func runSettingsTimer(_ timeout: Duration) async {
         do {
             try await Task.sleep(for: timeout)
@@ -433,8 +531,10 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     enum ReadStep {
         case proceed
         /// Serve a request on a new stream task; `body` feeds its request body, and `task`
-        /// cancels it.
-        case serve(HTTP2StreamID, HTTPRequest, HTTPRequestStorage, body: HTTP2BodyChannel?, task: HTTP2StreamTask)
+        /// cancels it. With a `rejection` status the handler is not called (#0055: `431`,
+        /// `413`) and there is no request.
+        case serve(HTTP2StreamID, HTTPRequest?, rejection: HTTPStatus?, HTTPRequestStorage, body: HTTP2BodyChannel?,
+                   task: HTTP2StreamTask)
         /// A connection error was answered (or the peer is gone): stop reading.
         case stop
     }
@@ -450,12 +550,6 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         var endStream: Bool
     }
 
-    /// The stream receive window the peer may fill before our SETTINGS are acknowledged and
-    /// after: the larger of the default and the advertised one.
-    var streamReceiveWindow: Int {
-        Swift.max(Int(configuration.initialWindowSize), Int(HTTP2Connection.defaultWindowSize))
-    }
-
     /// Reads the preface and then frames until end of input, a transport error, or a
     /// connection error.
     func runReader(streams: inout DiscardingTaskGroup) async {
@@ -467,11 +561,13 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
 
         var parser = HTTP2FrameParser(configuration: .init(role: .server))
         var assembler = HeaderBlockAssembler(configuration: .init(
-            maxBlockSize: configuration.maxHeaderListSize, maxContinuationFrames: configuration.maxContinuationFrames))
+            maxBlockSize: configuration.headerBlockLimit, maxContinuationFrames: configuration.maxContinuationFrames))
         // Until our SETTINGS are acknowledged the peer may use the default 4,096-byte table.
+        // Lists up to the hard limit are decoded so an oversized head can be answered `431`;
+        // the advertised limit is enforced by the field sinks.
         var decoder = HPACKDecoder(
             maxTableSize: Swift.max(configuration.headerTableSize, Int(HTTP2Connection.defaultHeaderTableSize)),
-            maxHeaderListSize: configuration.maxHeaderListSize)
+            maxHeaderListSize: configuration.headerBlockLimit)
         var data: DataTarget?
 
         while true {
@@ -497,8 +593,10 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                 case .stop:
                     await discardInput(streams: &streams, buffer: &buffer)
                     return
-                case .serve(let id, let request, let storage, let body, let task):
-                    streams.addTask { await self.runStream(id, request: request, storage: storage, body: body, task: task) }
+                case .serve(let id, let request, let rejection, let storage, let body, let task):
+                    streams.addTask {
+                        await self.runStream(id, request: request, rejection: rejection, storage: storage, body: body, task: task)
+                    }
                 }
             }
             buffer.clear()
@@ -569,6 +667,8 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         // Every frame passes the assembler first: nothing may interrupt a header block.
         let gate: HeaderBlockAssembler.Action
         let machineEvent: HTTP2Connection.Event
+        // Frames that cost work without carrying a request count toward a flood limit (#0056).
+        var abuse: HTTP2AbuseKind?
         switch event {
         case .needsMoreData:
             return .proceed
@@ -585,6 +685,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                 handle(.connectionError(.connection(code, reason: "frame inside a header block")))
                 return .stop
             }
+            // A DATA frame with no payload (padding at most) that does not end the stream does
+            // nothing but cost a frame.
+            if frame.dataLength == 0 && !frame.endStream && !countAbuse(.emptyFrames) { return .stop }
             var target = DataTarget(
                 streamID: frame.streamID, accepted: false, body: nil, remaining: frame.dataLength, endStream: frame.endStream)
             switch receiveData(frame, body: &target.body) {
@@ -600,12 +703,14 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             return .proceed
         case .headers(let id, let endStream, let endHeaders, let priority, let location):
             return parser.withPayload(location, in: input) { fragment in
+                if fragment.isEmpty && !endHeaders && !countAbuse(.emptyFrames) { return .stop }
                 let action = assembler.handle(.headers(
                     streamID: id, endStream: endStream, endHeaders: endHeaders, priority: priority, fragment: fragment))
                 return headerBlock(action, fragment: fragment, assembler: assembler, decoder: &decoder)
             }
         case .continuation(let id, let endHeaders, let location):
             return parser.withPayload(location, in: input) { fragment in
+                if fragment.isEmpty && !endHeaders && !countAbuse(.emptyFrames) { return .stop }
                 let action = assembler.handle(.continuation(streamID: id, endHeaders: endHeaders, fragment: fragment))
                 return headerBlock(action, fragment: fragment, assembler: assembler, decoder: &decoder)
             }
@@ -616,27 +721,32 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         case .priority(let id, _):
             gate = assembler.handle(.otherFrame(.priority, streamID: id))
             machineEvent = .priority(streamID: id)
+            abuse = .controlFrames
         case .rstStream(let id, let code):
             gate = assembler.handle(.otherFrame(.rstStream, streamID: id))
             machineEvent = .rstStream(streamID: id, code)
         case .settings(let settings):
             gate = assembler.handle(.otherFrame(.settings, streamID: .connection))
             machineEvent = .settings(settings)
+            abuse = .controlFrames
         case .settingsAck:
             gate = assembler.handle(.otherFrame(.settings, streamID: .connection))
             machineEvent = .settingsAck
         case .ping(let ack, let data):
             gate = assembler.handle(.otherFrame(.ping, streamID: .connection))
             machineEvent = .ping(ack: ack, opaqueData: data)
+            if !ack { abuse = .controlFrames }
         case .goaway(let last, let code, _):
             gate = assembler.handle(.otherFrame(.goaway, streamID: .connection))
             machineEvent = .goaway(lastStreamID: last, code)
         case .windowUpdate(let id, let increment):
             gate = assembler.handle(.otherFrame(.windowUpdate, streamID: id))
             machineEvent = .windowUpdate(streamID: id, increment: increment)
+            abuse = .windowUpdates
         case .unknown(let header):
             gate = assembler.handle(.otherFrame(header.type, streamID: header.streamID))
             machineEvent = .unknownFrame
+            abuse = .controlFrames
         case .streamError(let error):
             gate = assembler.handle(.otherFrame(.priority, streamID: error.streamID ?? .connection))
             machineEvent = .streamError(error)
@@ -645,7 +755,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             handle(.connectionError(.connection(code, reason: "frame inside a header block")))
             return .stop
         }
-        switch handle(machineEvent) {
+        switch handle(machineEvent, counting: abuse) {
         case .goaway:
             return .stop
         case .applyLocalSettings(let settings):
@@ -681,7 +791,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// Passes accepted DATA payload to the stream's body, or credits it when nobody reads it.
     func deliver(_ payload: UnsafeRawBufferPointer, to target: DataTarget) {
         guard let body = target.body else {
-            bodyConsumed(streamID: target.streamID, length: payload.count, streamIncrement: nil)
+            bodyConsumed(streamID: target.streamID, length: payload.count)
             return
         }
         switch body.receive(payload) {
@@ -690,8 +800,6 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         case .malformed:
             // More DATA than `content-length` (RFC 9113 §8.1.1).
             handle(.sendReset(streamID: target.streamID, .protocolError))
-        case .flowControlError:
-            handle(.sendReset(streamID: target.streamID, .flowControlError))
         }
     }
 
@@ -733,7 +841,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             case .dispatch(let id, _):
                 return try dispatch(id, block: block, fragment: fragment, assembler: assembler, decoder: &decoder)
             case .acceptTrailers(let id):
-                var sink = HTTP2TrailerFieldSink()
+                var sink = HTTP2TrailerFieldSink(maxListSize: configuration.maxHeaderListSize)
                 try assembler.decode(block, fragment: fragment, with: &decoder, into: &sink)
                 guard let body = state.withLock({ $0.bodies[id.rawValue] }) else { return .proceed }
                 if sink.failure != nil {
@@ -763,33 +871,58 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         assembler: HeaderBlockAssembler, decoder: inout HPACKDecoder
     ) throws(HTTP2Error) -> ReadStep {
         let storage = HTTPRequestStorage(bufferCapacity: Swift.max(block.size * 2, 256), fieldCapacity: 16)
-        var sink = HTTP2RequestFieldSink(storage: storage)
+        var sink = HTTP2RequestFieldSink(storage: storage, maxListSize: configuration.maxHeaderListSize)
         try assembler.decode(block, fragment: fragment, with: &decoder, into: &sink)
         // A stream that depends on itself (the deprecated PRIORITY flag, RFC 9113 §5.3.1) is a
         // stream PROTOCOL_ERROR; otherwise the priority fields are ignored.
         let selfDependent = block.priority?.dependency == id
-        guard !selfDependent, case .success(let head) = sink.head(endStream: block.endStream) else {
+        let task = HTTP2StreamTask()
+        let head: HTTP2RequestHead
+        switch sink.head(endStream: block.endStream) {
+        case .success(let valid) where !selfDependent:
+            head = valid
+        case .failure(.fieldSectionTooLarge) where !selfDependent:
+            // Over our SETTINGS_MAX_HEADER_LIST_SIZE with no malformed field before the limit:
+            // `431` without the handler (#0055).
+            return reject(id, .requestHeaderFieldsTooLarge, storage: storage, task: task)
+        default:
             // Malformed (RFC 9113 §8.1.1): a stream error. The stream was counted as served
             // when it was dispatched.
             handle(.sendReset(streamID: id, .protocolError))
             streamEnded(id)
             return .proceed
         }
-        let task = HTTP2StreamTask()
+        if let declared = head.contentLength, declared > configuration.maxRequestBodySize {
+            return reject(id, .contentTooLarge, storage: storage, task: task)
+        }
         var request = head.request
         var body: HTTP2BodyChannel?
         if !block.endStream {
             let channel = HTTP2BodyChannel(
-                streamID: id, declaredLength: head.contentLength, window: streamReceiveWindow, credit: self)
+                streamID: id, declaredLength: head.contentLength, maxSize: configuration.maxRequestBodySize, credit: self)
             request.body = HTTPRequestBody(source: channel, request: channel.requestID, length: head.contentLength)
             body = channel
         }
         // Registered before any later frame on the stream is read, so a reset finds them.
-        state.withLock { shared in
+        let limitReached = state.withLock { shared -> Bool in
             shared.tasks[id.rawValue] = task
             if let body { shared.bodies[id.rawValue] = body }
+            return shared.streamLimitReached
         }
-        return .serve(id, request, storage, body: body, task: task)
+        if limitReached { streamLimit.trigger() }
+        return .serve(id, request, rejection: nil, storage, body: body, task: task)
+    }
+
+    /// Answers `status` on a dispatched stream without calling the handler. DATA the peer
+    /// still sends has no body and is credited at once; the stream is reset with `NO_ERROR`
+    /// once the response ends (§8.1).
+    func reject(_ id: HTTP2StreamID, _ status: HTTPStatus, storage: HTTPRequestStorage, task: HTTP2StreamTask) -> ReadStep {
+        let limitReached = state.withLock { shared -> Bool in
+            shared.tasks[id.rawValue] = task
+            return shared.streamLimitReached
+        }
+        if limitReached { streamLimit.trigger() }
+        return .serve(id, nil, rejection: status, storage, body: nil, task: task)
     }
 
     // MARK: Streams
@@ -798,16 +931,16 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// zero once every stream ended, however it ended).
     var liveStreamTasks: Int { liveStreams.load(ordering: .relaxed) }
 
-    /// One stream's task: runs ``serve(_:request:storage:body:)`` as the only child of a group
-    /// that ``HTTP2StreamTask/cancel()`` cancels when the stream is reset (#0051).
+    /// One stream's task: runs ``serve(_:request:rejection:storage:body:)`` as the only child of
+    /// a group that ``HTTP2StreamTask/cancel()`` cancels when the stream is reset (#0051).
     func runStream(
-        _ id: HTTP2StreamID, request: HTTPRequest, storage: HTTPRequestStorage, body: HTTP2BodyChannel?,
-        task: HTTP2StreamTask
+        _ id: HTTP2StreamID, request: HTTPRequest?, rejection: HTTPStatus?, storage: HTTPRequestStorage,
+        body: HTTP2BodyChannel?, task: HTTP2StreamTask
     ) async {
         liveStreams.add(1, ordering: .relaxed)
         await withDiscardingTaskGroup { group in
             group.addTask {
-                await self.serve(id, request: request, storage: storage, body: body)
+                await self.serve(id, request: request, rejection: rejection, storage: storage, body: body)
                 task.finish()
             }
             await task.wait()
@@ -823,20 +956,34 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// `CancellationError`. A handler that ends because of it, or throws `CancellationError`, and
     /// a response cut short by it, reset the stream with `CANCEL`; the state machine drops the
     /// reset when the stream is already closed (the peer reset it, or the server did).
-    func serve(_ id: HTTP2StreamID, request: HTTPRequest, storage: HTTPRequestStorage, body: HTTP2BodyChannel?) async {
-        let isHead = request.method == .head
-        var requestContext = context.requestContext
-        if context.recordsRequestStartTime { requestContext.startTime = .now() }
+    ///
+    /// With a `rejection` (#0055) the handler is not called and the response is that status.
+    /// A body that grew past ``HTTP2Configuration/maxRequestBodySize`` makes a handler that
+    /// throws `HTTPRequestBodyError.tooLarge` answer `413` instead of `500`.
+    func serve(
+        _ id: HTTP2StreamID, request: HTTPRequest?, rejection: HTTPStatus?, storage: HTTPRequestStorage,
+        body: HTTP2BodyChannel?
+    ) async {
         var response: HTTPResponse?
         var cancelled = false
-        do {
-            response = try await handler.handle(request, context: requestContext)
-        } catch {
-            if Task.isCancelled || error is CancellationError {
-                cancelled = true
-            } else {
-                response = HTTPResponse(status: .internalServerError)
+        var isHead = false
+        if let request {
+            isHead = request.method == .head
+            var requestContext = context.requestContext
+            if context.recordsRequestStartTime { requestContext.startTime = .now() }
+            do {
+                response = try await handler.handle(request, context: requestContext)
+            } catch {
+                if Task.isCancelled || error is CancellationError {
+                    cancelled = true
+                } else if (error as? HTTPRequestBodyError) == .tooLarge || body?.isTooLarge == true {
+                    response = HTTPResponse(status: .contentTooLarge)
+                } else {
+                    response = HTTPResponse(status: .internalServerError)
+                }
             }
+        } else {
+            response = HTTPResponse(status: rejection ?? .internalServerError)
         }
         storage.endRequest()
         // Body bytes the handler did not read are discarded and credited.
@@ -883,11 +1030,13 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         case .file(let region): bodyless = !hasContent || region.length == 0
         case .stream: bodyless = !hasContent
         }
-        let head = await enqueue { shared, wakeups in
+        let head = await enqueue { shared, ticket, wakeups in
             shared.sendHeaders(streamID: id, status: status, headers: headers, contentLength: declaredLength,
-                               endStream: bodyless, wakeups: &wakeups)
+                               endStream: bodyless, ticket: ticket, wakeups: &wakeups)
         }
-        guard head != nil, !bodyless else { return }
+        // A head that ended the stream (bodyless, or replaced by a bare 500 because the peer's
+        // MAX_HEADER_LIST_SIZE refuses it) has no body.
+        guard let head, !head.endStream else { return }
         do {
             switch body {
             case .empty, .tunnel:
@@ -915,8 +1064,8 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         var remaining = bytes
         while true {
             let chunk = remaining
-            guard let (length, ended) = await enqueue({ shared, wakeups in
-                shared.sendData(streamID: id, bytes: chunk, endStream: endStream, wakeups: &wakeups)
+            guard let (length, ended) = await enqueue({ shared, ticket, wakeups in
+                shared.sendData(streamID: id, bytes: chunk, endStream: endStream, ticket: ticket, wakeups: &wakeups)
             }) else {
                 try Task.checkCancellation()
                 return false
@@ -957,8 +1106,8 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
 }
 
 extension HTTP2ConnectionDriver: HTTP2ReceiveCredit {
-    func bodyConsumed(streamID: HTTP2StreamID, length: Int, streamIncrement: UInt32?) {
-        handle(.bodyConsumed(streamID: streamID, length: length, streamIncrement: streamIncrement))
+    func bodyConsumed(streamID: HTTP2StreamID, length: Int) {
+        handle(.bodyConsumed(streamID: streamID, length: length))
     }
 }
 

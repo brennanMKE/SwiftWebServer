@@ -1,3 +1,5 @@
+public import Compression
+
 /// The server's settings, as read from `http-config.json` (#0086, legacy #0023).
 ///
 /// Every key of the file is optional: a missing key keeps the default documented on its
@@ -94,6 +96,22 @@ public struct ServerSettings: Sendable, Equatable {
     /// The HTTP/3 (QUIC) listener (#0089, #0103). `nil` (the default) serves no HTTP/3. Needs
     /// ``tls``. In the file: `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`.
     public var http3: HTTP3Settings?
+    /// Response compression (#0091). `nil` (the default) compresses nothing. In the file:
+    /// `"compression": true`, or an object (see ``CompressionSettings``). The legacy
+    /// `"enableCompression": true` is the same as `"compression": true`.
+    public var compression: CompressionSettings?
+
+    /// The `Compression` component and precompressed static files.
+    public struct CompressionSettings: Sendable, Equatable {
+        /// Codings, minimum size, MIME types and levels.
+        public var configuration = CompressionConfiguration()
+        /// Cache encoded variants of small static files (compressed once). Default true.
+        public var precompress = true
+        /// Serve `file.br` / `file.gz` sidecars as variants. Default true.
+        public var sidecars = true
+
+        public init() {}
+    }
 
     /// Virtual hosts (#0092): sites selected by `Host`, each with its own root. Empty (the
     /// default) serves ``root`` for every host. In the file:

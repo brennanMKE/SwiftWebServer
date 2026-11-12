@@ -4,9 +4,9 @@ import Synchronization
 /// Where a request body returns flow-control credit: the connection, which turns it into
 /// WINDOW_UPDATE frames (`HTTP2ConnectionDriver`).
 protocol HTTP2ReceiveCredit: AnyObject, Sendable {
-    /// `length` bytes of `streamID`'s DATA were consumed by the handler or discarded. Their
-    /// connection credit goes back; `streamIncrement`, when set, is stream credit to send.
-    func bodyConsumed(streamID: HTTP2StreamID, length: Int, streamIncrement: UInt32?)
+    /// `length` bytes of `streamID`'s DATA were consumed by the handler or discarded: their
+    /// connection and stream credit goes back (``HTTP2Connection/Event/bodyConsumed(streamID:length:)``).
+    func bodyConsumed(streamID: HTTP2StreamID, length: Int)
 }
 
 /// The ``HTTPRequestBodySource`` behind an HTTP/2 request's ``HTTPRequestBody``: the DATA
@@ -16,15 +16,13 @@ protocol HTTP2ReceiveCredit: AnyObject, Sendable {
 /// ## Bounds and backpressure
 ///
 /// The reader cannot stop reading for one stream without stalling every other stream, so the
-/// bound is flow control (§5.2): the peer may have at most the stream's receive window
-/// (``window``) of DATA outstanding, and stream credit goes back only as the handler consumes
-/// bytes. A handler that does not read stalls its own stream at the window; one that reads
-/// gets a stream WINDOW_UPDATE each time half the window was consumed. Connection credit for
-/// the same bytes goes back on consumption too (``HTTP2ReceiveCredit``). DATA past the window
-/// is a stream `FLOW_CONTROL_ERROR`.
-///
-/// `next()` is the pull signal: it hands the handler everything buffered as one chunk and
-/// returns the credit (#0053 builds its window policy on this hook).
+/// bound is flow control (§5.2, #0053): the state machine charges every DATA frame to the
+/// stream's receive window (``HTTP2ReceiveWindow``) and resets the stream with
+/// `FLOW_CONTROL_ERROR` past it, so at most one window is ever buffered here. Credit goes back
+/// only as the handler consumes bytes: `next()` hands the handler everything buffered as one
+/// chunk and reports its length (``HTTP2ReceiveCredit``), and the machine batches the
+/// stream and connection WINDOW_UPDATEs to half a window. A handler that does not read stalls
+/// its own stream at the window.
 ///
 /// ## Ends
 ///
@@ -32,6 +30,8 @@ protocol HTTP2ReceiveCredit: AnyObject, Sendable {
 /// - A DATA total that differs from `content-length` makes the body
 ///   ``HTTPRequestBodyError/malformed`` (the connection resets the stream with
 ///   `PROTOCOL_ERROR`), as does an invalid trailer section.
+/// - A body larger than ``maxSize`` fails with ``HTTPRequestBodyError/tooLarge`` (#0055): the
+///   handler's read throws it and the connection answers `413`.
 /// - A reset stream (either side) is ``TransportError/connectionReset``; a closed connection
 ///   ``TransportError/closed``. Bytes still buffered are discarded and their credit returned.
 /// - After the handler returned (``expire()``), reads throw ``HTTPRequestBodyError/expired``,
@@ -45,18 +45,12 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
         /// The DATA total disagrees with `content-length`, or the trailers are invalid: reset
         /// the stream with `PROTOCOL_ERROR`.
         case malformed
-        /// The peer sent past the stream window: reset the stream with `FLOW_CONTROL_ERROR`.
-        case flowControlError
     }
 
     struct State {
         var buffered = ByteBuffer()
         /// DATA payload bytes received, for `content-length`.
         var received = 0
-        /// Bytes received and not yet returned as stream credit: the window in use.
-        var outstanding = 0
-        /// Bytes consumed and not yet returned as stream credit (batched to half the window).
-        var uncredited = 0
         var ended = false
         var failure: (any Error)?
         var trailers: HTTPFields?
@@ -67,20 +61,20 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
 
     let streamID: HTTP2StreamID
     let declaredLength: Int?
-    /// The most DATA bytes the peer may have outstanding on the stream.
-    let window: Int
-    /// Consumed bytes returned as one stream WINDOW_UPDATE.
-    let creditThreshold: Int
+    /// The largest body accepted; more fails the body with ``HTTPRequestBodyError/tooLarge``.
+    let maxSize: Int
     let credit: any HTTP2ReceiveCredit
     private let state = Mutex(State())
 
-    init(streamID: HTTP2StreamID, declaredLength: Int?, window: Int, credit: any HTTP2ReceiveCredit) {
+    init(streamID: HTTP2StreamID, declaredLength: Int?, maxSize: Int = .max, credit: any HTTP2ReceiveCredit) {
         self.streamID = streamID
         self.declaredLength = declaredLength
-        self.window = window
-        creditThreshold = Swift.max(1, window / 2)
+        self.maxSize = maxSize
         self.credit = credit
     }
+
+    /// Whether the body failed because it grew past ``maxSize``.
+    var isTooLarge: Bool { state.withLock { ($0.failure as? HTTPRequestBodyError) == .tooLarge } }
 
     /// The request ID ``HTTPRequestBody`` passes back.
     var requestID: UInt64 { UInt64(streamID.rawValue) }
@@ -95,26 +89,21 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
         let count = bytes.count
         var waiter: CheckedContinuation<Void, Never>?
         var discard = 0
-        var increment: UInt32?
         let delivery = state.withLock { state -> Delivery in
-            if state.failure != nil || state.ended {
-                // The stream was reset: the rest of the frame is credited and dropped.
+            if state.failure != nil || state.ended || state.expired {
+                // Reset, failed, or nobody reads any more: credited and dropped.
                 discard = count
                 return .accepted
             }
             state.received += count
-            state.outstanding += count
             if let declaredLength, state.received > declaredLength {
                 discard = Self.fail(&state, HTTPRequestBodyError.malformed, waiter: &waiter) + count
                 return .malformed
             }
-            if state.outstanding > window {
-                discard = Self.fail(&state, HTTPRequestBodyError.malformed, waiter: &waiter) + count
-                return .flowControlError
-            }
-            if state.expired {
-                discard = count
-                increment = consume(count, &state)
+            if state.received > maxSize {
+                // The handler's read throws `tooLarge` (answered `413`); later DATA is credited
+                // and dropped.
+                discard = Self.fail(&state, HTTPRequestBodyError.tooLarge, waiter: &waiter) + count
                 return .accepted
             }
             bytes.withMemoryRebound(to: UInt8.self) { state.buffered.append(contentsOf: $0.span) }
@@ -123,7 +112,7 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
             return .accepted
         }
         waiter?.resume()
-        if discard > 0 { credit.bodyConsumed(streamID: streamID, length: discard, streamIncrement: increment) }
+        if discard > 0 { credit.bodyConsumed(streamID: streamID, length: discard) }
         return delivery
     }
 
@@ -139,40 +128,34 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
             }
             state.ended = true
             state.trailers = trailers
-            // No more stream credit is needed once the peer finished sending.
-            state.uncredited = 0
             waiter = state.waiter
             state.waiter = nil
             return .accepted
         }
         waiter?.resume()
-        if discard > 0 { credit.bodyConsumed(streamID: streamID, length: discard, streamIncrement: nil) }
+        if discard > 0 { credit.bodyConsumed(streamID: streamID, length: discard) }
         return delivery
     }
 
     /// Ends the body with `error` (the first error wins), discarding what is buffered and
-    /// returning its connection credit.
+    /// returning its credit.
     func fail(_ error: any Error) {
         var waiter: CheckedContinuation<Void, Never>?
         let discard = state.withLock { Self.fail(&$0, error, waiter: &waiter) }
         waiter?.resume()
-        if discard > 0 { credit.bodyConsumed(streamID: streamID, length: discard, streamIncrement: nil) }
+        if discard > 0 { credit.bodyConsumed(streamID: streamID, length: discard) }
     }
 
     /// The handler returned: later reads throw ``HTTPRequestBodyError/expired``; buffered and
     /// later DATA is discarded and credited.
     func expire() {
-        var increment: UInt32?
         let discard = state.withLock { state -> Int in
             state.expired = true
             let count = state.buffered.readableBytes
             state.buffered = ByteBuffer()
-            increment = consume(count, &state)
             return count
         }
-        if discard > 0 || increment != nil {
-            credit.bodyConsumed(streamID: streamID, length: discard, streamIncrement: increment)
-        }
+        if discard > 0 { credit.bodyConsumed(streamID: streamID, length: discard) }
     }
 
     /// Records `error` unless the body already failed; drops the buffer. Returns the dropped
@@ -186,18 +169,6 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
         return dropped
     }
 
-    /// Counts `count` consumed bytes; returns stream credit to send once half the window was
-    /// consumed (none after END_STREAM: the peer sends nothing more).
-    private func consume(_ count: Int, _ state: inout State) -> UInt32? {
-        guard !state.ended else { return nil }
-        state.uncredited += count
-        guard state.uncredited >= creditThreshold else { return nil }
-        let increment = state.uncredited
-        state.outstanding -= increment
-        state.uncredited = 0
-        return UInt32(increment)
-    }
-
     // MARK: HTTPRequestBodySource
 
     func nextChunk(request: UInt64) async throws -> ByteBuffer? {
@@ -209,7 +180,7 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
         defer { state.withLock { $0.reading = false } }
         while true {
             enum Step {
-                case chunk(ByteBuffer, UInt32?)
+                case chunk(ByteBuffer)
                 case end
                 case failed(any Error)
                 case wait
@@ -218,15 +189,16 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
                 if state.buffered.readableBytes > 0 {
                     let chunk = state.buffered
                     state.buffered = ByteBuffer()
-                    return .chunk(chunk, consume(chunk.readableBytes, &state))
+                    return .chunk(chunk)
                 }
                 if let failure = state.failure { return .failed(failure) }
                 if state.ended { return .end }
                 return .wait
             }
             switch step {
-            case .chunk(let chunk, let increment):
-                credit.bodyConsumed(streamID: streamID, length: chunk.readableBytes, streamIncrement: increment)
+            case .chunk(let chunk):
+                // The pull signal: the bytes are the handler's now, so their credit goes back.
+                credit.bodyConsumed(streamID: streamID, length: chunk.readableBytes)
                 return chunk
             case .end:
                 return nil

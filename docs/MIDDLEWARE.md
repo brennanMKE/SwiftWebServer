@@ -138,3 +138,36 @@ into the connection's buffer, full batches go to the writer with `BoundedAsyncQu
 (dropped and counted when the queue is full, never awaited), and metrics are relaxed atomic adds
 on the connection's own counters, merged into `AccessLogMetrics` when the connection closes and
 read live on a scrape. Costs: docs/benchmarks/M6-accesslog.md.
+
+## Compression and precompressed static files
+
+`Compression` (target `Compression`, #0091) is a plain middleware: it changes the response after
+`next` returns. It negotiates `Accept-Encoding` (q-values; `br` > `gzip` > `deflate` at equal
+weight), adds `Vary: Accept-Encoding`, and leaves alone `206`, `304`, `HEAD`, responses that
+already have `Content-Encoding`, bodies under `minimumSize` and types outside its MIME
+allowlist. A strong `ETag` becomes the variant's own (`"abc"` → `"abc-gz"`), and
+`If-None-Match` naming that tag gets `304` from the middleware. `.bytes` are compressed in one
+call; `.stream` and `.file` become chunked streams compressed piece by piece under the
+transport's backpressure.
+
+Static files coordinate through one rule: a response whose `Vary` already lists
+`Accept-Encoding` was negotiated by its producer and is not encoded again. With
+`StaticFilesConfiguration.compression` set, `StaticFiles` renders `br` and `gzip` variants of
+small files once into its cache (or takes `file.br`/`file.gz` sidecars), picks one per request
+(smallest at equal weight) and evaluates conditional requests against the variant's tag, so a
+variant hit costs no compression. Large files without sidecars carry no `Vary` and are streamed
+through the middleware.
+
+```swift
+var files = StaticFilesConfiguration()
+files.compression = CompressionConfiguration()
+let server = Server(listeners: [listener], protocols: [HTTP1()]) {
+    Compression()
+    StaticFiles(root: publicURL, configuration: files)
+}
+```
+
+The codecs come from the system: `libz` for gzip/deflate (`DeflateEncoder` also does raw
+deflate with sync flush for permessage-deflate, #0110) and `libcompression` for Brotli, loaded
+with `dlsym` because the target's name shadows the SDK's `Compression` module. Costs:
+docs/benchmarks/M6-compression.md.

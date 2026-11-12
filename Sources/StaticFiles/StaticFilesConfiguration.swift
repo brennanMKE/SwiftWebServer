@@ -1,3 +1,5 @@
+public import Compression
+
 /// Settings for ``StaticFiles`` (#0084). Immutable once the component is created.
 public struct StaticFilesConfiguration: Sendable {
     /// What to do with symbolic links found while resolving a request path (#0014).
@@ -60,6 +62,27 @@ public struct StaticFilesConfiguration: Sendable {
     /// How long a cached entry is served before the next request for it re-checks the file
     /// with `realpath` and `stat`. Changes on disk are visible after at most this long.
     public var revalidationInterval = Duration.seconds(1)
+
+    /// Encoded variants served from the cache (#0091); `nil` (the default) serves files as
+    /// they are. When set, a cached file whose type is in
+    /// ``CompressionConfiguration/mimeTypes`` gets its encoded variants built once, when it
+    /// enters the cache: from a sidecar (``precompressedSidecars``) or, for files held in
+    /// memory (≤ ``smallFileLimit``) of at least ``CompressionConfiguration/minimumSize``
+    /// bytes, compressed at ``CompressionConfiguration/precompressionLevel``. Requests are
+    /// negotiated on `Accept-Encoding` and answered with the stored variant, so a hit costs
+    /// no compression. Variants carry `Content-Encoding`, `Vary: Accept-Encoding` and a
+    /// suffixed strong `ETag` (`"…-br"`, `"…-gz"`, `"…-df"`) that conditional requests are
+    /// evaluated against. Large files without sidecars are left to the `Compression`
+    /// middleware, which streams them.
+    public var compression: CompressionConfiguration?
+
+    /// With ``compression`` set: serve `name.br` and `name.gz` found next to a file as its
+    /// `br` and `gzip` variants (any size; read into memory up to ``smallFileLimit``, else
+    /// sent from the open file). A sidecar must be a regular file (not a link) at least as
+    /// new as the file it encodes; an older one is ignored. Sidecars are looked up when the
+    /// file enters the cache, so replacing only a sidecar is seen once the file itself
+    /// changes or its entry is evicted. Default true.
+    public var precompressedSidecars = true
 
     public init() {}
 }

@@ -17,6 +17,15 @@ enum HTTP2MalformedRequest: Error, Hashable, Sendable {
     case contentLengthWithoutBody
     /// `host` names a different authority than `:authority` (§8.3.1).
     case hostMismatch
+    /// The header list is larger than our SETTINGS_MAX_HEADER_LIST_SIZE (#0055). Not malformed:
+    /// answered `431` when no field before the limit was malformed.
+    case fieldSectionTooLarge
+}
+
+/// The size of a header field list as SETTINGS_MAX_HEADER_LIST_SIZE counts it (RFC 9113
+/// §6.5.2): name and value octets plus 32 per field.
+enum HTTP2HeaderListSize {
+    static let fieldOverhead = 32
 }
 
 /// A validated request head and what the body checks need.
@@ -39,9 +48,13 @@ struct HTTP2RequestHead {
 /// - `cookie` crumbs (§8.2.3) are joined with `"; "` into one field for the handler.
 ///
 /// The first violation is kept; later fields are still decoded (HPACK must stay in step) but
-/// not stored.
+/// not stored. So is a header list past ``maxListSize`` (``HTTP2MalformedRequest/fieldSectionTooLarge``).
 struct HTTP2RequestFieldSink: HPACKFieldSink {
     let storage: HTTPRequestStorage
+    /// Our SETTINGS_MAX_HEADER_LIST_SIZE.
+    let maxListSize: Int
+    /// The header list size so far (§6.5.2).
+    var listSize = 0
     var validator = PseudoHeaderValidator(kind: .request)
     var failure: HTTP2MalformedRequest?
     var scheme = ByteView.empty
@@ -54,12 +67,18 @@ struct HTTP2RequestFieldSink: HPACKFieldSink {
     var firstCookie = ByteView.empty
     var moreCookies: [ByteView] = []
 
-    init(storage: HTTPRequestStorage) {
+    init(storage: HTTPRequestStorage, maxListSize: Int = .max) {
         self.storage = storage
+        self.maxListSize = maxListSize
     }
 
     mutating func field(name: Span<UInt8>, value: Span<UInt8>, representation: HPACKRepresentation) {
         guard failure == nil else { return }
+        listSize += name.count + value.count + HTTP2HeaderListSize.fieldOverhead
+        if listSize > maxListSize {
+            failure = .fieldSectionTooLarge
+            return
+        }
         if let violation = validator.handle(name: name, value: value) {
             failure = .field(violation)
             return
@@ -156,12 +175,21 @@ struct HTTP2RequestFieldSink: HPACKFieldSink {
 /// Collects a request's trailer section (RFC 9113 §8.1): regular, well-formed fields only.
 /// A pseudo-header or an invalid field makes the request malformed.
 struct HTTP2TrailerFieldSink: HPACKFieldSink {
+    /// Our SETTINGS_MAX_HEADER_LIST_SIZE: larger trailers make the request malformed.
+    var maxListSize = Int.max
+    var listSize = 0
     var validator = PseudoHeaderValidator(kind: .request)
     var failure: HTTP2MalformedRequest?
     var fields = HTTPFields()
 
     mutating func field(name: Span<UInt8>, value: Span<UInt8>, representation: HPACKRepresentation) {
         guard failure == nil else { return }
+        listSize += name.count + value.count + HTTP2HeaderListSize.fieldOverhead
+        if listSize > maxListSize {
+            failure = .fieldSectionTooLarge
+            fields = HTTPFields()
+            return
+        }
         if !name.isEmpty && name[0] == UInt8(ascii: ":") {
             failure = .field(.pseudoHeaderAfterRegularField)
             return
@@ -215,6 +243,39 @@ struct HTTP2ResponseHeadEncoder: Sendable {
         Self.encodeBlock(hpack: &hpack, block: &block, name: &name, status: status, headers: headers,
                          contentLength: contentLength)
         Self.frame(block: block, streamID: streamID, endStream: endStream, maxFrameSize: maxFrameSize, into: &out)
+    }
+
+    /// The header list size (§6.5.2) of the head ``encode`` would send, to check against the
+    /// peer's SETTINGS_MAX_HEADER_LIST_SIZE (#0055).
+    static func listSize(status: HTTPStatus, headers: HTTPFields, contentLength: Int?) -> Int {
+        let overhead = HTTP2HeaderListSize.fieldOverhead
+        var size = ":status".utf8.count + 3 + overhead
+        var sawContentLength = false
+        headers.withFieldStorage { index, _ in
+            for i in 0..<index.count {
+                let field = index[i]
+                switch field.name {
+                case .connection, .keepAlive, .proxyConnection, .transferEncoding, .upgrade:
+                    continue
+                case .contentLength:
+                    sawContentLength = true
+                default:
+                    break
+                }
+                if field.name.isPseudoHeader { continue }
+                size += field.nameView.length + field.valueView.length + overhead
+            }
+        }
+        if let contentLength, !sawContentLength {
+            var digits = 1
+            var value = contentLength
+            while value >= 10 {
+                value /= 10
+                digits += 1
+            }
+            size += "content-length".utf8.count + digits + overhead
+        }
+        return size
     }
 
     /// Builds the HPACK block in `block`. Static over disjoint `inout`s so the closures below

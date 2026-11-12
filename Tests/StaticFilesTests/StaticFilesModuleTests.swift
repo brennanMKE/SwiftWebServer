@@ -7,6 +7,6 @@ import StaticFiles
     }
 
     @Test func dependenciesMatchRoadmapLayering() {
-        #expect(StaticFilesModule.dependencies == ["HTTPCore"])
+        #expect(StaticFilesModule.dependencies == ["HTTPCore", "Compression"])
     }
 }
