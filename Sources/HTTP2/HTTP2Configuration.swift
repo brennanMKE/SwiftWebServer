@@ -101,4 +101,11 @@ public struct HTTP2Configuration: Sendable, Hashable {
             maxHeaderListSize: UInt32(maxHeaderListSize))
     }
 
+    /// The connection state machine's configuration.
+    public var connection: HTTP2Connection.Configuration {
+        HTTP2Connection.Configuration(
+            localSettings: localSettings,
+            connectionWindowSize: connectionWindowSize,
+            streams: HTTP2StreamTable.Configuration(maxConcurrentStreams: maxConcurrentStreams))
+    }
 }
