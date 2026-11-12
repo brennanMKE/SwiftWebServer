@@ -45,7 +45,7 @@ func get(_ files: StaticFiles, _ path: String, _ method: HTTPMethod = .get, head
 @Suite struct StaticVariantTests {
     let page = sampleText(40_000, seed: 11)
 
-    @Test(arguments: [("br", ContentCoding.brotli), ("gzip", .gzip), ("deflate", .deflate), ("gzip, br", .brotli)])
+    @Test(arguments: [("br", ContentCoding.brotli), ("gzip", .gzip), ("br;q=1, gzip;q=0.5", .brotli), ("x-gzip", .gzip)])
     func cachedVariantIsServed(_ accept: String, _ coding: ContentCoding) async throws {
         let site = try Site()
         try site.write("index.html", page)
@@ -65,6 +65,30 @@ func get(_ files: StaticFiles, _ path: String, _ method: HTTPMethod = .get, head
         #expect(encoded.header(.lastModified) == identity.header(.lastModified))
         let body = try await encoded.bodyBytes()
         #expect(ContentCodec.decode(body, coding) == page)
+    }
+
+    @Test func equalWeightsGetTheSmallestVariant() async throws {
+        let site = try Site()
+        try site.write("index.html", page)
+        // The brotli variant is the same bytes a one-shot encode gives.
+        let br = try #require(ContentCodec.encode(ByteBuffer(bytes: page), .brotli)).withUnsafeReadableBytes { Array($0) }
+        let files = try site.files()
+        let gzipSize = try await get(files, "/index.html", headers: [("Accept-Encoding", "gzip")]).bodyBytes().count
+        let brSize = try await get(files, "/index.html", headers: [("Accept-Encoding", "br")]).bodyBytes().count
+        #expect(brSize == br.count)
+        let both = try get(files, "/index.html", headers: [("Accept-Encoding", "gzip, deflate, br")])
+        #expect(both.header(.contentEncoding) == (brSize < gzipSize ? "br" : "gzip"))
+        #expect(try await both.bodyBytes().count == min(brSize, gzipSize))
+    }
+
+    @Test func deflateIsNotCachedSoDeflateOnlyClientsGetTheFile() async throws {
+        let site = try Site()
+        try site.write("index.html", page)
+        let files = try site.files()
+        let response = try get(files, "/index.html", headers: [("Accept-Encoding", "deflate")])
+        #expect(response.header(.contentEncoding) == nil)
+        #expect(response.headerValues(.vary) == ["Accept-Encoding"])
+        #expect(try await response.bodyBytes() == page)
     }
 
     @Test func repeatedRequestsShareOneCompressedBuffer() throws {
@@ -179,9 +203,6 @@ func get(_ files: StaticFiles, _ path: String, _ method: HTTPMethod = .get, head
         #expect(try await brotli.bodyBytes() == br)
         let gzip = try get(files, "/app.js", headers: [("Accept-Encoding", "gzip")])
         #expect(try await gzip.bodyBytes() == gz)
-        // deflate has no sidecar: compressed from the file.
-        let deflate = try get(files, "/app.js", headers: [("Accept-Encoding", "deflate")])
-        #expect(ContentCodec.decode(try await deflate.bodyBytes(), .deflate) == page)
     }
 
     @Test func staleOrLinkedSidecarsAreIgnored() async throws {

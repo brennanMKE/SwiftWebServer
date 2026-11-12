@@ -17,7 +17,10 @@ struct Precompression: Sendable {
     init(_ configuration: CompressionConfiguration, sidecars: Bool) {
         self.configuration = configuration
         types = CompressibleTypes(configuration.mimeTypes)
-        codings = configuration.availableEncodings.members
+        // `br` and `gzip` only: `deflate` would win every size tie-break against `gzip` by its
+        // 12-byte smaller framing, yet it is the legacy coding with the history of raw/zlib
+        // mix-ups. Clients that accept only `deflate` get the file unencoded.
+        codings = configuration.availableEncodings.members.filter { $0 != .deflate }
         self.sidecars = sidecars
     }
 }
@@ -37,6 +40,8 @@ final class CachedFile: Sendable {
     /// An encoded variant: its own `200` and `304` and its suffixed strong `ETag`.
     struct Variant: Sendable {
         let coding: ContentCoding
+        /// Encoded length in bytes.
+        let size: Int
         let etag: [UInt8]
         let response: HTTPResponse
         let notModified: HTTPResponse
@@ -47,10 +52,9 @@ final class CachedFile: Sendable {
     let identity: FileIdentity
     let content: Content
     let response: HTTPResponse
-    /// Encoded variants, in ``ContentCoding`` preference order; empty without precompression.
+    /// Encoded variants, smallest first (ties in ``ContentCoding`` preference order); empty
+    /// without precompression.
     let variants: [Variant]
-    /// The codings in ``variants``.
-    let variantCodings: ContentCodingSet
     /// The `304` for this version: `ETag`, `Last-Modified` and `Cache-Control` (the fields a
     /// `200` would carry that RFC 9110 §15.4.5 requires), no body and no `Content-Length`.
     /// The connection adds `Date`.
@@ -121,16 +125,19 @@ final class CachedFile: Sendable {
                 else { continue }
                 let variantTag = tag.withUnsafeReadableBytes { Array($0) }
                 let rendered = base.render(etag: variantTag, coding: coding, body: body)
-                variants.append(Variant(coding: coding, etag: variantTag, response: rendered.response,
-                                        notModified: rendered.notModified))
+                variants.append(Variant(coding: coding, size: body.knownLength ?? 0, etag: variantTag,
+                                        response: rendered.response, notModified: rendered.notModified))
             }
+            // Smallest first: among codings a client weights equally the smallest is sent.
+            // Brotli's built-in quality 2 can lose to gzip at level 9 on a variant compressed
+            // once; a `.br` sidecar made at quality 11 wins.
+            variants.sort { ($0.size, $0.coding.rawValue) < ($1.size, $1.coding.rawValue) }
             // A small file that no coding shrinks still varies: it was negotiated here, so
             // the Compression middleware must not try again on every request.
             if case .memory = content, identity.size >= Int64(precompression.configuration.minimumSize) { varies = true }
             if !variants.isEmpty { varies = true }
         }
         self.variants = variants
-        variantCodings = ContentCodingSet(variants.map(\.coding))
 
         let body: HTTPResponseBody
         switch content {
@@ -217,11 +224,21 @@ final class CachedFile: Sendable {
         return (file, sidecar.size)
     }
 
-    /// The variant for `coding`, which is in ``variantCodings``.
+    /// The variant to send for `weights` (as ``AcceptEncoding/select(_:available:)``, but
+    /// equal weights go to the smallest variant), or `nil` for the unencoded representation.
     @inline(__always)
-    func variant(_ coding: ContentCoding) -> Variant? {
-        for variant in variants where variant.coding == coding { return variant }
-        return nil
+    func selectVariant(_ weights: AcceptEncoding.Weights) -> Variant? {
+        var best = -1
+        var bestWeight: Int16 = 0
+        for i in variants.indices {
+            let weight = weights.weight(of: variants[i].coding)
+            if weight > bestWeight {
+                best = i
+                bestWeight = weight
+            }
+        }
+        guard best >= 0, weights.identity <= bestWeight else { return nil }
+        return variants[best]
     }
 
     /// `206` for `offset ..< offset + length`, which lies inside the file. Allocates (a header

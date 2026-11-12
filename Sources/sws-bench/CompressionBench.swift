@@ -32,13 +32,24 @@ func registerCompressionBenchmarks() {
     }
     hit("Compression.hit 50 KiB html, no precompression", precompressed: false, headers: { _ in [("Accept-Encoding", "br, gzip")] })
     hit("Compression.hit 50 KiB html, precompressed, identity", precompressed: true)
-    hit("Compression.hit 50 KiB html, precompressed, br variant", precompressed: true,
+    hit("Compression.hit 50 KiB html, precompressed, browser header (smallest variant)", precompressed: true,
         headers: { _ in [("Accept-Encoding", "gzip, deflate, br, zstd")] })
+    hit("Compression.hit 50 KiB html, precompressed, br variant", precompressed: true,
+        headers: { _ in [("Accept-Encoding", "br")] })
     hit("Compression.hit 50 KiB html, precompressed, gzip variant", precompressed: true,
         headers: { _ in [("Accept-Encoding", "deflate, gzip")] })
     hit("Compression.304 50 KiB html, br variant", precompressed: true) { files in
         let probe = CompressionFixture.request("/index.html", headers: [("Accept-Encoding", "br")])
         return [("Accept-Encoding", "br"), ("If-None-Match", files.respond(to: probe.1)?.headers.firstValueString(for: .etag) ?? "")]
+    }
+
+    for accept in ["gzip, deflate, br, zstd", "br;q=1.0, gzip;q=0.8, *;q=0.1"] {
+        var request: (HTTPRequestStorage, HTTPRequest)?
+        let all = ContentCodingSet(ContentCoding.allCases)
+        Benchmark.register(name: "Compression.negotiate \"\(accept)\"") {
+            if request == nil { request = CompressionFixture.request("/", headers: [("Accept-Encoding", accept)]) }
+            blackHole(AcceptEncoding.negotiate(request!.1.headers, available: all))
+        }
     }
 
     func dynamic(_ name: String, accept: String, type: String = "text/html", level: Int = 4) {

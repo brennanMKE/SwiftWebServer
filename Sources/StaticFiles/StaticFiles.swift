@@ -25,6 +25,10 @@ public import HTTPCore
 ///   `If-Unmodified-Since`, `If-None-Match`, `If-Modified-Since`, then `If-Range`. A `304`
 ///   carries `ETag`, `Last-Modified` and `Cache-Control` and no body; a failed `If-Match` or
 ///   `If-Unmodified-Since` answers `412`. Dates compare in whole seconds (#0017).
+/// - With ``StaticFilesConfiguration/compression`` (#0091), `br` and `gzip` variants are
+///   rendered once per cached file (or read from `.br`/`.gz` sidecars) and chosen per request
+///   from `Accept-Encoding`; preconditions are then evaluated against the variant's suffixed
+///   `ETag`.
 ///
 /// ## Hot path
 ///
@@ -115,11 +119,11 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
         case .response(let response): return response
         case .notFound: return nil
         }
-        // Precompressed variants (#0091): negotiated per request, rendered once. A Range
-        // request is answered from the unencoded representation.
-        if !entry.variants.isEmpty, !(isGet && request.headers.contains(.range)),
-           let coding = AcceptEncoding.negotiate(request.headers, available: entry.variantCodings),
-           let variant = entry.variant(coding) {
+        // Precompressed variants (#0091): negotiated per request, rendered once; equal weights
+        // get the smallest variant. A Range request is answered from the unencoded file.
+        if !entry.variants.isEmpty, request.headers.contains(.acceptEncoding),
+           !(isGet && request.headers.contains(.range)),
+           let variant = entry.selectVariant(AcceptEncoding.weights(request.headers)) {
             if ConditionalRequest.hasPreconditions(request.headers) {
                 switch ConditionalRequest.evaluate(method: request.method, fields: request.headers,
                                                    etag: variant.etag, lastModified: entry.lastModifiedSeconds) {

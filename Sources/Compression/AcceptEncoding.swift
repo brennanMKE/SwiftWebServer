@@ -40,12 +40,14 @@ public enum AcceptEncoding {
 
     /// The coding to apply for a request with `fields`, chosen among `available`, or `nil`
     /// to send the representation unencoded.
+    @inlinable
     public static func negotiate(_ fields: some HTTPFieldCollection, available: ContentCodingSet) -> ContentCoding? {
         guard !available.isEmpty, fields.contains(.acceptEncoding) else { return nil }
         return select(weights(fields), available: available)
     }
 
     /// The choice for already parsed `weights`.
+    @inlinable
     public static func select(_ weights: Weights, available: ContentCodingSet) -> ContentCoding? {
         var best: ContentCoding?
         var bestWeight: Int16 = 0
@@ -62,80 +64,121 @@ public enum AcceptEncoding {
     }
 
     /// The weights listed in every `Accept-Encoding` field of `fields`.
+    @inlinable
     public static func weights(_ fields: some HTTPFieldCollection) -> Weights {
-        var weights = Weights()
-        fields.forEachListElement(of: .acceptEncoding) { element in
-            fields.withSpan(of: element) { parse($0, into: &weights) }
+        // One pass over each field's bytes (no closure per element): this runs on every
+        // cached-variant hit.
+        fields.withFieldStorage { index, arena in
+            var weights = Weights()
+            var position = 0
+            while let i = index.firstIndex(of: .acceptEncoding, from: position) {
+                arena.withSpan(of: index.valueViews[i]) { scan($0, into: &weights) }
+                position = i &+ 1
+            }
+            return weights
         }
-        return weights
     }
 
     /// The weights of one header value such as `br;q=1.0, gzip;q=0.8, *;q=0` (for tests and
     /// callers holding raw bytes).
     public static func weights(value: Span<UInt8>) -> Weights {
         var weights = Weights()
-        var start = 0
-        var i = 0
-        while i <= value.count {
-            if i == value.count || value[i] == UInt8(ascii: ",") {
-                var lo = start
-                var hi = i
-                while lo < hi, value[lo] == 0x20 || value[lo] == 0x09 { lo &+= 1 }
-                while hi > lo, value[hi &- 1] == 0x20 || value[hi &- 1] == 0x09 { hi &-= 1 }
-                if hi > lo { parse(value.extracting(lo..<hi), into: &weights) }
-                start = i &+ 1
-            }
-            i &+= 1
-        }
+        scan(value, into: &weights)
         return weights
     }
 
-    /// Applies one list element, `coding *( OWS ";" OWS parameter )`.
-    static func parse(_ element: Span<UInt8>, into weights: inout Weights) {
-        var end = 0
-        while end < element.count, element[end] != UInt8(ascii: ";") { end &+= 1 }
-        var tokenEnd = end
-        while tokenEnd > 0, element[tokenEnd &- 1] == 0x20 || element[tokenEnd &- 1] == 0x09 { tokenEnd &-= 1 }
-        let token = element.extracting(0..<tokenEnd)
-        var weight: Int16 = 1000
-        // Parameters: only `q` matters; the last one given wins.
-        var i = end
-        while i < element.count {
-            // At a ";": skip it and OWS, then read `name=value` up to the next ";".
-            i &+= 1
-            while i < element.count, element[i] == 0x20 || element[i] == 0x09 { i &+= 1 }
-            var paramEnd = i
-            while paramEnd < element.count, element[paramEnd] != UInt8(ascii: ";") { paramEnd &+= 1 }
-            var valueEnd = paramEnd
-            while valueEnd > i, element[valueEnd &- 1] == 0x20 || element[valueEnd &- 1] == 0x09 { valueEnd &-= 1 }
-            let parameter = element.extracting(i..<valueEnd)
-            if parameter.count >= 2, parameter[0] | 0x20 == UInt8(ascii: "q") {
-                var j = 1
-                while j < parameter.count, parameter[j] == 0x20 || parameter[j] == 0x09 { j &+= 1 }
-                guard j < parameter.count, parameter[j] == UInt8(ascii: "=") else { return }
-                j &+= 1
-                while j < parameter.count, parameter[j] == 0x20 || parameter[j] == 0x09 { j &+= 1 }
-                guard let q = qvalue(parameter.extracting(j..<parameter.count)) else { return }
-                weight = q
+    /// Applies every comma-separated element of one field value:
+    /// `coding *( OWS ";" OWS name [ OWS "=" OWS value ] )`. Only the `q` parameter counts; an
+    /// element whose `q` is malformed, or with stray bytes, is ignored.
+    @usableFromInline
+    static func scan(_ value: Span<UInt8>, into weights: inout Weights) {
+        value.withUnsafeBufferPointer { scan($0, into: &weights) }
+    }
+
+    @usableFromInline
+    static func scan(_ p: UnsafeBufferPointer<UInt8>, into weights: inout Weights) {
+        let n = p.count
+        var i = 0
+        @inline(__always) func isOWS(_ c: UInt8) -> Bool { c == 0x20 || c == 0x09 }
+        while i < n {
+            var c = p[i]
+            if isOWS(c) || c == UInt8(ascii: ",") {
+                i &+= 1
+                continue
             }
-            i = paramEnd
-        }
-        func keep(_ slot: inout Int16) { if weight > slot { slot = weight } }
-        if ASCII.equalsCaseInsensitive(token, "br") {
-            keep(&weights.brotli)
-        } else if ASCII.equalsCaseInsensitive(token, "gzip") || ASCII.equalsCaseInsensitive(token, "x-gzip") {
-            keep(&weights.gzip)
-        } else if ASCII.equalsCaseInsensitive(token, "deflate") {
-            keep(&weights.deflate)
-        } else if ASCII.equalsCaseInsensitive(token, "identity") {
-            keep(&weights.identity)
-        } else if token.count == 1, token[0] == UInt8(ascii: "*") {
-            keep(&weights.any)
+            // The coding token, packed little-endian with the ASCII case bit set (see `pack`).
+            var packed: UInt64 = 0
+            var length = 0
+            while i < n {
+                c = p[i]
+                if c == UInt8(ascii: ";") || c == UInt8(ascii: ",") || isOWS(c) { break }
+                if length < 8 { packed |= UInt64(c | 0x20) &<< UInt64(length &* 8) }
+                length &+= 1
+                i &+= 1
+            }
+            var weight: Int16 = 1000
+            var valid = length <= 8
+            // Parameters up to the next comma.
+            while i < n, p[i] != UInt8(ascii: ",") {
+                c = p[i]
+                if isOWS(c) {
+                    i &+= 1
+                    continue
+                }
+                guard c == UInt8(ascii: ";") else {
+                    valid = false
+                    i &+= 1
+                    continue
+                }
+                i &+= 1
+                while i < n, isOWS(p[i]) { i &+= 1 }
+                let nameStart = i
+                while i < n, p[i] != UInt8(ascii: "="), p[i] != UInt8(ascii: ";"), p[i] != UInt8(ascii: ","), !isOWS(p[i]) {
+                    i &+= 1
+                }
+                let isQ = i &- nameStart == 1 && p[nameStart] | 0x20 == UInt8(ascii: "q")
+                while i < n, isOWS(p[i]) { i &+= 1 }
+                guard i < n, p[i] == UInt8(ascii: "=") else {
+                    if isQ { valid = false }
+                    continue
+                }
+                i &+= 1
+                while i < n, isOWS(p[i]) { i &+= 1 }
+                let valueStart = i
+                while i < n, p[i] != UInt8(ascii: ";"), p[i] != UInt8(ascii: ","), !isOWS(p[i]) { i &+= 1 }
+                if isQ {
+                    if let q = qvalue(UnsafeBufferPointer(rebasing: p[valueStart..<i])) {
+                        weight = q
+                    } else {
+                        valid = false
+                    }
+                }
+            }
+            guard valid else { continue }
+            // Constants are `pack` of each token (checked by the tests).
+            switch packed {
+            case 0x2A: weights.any = max(weights.any, weight)                                   // *
+            case 0x7262: weights.brotli = max(weights.brotli, weight)                          // br
+            case 0x7069_7A67, 0x7069_7A67_2D78: weights.gzip = max(weights.gzip, weight)       // gzip, x-gzip
+            case 0x65_7461_6C66_6564: weights.deflate = max(weights.deflate, weight)           // deflate
+            case 0x7974_6974_6E65_6469: weights.identity = max(weights.identity, weight)       // identity
+            default: break
+            }
         }
     }
 
+    /// `literal` (lowercase, at most 8 bytes) packed as ``parse(_:into:)`` packs tokens.
+    @usableFromInline @inline(__always)
+    static func pack(_ literal: StaticString) -> UInt64 {
+        var packed: UInt64 = 0
+        let base = literal.utf8Start
+        for k in 0..<literal.utf8CodeUnitCount { packed |= UInt64(base[k] | 0x20) &<< UInt64(k &* 8) }
+        return packed
+    }
+
     /// `qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )` in thousandths, or `nil`.
-    static func qvalue(_ bytes: Span<UInt8>) -> Int16? {
+    @usableFromInline
+    static func qvalue(_ bytes: UnsafeBufferPointer<UInt8>) -> Int16? {
         guard bytes.count >= 1, bytes.count <= 5 else { return nil }
         let first = bytes[0]
         guard first == UInt8(ascii: "0") || first == UInt8(ascii: "1") else { return nil }
@@ -145,7 +188,7 @@ public enum AcceptEncoding {
         var scale: Int16 = 100
         for i in 2..<bytes.count {
             let digit = bytes[i]
-            guard ASCII.isDigit(digit) else { return nil }
+            guard digit >= UInt8(ascii: "0"), digit <= UInt8(ascii: "9") else { return nil }
             value &+= Int16(digit &- UInt8(ascii: "0")) &* scale
             scale /= 10
         }
