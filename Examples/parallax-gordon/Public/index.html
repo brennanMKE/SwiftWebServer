@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System 1 on gordon</title>
+<style>
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; }
+  code { background: #f2f2f2; padding: 0 .25rem; border-radius: 3px; }
+  #health { font-weight: 600; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #ddd; } code { background: #222; } }
+</style>
+<h1>System 1 decision server</h1>
+<p>SwiftWebServer on this Mac reverse-proxies <code>/laya</code> to Laya
+(<code>laya-server</code>, running on the GPU with Metal) on <code>127.0.0.1</code>.</p>
+<p>Laya: <span id="health">checking…</span></p>
+<ul>
+  <li><code>GET /laya/health</code> — open</li>
+  <li><code>POST /laya/predict</code> — needs <code>Authorization: Bearer &lt;key&gt;</code></li>
+  <li><code>GET /laya/stats</code> — needs the same key</li>
+</ul>
+<script>
+fetch("/laya/health").then(r => r.ok ? r.json() : Promise.reject(r.status))
+  .then(j => { document.getElementById("health").textContent = j.ok ? "up" : "not ready"; })
+  .catch(e => { document.getElementById("health").textContent = "down (" + e + ")"; });
+</script>
+</html>
