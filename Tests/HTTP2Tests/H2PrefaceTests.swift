@@ -66,18 +66,29 @@ struct H2PrefaceTests {
 
     @Test func prefaceRoutesToHTTP2() async {
         let frames = H2FrameReader.frames(in: await route(clientStart))
-        // Our SETTINGS first; the frame loop (#0044) is not there yet, so a clean GOAWAY.
-        #expect(frames == [.settings(HTTP2Configuration().localSettings), .goaway(last: 0, .noError, debug: "NO_ERROR")])
+        // Our SETTINGS first, the connection window raise, then the ACK of theirs.
+        #expect(frames == [
+            .settings(HTTP2Configuration().localSettings),
+            .windowUpdate(stream: 0, HTTP2Configuration.defaultConnectionWindowSize - 65_535),
+            .settingsAck,
+        ])
     }
 
     @Test func prefaceSplitAtEveryByteRoutesToHTTP2() async {
-        let input = clientStart
-        let expected: [H2Frame] = [.settings(HTTP2Configuration().localSettings), .goaway(last: 0, .noError, debug: "NO_ERROR")]
+        let input = F.join(clientStart, F.ping(42))
+        let expected: [H2Frame] = [
+            .settings(HTTP2Configuration().localSettings),
+            .windowUpdate(stream: 0, HTTP2Configuration.defaultConnectionWindowSize - 65_535),
+            .settingsAck,
+            .ping(ack: true, 42),
+        ]
         var chunkings: [InMemoryTransport.Chunking] = [.bytewise]
         for split in 1..<input.readableBytes { chunkings.append(.pattern([split, .max])) }
         for chunking in chunkings {
             let frames = H2FrameReader.frames(in: await route(input, chunking: chunking))
-            #expect(frames == expected, "\(chunking)")
+            // Our SETTINGS is always first; the PING ACK may overtake the SETTINGS ACK.
+            #expect(frames.first == expected.first, "\(chunking)")
+            #expect(frames.count == expected.count && expected.allSatisfy(frames.contains), "\(chunking): \(frames)")
         }
     }
 
@@ -104,8 +115,8 @@ struct H2PrefaceTests {
         bad[20] = UInt8(ascii: "X")
         let info = ConnectionInfo(isSecure: true, negotiatedALPN: "h2")
         let frames = H2FrameReader.frames(in: await route(ByteBuffer(bytes: bad), info: info))
-        #expect(frames == [.settings(HTTP2Configuration().localSettings),
-                           .goaway(last: 0, .protocolError, debug: "PROTOCOL_ERROR")])
+        #expect(frames.count == 3)
+        #expect(frames.last == .goaway(last: 0, .protocolError, debug: "PROTOCOL_ERROR"))
     }
 
     @Test func firstFrameMustBeSettings() async {

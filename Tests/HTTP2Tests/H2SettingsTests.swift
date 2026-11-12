@@ -3,7 +3,7 @@ import HPACK
 import HTTPCore
 import Testing
 
-/// #0043: the SETTINGS exchange in the connection state machine.
+/// #0043: the SETTINGS exchange, as a state machine and over an in-memory connection.
 @Suite(.timeLimit(.minutes(1)))
 struct H2SettingsTests {
     typealias Event = HTTP2Connection.Event
@@ -173,5 +173,139 @@ struct H2SettingsTests {
         } else {
             #expect(action == .acknowledgeSettings(headerTableSize: nil), "\(name)")
         }
+    }
+
+    // MARK: Over a connection
+
+    /// Each invalid SETTINGS frame ends the connection with GOAWAY and the exact code.
+    @Test(arguments: [
+        ("ENABLE_PUSH 2", F.rawSettings([(0x2, 2)]), HTTP2ErrorCode.protocolError),
+        ("INITIAL_WINDOW_SIZE 2^31", F.rawSettings([(0x4, 0x8000_0000)]), .flowControlError),
+        ("MAX_FRAME_SIZE 16383", F.rawSettings([(0x5, 16_383)]), .protocolError),
+        ("MAX_FRAME_SIZE 2^24", F.rawSettings([(0x5, 1 << 24)]), .protocolError),
+        ("ACK with payload", F.rawSettings([(0x1, 0)], flags: .ack), .frameSizeError),
+        ("length not a multiple of 6", F.raw(type: .settings, streamID: 0, payload: [0, 1, 0, 0, 0]), .frameSizeError),
+        ("on a stream", F.rawSettings([], streamID: 1), .protocolError),
+    ])
+    func invalidSettingsEndTheConnection(name: String, frame: ByteBuffer, code: HTTP2ErrorCode) async throws {
+        try await withH2Connection { client in
+            try await client.handshake()
+            try await client.send(frame)
+            let frames = try await client.framesUntilClosed()
+            #expect(frames.last == .goaway(last: 0, code, debug: "\(code.name)"), "\(name): \(frames)")
+        }
+    }
+
+    @Test func unknownSettingsAreIgnoredAndAcknowledged() async throws {
+        try await withH2Connection { client in
+            try await client.send(F.preface, F.rawSettings([(0x99, 7), (0xff, 0xffff_ffff)]))
+            let frames = try await client.frames(until: { $0 == .settingsAck })
+            #expect(frames.last == .settingsAck)
+            #expect(!frames.contains { $0.isGoaway })
+        }
+    }
+
+    /// Our SETTINGS goes first, before the client's arrive; the client's are ACKed after.
+    @Test func ackTiming() async throws {
+        try await withH2Connection { client in
+            try await client.send(F.preface)
+            #expect(try await client.nextFrame() == .settings(HTTP2Configuration().localSettings))
+            #expect(try await client.nextFrame() == .windowUpdate(stream: 0, (1 << 20) - 65_535))
+            try await client.send(F.settings(HTTP2Settings(maxFrameSize: 20_000)))
+            #expect(try await client.nextFrame() == .settingsAck)
+            try await client.send(F.settingsAck)
+            try await client.send(F.ping(5))
+            #expect(try await client.nextFrame() == .ping(ack: true, 5))
+        }
+    }
+
+    /// A frame above 16,384 bytes is a FRAME_SIZE_ERROR until our larger MAX_FRAME_SIZE is
+    /// acknowledged, and accepted after.
+    @Test func largerFrameSizeAppliesOnlyAfterTheAck() async throws {
+        let config = HTTP2Configuration(maxFrameSize: 32_768)
+        let big = F.raw(type: HTTP2FrameType(rawValue: 0x42), streamID: 0, payload: Array(repeating: 7, count: 20_000))
+        try await withH2Connection(configuration: config) { client in
+            try await client.handshake()
+            try await client.send(big, F.ping(1))
+            let frames = try await client.frames(until: { $0 == .ping(ack: true, 1) })
+            #expect(frames.last == .ping(ack: true, 1), "\(frames)")
+        }
+        try await withH2Connection(configuration: config) { client in
+            try await client.send(F.preface, F.settings(), big)
+            let frames = try await client.framesUntilClosed()
+            #expect(frames.last == .goaway(last: 0, .frameSizeError, debug: "FRAME_SIZE_ERROR"), "\(frames)")
+        }
+    }
+
+    @Test func settingsTimeoutClosesTheConnection() async throws {
+        let config = HTTP2Configuration(settingsTimeout: .milliseconds(100))
+        let clock = ContinuousClock()
+        let start = clock.now
+        try await withH2Connection(configuration: config) { client in
+            try await client.send(F.preface, F.settings())
+            let frames = try await client.framesUntilClosed()
+            #expect(frames.last == .goaway(last: 0, .settingsTimeout, debug: "SETTINGS_TIMEOUT"), "\(frames)")
+        }
+        #expect(clock.now - start < .seconds(5))
+        // Acknowledged in time: no timeout.
+        try await withH2Connection(configuration: config) { client in
+            try await client.handshake()
+            try await Task.sleep(for: .milliseconds(300))
+            try await client.send(F.ping(3))
+            #expect(try await client.frames(until: { $0 == .ping(ack: true, 3) }).allSatisfy { !$0.isGoaway })
+        }
+    }
+
+    /// The peer's HEADER_TABLE_SIZE reaches the HPACK encoder in wire order: blocks queued
+    /// before the SETTINGS ACK use the old table, the first block after it starts with the size
+    /// update. A client decoder that applies the new limit at the ACK decodes every block.
+    @Test func headerTableSizeChangesReachHPACKInOrder() throws {
+        var shared = HTTP2SharedState(configuration: HTTP2Configuration())
+        var wakeups = HTTP2Wakeups()
+        _ = shared.handle(.start, wakeups: &wakeups)
+        _ = shared.handle(.settings(HTTP2Settings()), wakeups: &wakeups)
+        for id in [1, 3, 5] as [UInt32] {
+            _ = shared.handle(.headers(streamID: HTTP2StreamID(id), endStream: true, trailers: false), wakeups: &wakeups)
+        }
+        var headers = HTTPFields()
+        headers.append(name: "x-custom", value: "a value worth indexing")
+        func respond(_ id: UInt32) {
+            let step = shared.sendHeaders(streamID: HTTP2StreamID(id), status: .ok, headers: headers, contentLength: nil,
+                                          endStream: true, wakeups: &wakeups)
+            #expect(step == .sent(length: 0, endStream: true))
+        }
+        respond(1)
+        _ = shared.handle(.settings(HTTP2Settings(headerTableSize: 0)), wakeups: &wakeups)
+        respond(3)
+        _ = shared.handle(.settings(HTTP2Settings(headerTableSize: 256)), wakeups: &wakeups)
+        respond(5)
+        guard case .send(let batch) = shared.nextWriterStep(wakeups: &wakeups) else {
+            Issue.record("nothing queued")
+            return
+        }
+        var decoder = HPACKDecoder()
+        var blocks: [[UInt8]] = []
+        var acks = 0
+        for frame in H2FrameReader.frames(in: batch) {
+            switch frame {
+            case .settingsAck:
+                acks += 1
+                decoder.setMaxTableSizeLimit([4_096, 0, 256][acks - 1])
+            case .headers(_, _, _, let block):
+                blocks.append(block)
+                let fields = try decodeBlock(block, with: &decoder)
+                #expect(fields.map(\.0) == [":status", "x-custom"])
+            default:
+                break
+            }
+        }
+        #expect(acks == 3)
+        #expect(blocks.count == 3)
+        // The first block indexes the field; after the shrink to 0 the next one starts with
+        // a size update (001xxxxx) and the table is empty.
+        #expect(blocks[0].first! & 0xe0 != 0x20)
+        #expect(blocks[1].first! & 0xe0 == 0x20)
+        #expect(blocks[2].first! & 0xe0 == 0x20)
+        #expect(decoder.dynamicTable.maxSize == 256)
     }
 }
