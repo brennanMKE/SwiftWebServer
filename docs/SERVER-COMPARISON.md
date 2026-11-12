@@ -124,3 +124,20 @@ The new server serves the file from disk through StaticFiles on the default BSD 
 - With kept-alive connections the new server is second only to lighttpd: it beats nginx by 14–20% and h2o by 7–11%.
 - Closed-connection rows in the raw file have thousands of client-side errors (loopback ephemeral ports run out), so they are not used for ranking here. The dedicated accept benchmark (`scripts/bench-accept.sh`, #0113) measured the new server at about 21.9k new connections/s against nginx's 18.0k.
 - HTTP/2 (h2load, `-c 16 -m 10`, in-memory body): 374,655 req/s against nginx h2c's 135,367 req/s (`benchmarks/M13-h2.md`). h2spec passes 146/146.
+
+## Reverse proxy (#0124)
+
+Keep-alive hello world through each server's reverse proxy to the same upstream (`sws-bench
+serve`), 5 s per row with oha, loopback only, load average 6–10 (another build was running).
+Raw table and setup in [benchmarks/M17-proxy.md](benchmarks/M17-proxy.md); re-run with
+`scripts/guarded.sh -t 600 -- scripts/bench-proxy.sh 5 1 16 64`.
+
+| Path | c=1 req/s | c=16 req/s | c=64 req/s | p50 / p99 at 64, ms |
+|---|---:|---:|---:|---:|
+| upstream direct | 24,908 | 74,731 | 81,406 | 0.75 / 1.16 |
+| **SwiftWebServer `proxy`** | 11,585 | 31,045 | 33,864 | 1.82 / 2.59 |
+| Apache `mod_proxy` | 11,134 | 34,498 | 38,496 | 1.60 / 2.13 |
+| nginx `proxy_pass` | **15,033** | **40,707** | 37,066 | 1.74 / 2.16 |
+
+The SwiftWebServer proxy is on a par with Apache one request at a time and 10–20% behind
+Apache and nginx under concurrency; the per-read timeout race is the known cost to remove.
