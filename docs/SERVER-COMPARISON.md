@@ -107,3 +107,20 @@ Load average 4.7 at the start; other agents started building during the closed-c
 - **Serving from disk costs nothing measurable.** Keep-alive throughput went from 63k to 89k req/s against the earlier in-memory run. Most of that gain is probably the BSD socket transport (#0113), not StaticFiles (not measured separately). The new server is second only to lighttpd and 12–21% ahead of nginx. nginx still has the tighter p99 at 16 connections (0.27 ms against 0.61 ms). At 64 connections the new server's p99 of 1.07 ms beats nginx's 1.47 ms.
 - **New connections:** about 8,500 per second, 3.7× the Network.framework listener's 2,300, but under the load that rose during these rows. nginx still leads. Repeat on an idle machine before ranking.
 - **Large files:** `BSDSocketTransport.sendFile` now uses `sendfile(2)`. Serving a page-cached 512 MiB file to curl over loopback took 9.0 GB/s (median of 5) against 5.8 GB/s with the bounded `pread` loop on the same transport and 2.3 GB/s on Network.framework, with about 35% less server CPU than the `pread` loop. Measured at load average about 17, so treat these as relative figures. A 1 GiB download keeps server RSS flat at 8 MiB (`StaticFilesIntegrationTests`).
+
+## Latest run: end of day, 2026-11-11 (commit b6fc9a6)
+
+The new server serves the file from disk through StaticFiles on the default BSD socket transport. No agents were building, and the load average was 6–7. Raw output is in [benchmarks/compare-servers-final.md](benchmarks/compare-servers-final.md).
+
+| Server | Keep-alive, 16 conns | Keep-alive, 64 conns | p99 at 64 conns |
+|---|---:|---:|---:|
+| lighttpd | **103,737** | **122,251** | 0.98 ms |
+| **new server** | 93,132 | 97,265 | 0.99 ms |
+| h2o | 87,251 | 87,459 | 0.85 ms |
+| nginx | 81,572 | 81,023 | 1.03 ms |
+| Apache | 52,247 | 55,318 | 12.3 ms |
+| Caddy | 37,605 | 45,487 | 7.2 ms |
+
+- With kept-alive connections the new server is second only to lighttpd: it beats nginx by 14–20% and h2o by 7–11%.
+- Closed-connection rows in the raw file have thousands of client-side errors (loopback ephemeral ports run out), so they are not used for ranking here. The dedicated accept benchmark (`scripts/bench-accept.sh`, #0113) measured the new server at about 21.9k new connections/s against nginx's 18.0k.
+- HTTP/2 (h2load, `-c 16 -m 10`, in-memory body): 374,655 req/s against nginx h2c's 135,367 req/s (`benchmarks/M13-h2.md`). h2spec passes 146/146.
