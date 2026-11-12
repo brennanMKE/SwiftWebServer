@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import HTTP1
 import HTTP2
 import HTTPCore
@@ -133,6 +134,64 @@ struct H2CurlTests {
                 "-w", "\n%{http_code} %{http_version}", "http://127.0.0.1:\(port)/upload"])
             #expect(status == 0, "\(output)")
             #expect(output == "\(size) \(sum)\n200 2", "\(output)")
+        }
+    }
+    // MARK: Responses (#0049)
+
+    /// Serves files from `Root/Public` (`/` is `index.html`), with a short pause first so that
+    /// parallel requests overlap; records how many handlers ran at once.
+    final class PublicFilesHandler: HTTPHandler {
+        let inFlight = Mutex((now: 0, peak: 0))
+
+        func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse {
+            inFlight.withLock {
+                $0.now += 1
+                $0.peak = Swift.max($0.peak, $0.now)
+            }
+            defer { inFlight.withLock { $0.now -= 1 } }
+            try await Task.sleep(for: .milliseconds(20))
+            var path = request.string(of: request.path)
+            if path == "/" { path = "/index.html" }
+            guard !path.contains("..") else { return HTTPResponse(status: .notFound) }
+            do {
+                let file = try OwnedFileDescriptor.openForReading(path: TestIdentity.repositoryRoot + "/Root/Public" + path)
+                return HTTPResponse(body: .file(try FileRegion.entireFile(file)))
+            } catch {
+                return HTTPResponse(status: .notFound)
+            }
+        }
+    }
+
+    @Test func curlGetsTheIndexPage() async throws {
+        let index = try String(contentsOfFile: TestIdentity.repositoryRoot + "/Root/Public/index.html", encoding: .utf8)
+        try await Self.withServer(tls: false, handler: PublicFilesHandler()) { port, _ in
+            let (status, output) = try await Self.curl([
+                "-sS", "--http2-prior-knowledge", "--max-time", "10", "-w", "\n%{http_code} %{http_version}",
+                "http://localhost:\(port)/"])
+            #expect(status == 0, "\(output)")
+            #expect(output == index + "\n200 2")
+        }
+    }
+
+    /// 50 transfers with `--parallel` (`-Z`) share one connection as concurrent streams:
+    /// curl's verbose log shows one connection and multiplexing, and the handlers overlap.
+    @Test func curlFetchesFiftyURLsOverOneConnection() async throws {
+        let handler = PublicFilesHandler()
+        let files = ["/", "/index.html", "/favicon.ico", "/swift.png"]
+        try await Self.withServer(tls: false, handler: handler) { port, server in
+            var arguments = ["-sS", "-v", "--http2-prior-knowledge", "--max-time", "20", "-Z", "--parallel-max", "50",
+                             "-w", "%{http_code} %{http_version} %{num_connects}\\n"]
+            for i in 0..<50 { arguments += ["-o", "/dev/null", "http://127.0.0.1:\(port)\(files[i % files.count])"] }
+            let (status, output) = try await Self.curl(arguments)
+            #expect(status == 0, "\(output)")
+            let results = output.split(separator: "\n").filter { $0.hasPrefix("200 ") }
+            #expect(results.count == 50, "\(output)")
+            #expect(results.allSatisfy { $0.hasPrefix("200 2 ") }, "\(output)")
+            // Only one transfer had to connect; the rest multiplexed onto it.
+            #expect(results.filter { $0 == "200 2 1" }.count == 1, "\(output)")
+            #expect(output.lowercased().contains("multiplex"), "\(output)")
+            #expect(server.acceptedConnectionCount == 1)
+            #expect(handler.inFlight.withLock { $0.peak } > 1)
         }
     }
 }

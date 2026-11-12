@@ -64,6 +64,16 @@ import Darwin
 /// is credited at once, and a stream still sending when its response ends is reset with
 /// `NO_ERROR` (§8.1).
 ///
+/// ## Responses (#0049)
+///
+/// Each request runs the handler in its own child task, so streams are served concurrently.
+/// The response head is HPACK-encoded with `:status` first, lowercase names, the
+/// connection-specific fields removed and `content-length` added when the length is known;
+/// HEAD, 204 and 304 end the stream on HEADERS. The body becomes DATA frames no larger than the
+/// peer's MAX_FRAME_SIZE and both send windows, with END_STREAM on the last. A handler error
+/// before HEADERS is a `500`; a body that fails after them is `RST_STREAM(INTERNAL_ERROR)`.
+/// `HTTPResponse` has no trailers, so none are sent.
+///
 /// ## Not yet
 ///
 /// Per-stream cancellation on RST_STREAM (#0051), the PING round-trip on shutdown and idle
