@@ -9,6 +9,10 @@
 /// absolute form; the `host` field carries the authority.
 public struct HTTPRequest: Sendable {
     public var method: HTTPMethod
+    /// The protocol version the request arrived with: HTTP/1.0 or HTTP/1.1 from the request
+    /// line, ``HTTPVersion/http3`` on HTTP/3 (#0117). Runners that do not set it (HTTP/2 for
+    /// now) leave the default, HTTP/1.1.
+    public var version: HTTPVersion
     public var scheme: ByteView
     public var authority: ByteView
     /// The path, still percent-encoded (decoded once, on demand, in #0084).
@@ -26,9 +30,11 @@ public struct HTTPRequest: Sendable {
         path: ByteView,
         query: ByteView = .empty,
         headers: HTTPFieldsView,
-        body: HTTPRequestBody = .empty
+        body: HTTPRequestBody = .empty,
+        version: HTTPVersion = .http1_1
     ) {
         self.method = method
+        self.version = version
         self.scheme = scheme
         self.authority = authority
         self.path = path
@@ -78,8 +84,36 @@ public struct HTTPRequest: Sendable {
                 copy.fields.append(field.name, nameView: move(field.nameView), valueView: move(field.valueView))
             }
             return HTTPRequest(method: method, scheme: scheme, authority: authority, path: path,
-                               query: query, headers: copy.fieldsView, body: .empty)
+                               query: query, headers: copy.fieldsView, body: .empty, version: version)
         }
+    }
+}
+
+/// An HTTP protocol version (RFC 9110 §2.5): `major.minor` for HTTP/1.x, the major version
+/// alone for HTTP/2 and HTTP/3.
+public struct HTTPVersion: Sendable, Hashable, Comparable, CustomStringConvertible {
+    public var major: UInt8
+    public var minor: UInt8
+
+    @inlinable
+    public init(major: UInt8, minor: UInt8) {
+        self.major = major
+        self.minor = minor
+    }
+
+    public static let http1_0 = HTTPVersion(major: 1, minor: 0)
+    public static let http1_1 = HTTPVersion(major: 1, minor: 1)
+    public static let http2 = HTTPVersion(major: 2, minor: 0)
+    public static let http3 = HTTPVersion(major: 3, minor: 0)
+
+    @inlinable
+    public static func < (lhs: HTTPVersion, rhs: HTTPVersion) -> Bool {
+        (lhs.major, lhs.minor) < (rhs.major, rhs.minor)
+    }
+
+    /// `HTTP/1.1`, `HTTP/2`, `HTTP/3`.
+    public var description: String {
+        major >= 2 && minor == 0 ? "HTTP/\(major)" : "HTTP/\(major).\(minor)"
     }
 }
 

@@ -63,7 +63,7 @@ public enum H3RequestHeadDecoder {
         }
         return HTTPRequest(
             method: method, scheme: sink.scheme, authority: sink.authority, path: path, query: query,
-            headers: storage.fieldsView)
+            headers: storage.fieldsView, version: .http3)
     }
 
     /// Decodes a trailing HEADERS frame: only regular, well-formed fields are allowed

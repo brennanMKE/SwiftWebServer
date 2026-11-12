@@ -138,6 +138,21 @@ let echo = WebSocketUpgrade(path: "/ws") { socket, _ in
         }
     }
 
+    /// #0117: `Upgrade` is ignored on HTTP/1.0 (RFC 9110 §7.8): `400` on the component's
+    /// path, the next handler otherwise, never `101`.
+    @Test(.timeLimit(.minutes(1)))
+    func http10HandshakeIsRejected() async throws {
+        let http10 = handshake().replacingOccurrences(of: "HTTP/1.1", with: "HTTP/1.0")
+        try await withServer(echo, request: http10) { _, head, _ in
+            #expect(head.status == 400)
+            #expect(head.header("Sec-WebSocket-Accept") == nil)
+        }
+        let any = WebSocketUpgrade { _, _ in }
+        try await withServer(any, request: http10) { _, head, _ in
+            #expect(head.status == 404)
+        }
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func otherPathsGoToTheNextHandler() async throws {
         try await withServer(echo, request: handshake(path: "/other")) { _, head, _ in

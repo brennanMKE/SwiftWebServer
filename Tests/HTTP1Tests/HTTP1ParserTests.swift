@@ -266,8 +266,23 @@ import HTTPTestSupport
         #expect(request.string(of: request.query) == "b=c")
         #expect(request.headers.firstValueString(for: .host) == "example.com")
         #expect(request.headers.count == 2)
+        #expect(request.version == .http1_1)
         storage.endRequest()
         #expect(!request.isValid)
+    }
+
+    /// The request carries the request line's version (#0117).
+    @Test func requestCarriesTheHTTPVersion() throws {
+        let storage = HTTPRequestStorage(bufferCapacity: 1024, fieldCapacity: 16)
+        storage.buffer.append("GET / HTTP/1.0\r\n\r\n")
+        var parser = HTTP1Parser()
+        #expect(parser.parseHead(into: storage) == .complete)
+        let request = parser.head.request(in: storage)
+        #expect(request.version == .http1_0)
+        #expect(request.snapshot().version == .http1_0)
+        #expect(request.version.description == "HTTP/1.0")
+        #expect(HTTPVersion.http3.description == "HTTP/3")
+        #expect(HTTPVersion.http1_0 < .http1_1 && HTTPVersion.http1_1 < .http2)
     }
 
     /// Every corpus input gives the same outcome however it is split: at every single byte

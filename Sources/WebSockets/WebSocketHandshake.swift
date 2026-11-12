@@ -18,13 +18,16 @@ public enum WebSocketHandshake {
         case unsupportedVersion
         /// `Sec-WebSocket-Key` missing, repeated, or not the base64 of 16 bytes.
         case invalidKey
+        /// An HTTP/1.0 request: `Upgrade` is ignored there (RFC 9110 §7.8) and an HTTP/1.0
+        /// client must not get `101` (RFC 9110 §15.2); RFC 6455 §4.1 needs HTTP/1.1 (#0117).
+        case unsupportedHTTPVersion
 
         /// The response status: 426 for a missing upgrade or an unsupported version (with
         /// the headers that say what is supported), 400 for the rest.
         public var status: HTTPStatus {
             switch self {
             case .missingUpgrade, .unsupportedVersion: .upgradeRequired
-            case .methodNotGET, .missingConnectionUpgrade, .invalidKey: .badRequest
+            case .methodNotGET, .missingConnectionUpgrade, .invalidKey, .unsupportedHTTPVersion: .badRequest
             }
         }
 
@@ -48,18 +51,17 @@ public enum WebSocketHandshake {
     }
 
     /// True when the request asks for a WebSocket (`Upgrade: websocket`); whether it is a
-    /// valid handshake is ``validate(_:)``'s job.
+    /// valid handshake is ``validate(_:)``'s job. Always false for HTTP/1.0, whose `Upgrade`
+    /// field a server must ignore (RFC 9110 §7.8).
     public static func isUpgradeRequest(_ request: HTTPRequest) -> Bool {
-        request.headers.containsListElement("websocket", in: .upgrade)
+        request.version != .http1_0 && request.headers.containsListElement("websocket", in: .upgrade)
     }
 
     /// Checks the request line and fields of an opening handshake (RFC 6455 §4.2.1) and
-    /// returns the `Sec-WebSocket-Accept` value.
-    ///
-    /// The HTTP version is not visible to handlers; HTTP/1.1 is the only HTTP/1 version
-    /// whose connections can carry `101` with `Connection: upgrade` in practice, and the
-    /// key and version checks reject anything that is not a WebSocket client.
+    /// returns the `Sec-WebSocket-Accept` value. An HTTP/1.0 request is
+    /// ``Failure/unsupportedHTTPVersion`` (`400`), never `101`.
     public static func validate(_ request: HTTPRequest) throws(Failure) -> String {
+        guard request.version != .http1_0 else { throw .unsupportedHTTPVersion }
         guard request.method == .get else { throw .methodNotGET }
         guard isUpgradeRequest(request) else { throw .missingUpgrade }
         guard request.headers.containsListElement("upgrade", in: .connection) else { throw .missingConnectionUpgrade }
