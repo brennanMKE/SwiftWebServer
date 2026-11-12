@@ -50,7 +50,7 @@ public final class QUICStreamTransport: ByteStreamTransport, StreamIdentified {
         self.connection = connection
         self.isLocallyInitiated = isLocallyInitiated
         self.chunkSize = chunkSize
-        let core = Core(events: events)
+        let core = Core(isLocallyInitiated: isLocallyInitiated, events: events)
         self.core = core
         connection.stateUpdateHandler = { [core, weak connection] state in
             core.handle(state, connection: connection)
@@ -92,7 +92,7 @@ public final class QUICStreamTransport: ByteStreamTransport, StreamIdentified {
     /// The RESET_STREAM code this end sent.
     public var sentResetCode: UInt64? { core.state.withLock { $0.sentResetCode } }
     /// The code of the peer's RESET_STREAM, read from `streamApplicationErrorCode` when a
-    /// receive failed with a reset.
+    /// receive failed with a reset or the stream failed with one while nothing was pending.
     public var receivedResetCode: UInt64? { core.state.withLock { $0.receivedResetCode } }
     /// The peer's code read when a send failed (STOP_SENDING); `nil` if none was observed.
     public var receivedStopSendingCode: UInt64? { core.state.withLock { $0.receivedStopSendingCode } }
@@ -343,9 +343,11 @@ extension QUICStreamTransport {
         }
 
         let state = Mutex(State())
+        let isLocallyInitiated: Bool
         let events: Events
 
-        init(events: Events) {
+        init(isLocallyInitiated: Bool, events: Events) {
+            self.isLocallyInitiated = isLocallyInitiated
             self.events = events
         }
 
@@ -508,6 +510,13 @@ extension QUICStreamTransport {
                 events.ready(id)
                 waiter?.resume()
             case .failed(let error):
+                // A peer RESET_STREAM / STOP_SENDING fails the stream even with no receive or
+                // send pending (#0104 observation 6). Under load that can happen before the
+                // next receive is issued, which then fails from the stored failure without
+                // reading the code (#0115), so read it here too.
+                if case .posix(.ECONNRESET) = error {
+                    recordPeerAbortCode(connection?.quicMetadata.flatMap { quicCode($0.streamApplicationErrorCode) })
+                }
                 fail(TransportError(quic: error))
                 connection?.cancel()
             case .cancelled:
@@ -519,6 +528,23 @@ extension QUICStreamTransport {
                 break
             @unknown default:
                 break
+            }
+        }
+
+        /// The stream failed with a peer abort while possibly nothing was pending: keeps the
+        /// peer's code as the RESET_STREAM code if this end still receives (input neither ended
+        /// nor locally unidirectional), else as the STOP_SENDING code. A code that matches what
+        /// this end sent is our own reset echoed back, not the peer's. First code wins.
+        private func recordPeerAbortCode(_ code: UInt64?) {
+            guard let code else { return }
+            state.withLock { state in
+                guard code != state.sentResetCode else { return }
+                let receives = !state.receive.inputEnded && !(isLocallyInitiated && (state.streamID ?? 0) & 0x2 != 0)
+                if receives {
+                    if state.receivedResetCode == nil { state.receivedResetCode = code }
+                } else if state.receivedStopSendingCode == nil {
+                    state.receivedStopSendingCode = code
+                }
             }
         }
 
