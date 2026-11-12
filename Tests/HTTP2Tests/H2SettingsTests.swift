@@ -35,7 +35,7 @@ struct H2SettingsTests {
             .settingsAck, .ping(ack: false, opaqueData: 1), .goaway(lastStreamID: .connection, .noError),
             .windowUpdate(streamID: .connection, increment: 1), .rstStream(streamID: HTTP2StreamID(1), .cancel),
             .priority(streamID: HTTP2StreamID(1)), .headers(streamID: HTTP2StreamID(1), endStream: true, trailers: false),
-            .data(streamID: HTTP2StreamID(1), flowControlledLength: 0, endStream: true), .unknownFrame,
+            .data(streamID: HTTP2StreamID(1), dataLength: 0, flowControlledLength: 0, endStream: true), .unknownFrame,
             .streamError(.stream(HTTP2StreamID(1), .frameSizeError, reason: "x")),
         ]
         for event in events {

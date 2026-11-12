@@ -18,6 +18,13 @@ struct H2CurlTests {
     static func withServer(
         tls: Bool, _ body: @Sendable (UInt16, Server<TCPListener, HelloHandler>) async throws -> Void
     ) async throws {
+        try await withServer(tls: tls, handler: HelloHandler(), body)
+    }
+
+    static func withServer<H: HTTPHandler>(
+        tls: Bool, handler: H, http2: HTTP2Configuration = HTTP2Configuration(), drainTimeout: Duration = .seconds(2),
+        _ body: @Sendable (UInt16, Server<TCPListener, H>) async throws -> Void
+    ) async throws {
         var tlsConfiguration: TLSConfiguration?
         if tls {
             let material = try TestIdentity.load()
@@ -27,8 +34,8 @@ struct H2CurlTests {
         let listener = try TCPListener(
             configuration: .init(host: "127.0.0.1", port: 0, tcp: TCPConfiguration(allowLocalEndpointReuse: false)),
             tls: tlsConfiguration)
-        let server = Server(configuration: ServerConfiguration(drainTimeout: .seconds(2)),
-                            listeners: [listener], protocols: protocols, handler: HelloHandler())
+        let server = Server(configuration: ServerConfiguration(drainTimeout: drainTimeout),
+                            listeners: [listener], protocols: [HTTP2(configuration: http2), HTTP1()], handler: handler)
         try await withThrowingTaskGroup { group in
             group.addTask { try await server.run() }
             defer { server.requestShutdown() }
@@ -89,6 +96,43 @@ struct H2CurlTests {
             #expect(lines.count == 10, "\(output)")
             #expect(lines.allSatisfy { $0 == "200 2" }, "\(output)")
             #expect(server.acceptedConnectionCount == 1)
+        }
+    }
+    // MARK: Request bodies (#0048)
+
+    /// Answers a POST with its body's length and byte sum, read as the client sends it.
+    struct BodySumHandler: HTTPHandler {
+        func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse {
+            var count = 0
+            var sum: UInt64 = 0
+            for try await chunk in request.body {
+                count += chunk.readableBytes
+                chunk.withUnsafeReadableBytes { for byte in $0 { sum &+= UInt64(byte) } }
+            }
+            return HTTPResponse(body: .bytes(ByteBuffer(bytes: Array("\(count) \(sum)".utf8))))
+        }
+    }
+
+    /// `curl --data-binary @file` with a body many times the stream window: it arrives whole,
+    /// paced by the WINDOW_UPDATEs the handler's reads return.
+    @Test func curlPostsALargeBody() async throws {
+        let size = 3 * 1024 * 1024 + 17
+        var bytes = [UInt8](repeating: 0, count: size)
+        var seed: UInt64 = 0x9E37_79B9_7F4A_7C15
+        for i in 0..<size {
+            seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            bytes[i] = UInt8(truncatingIfNeeded: seed >> 33)
+        }
+        let sum = bytes.reduce(UInt64(0)) { $0 &+ UInt64($1) }
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("sws-h2-body-\(UUID().uuidString).bin")
+        try Data(bytes).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        try await Self.withServer(tls: false, handler: BodySumHandler()) { port, _ in
+            let (status, output) = try await Self.curl([
+                "-sS", "--http2-prior-knowledge", "--max-time", "20", "--data-binary", "@\(file.path)",
+                "-w", "\n%{http_code} %{http_version}", "http://127.0.0.1:\(port)/upload"])
+            #expect(status == 0, "\(output)")
+            #expect(output == "\(size) \(sum)\n200 2", "\(output)")
         }
     }
 }

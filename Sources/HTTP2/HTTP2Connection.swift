@@ -14,8 +14,10 @@
 /// - "the first frame after the preface is SETTINGS" (§3.4): anything else is `PROTOCOL_ERROR`;
 /// - the ``HTTP2StreamTable`` (stream states and identifier rules);
 /// - connection-level receive accounting: DATA beyond the receive window is
-///   `FLOW_CONTROL_ERROR`, and every DATA payload (delivered or ignored, padding included)
-///   is credited back with a connection WINDOW_UPDATE once half the window is consumed;
+///   `FLOW_CONTROL_ERROR`. Padding and DATA that is not delivered (ignored or refused streams)
+///   are credited back at once; DATA delivered to a request body is credited when the handler
+///   consumes it (``Event/bodyConsumed(streamID:length:streamIncrement:)``). Credit goes back
+///   with a connection WINDOW_UPDATE once half the window is pending;
 /// - send windows (§6.9): the connection window and one window per stream with a response in
 ///   progress, moved by WINDOW_UPDATE and by changes to the peer's INITIAL_WINDOW_SIZE;
 /// - PING replies, GOAWAY on connection errors (once), and the graceful GOAWAY.
@@ -67,8 +69,14 @@ public struct HTTP2Connection: Sendable {
         /// A complete header block (HEADERS and its CONTINUATIONs). `trailers` when it is the
         /// stream's second block (``HeaderBlockAssembler/Kind/trailers``).
         case headers(streamID: HTTP2StreamID, endStream: Bool, trailers: Bool)
-        /// The start of a DATA frame; `flowControlledLength` includes padding.
-        case data(streamID: HTTP2StreamID, flowControlledLength: Int, endStream: Bool)
+        /// The start of a DATA frame: `dataLength` payload bytes; `flowControlledLength`
+        /// includes padding.
+        case data(streamID: HTTP2StreamID, dataLength: Int, flowControlledLength: Int, endStream: Bool)
+        /// `length` bytes of DATA that ``Action/acceptData(connectionIncrement:)`` delivered were
+        /// consumed by the handler (or discarded). Their connection credit is returned; the
+        /// body also hands back `streamIncrement` of stream credit, sent while the peer may
+        /// still send on the stream. The body's `next()` is the pull signal #0053 builds on.
+        case bodyConsumed(streamID: HTTP2StreamID, length: Int, streamIncrement: UInt32?)
         /// A frame of an unknown type (ignored, but it is still "a frame" for §3.4).
         case unknownFrame
         /// A frame-level stream error reported by the parser.
@@ -105,8 +113,15 @@ public struct HTTP2Connection: Sendable {
         /// header table limits to the frame parser and HPACK decoder.
         case applyLocalSettings(HTTP2Settings)
         case sendPingAck(opaqueData: UInt64)
-        /// Send a connection-level WINDOW_UPDATE.
-        case sendWindowUpdate(increment: UInt32)
+        /// Send a connection WINDOW_UPDATE of `connectionIncrement` and a WINDOW_UPDATE of
+        /// `streamIncrement` on `streamID`, each when set.
+        case sendWindowUpdate(connectionIncrement: UInt32?, streamID: HTTP2StreamID, streamIncrement: UInt32?)
+        /// The DATA frame's payload belongs to the stream's request body: deliver it, and
+        /// report it with ``Event/bodyConsumed(streamID:length:streamIncrement:)`` once
+        /// consumed or discarded. `connectionIncrement` is credit to return now (padding).
+        case acceptData(connectionIncrement: UInt32?)
+        /// A trailer section completed the stream's request: decode it for the body.
+        case acceptTrailers(streamID: HTTP2StreamID)
         /// A request head is complete on a new stream: decode it and serve it.
         case dispatch(streamID: HTTP2StreamID, endStream: Bool)
         /// Send RST_STREAM. `windowIncrement`, when set, is connection credit to return with a
@@ -241,7 +256,7 @@ public struct HTTP2Connection: Sendable {
             if let error = requirePeerSettings() { return error }
             switch streams.handle(.received(id, .headers(endStream: endStream))) {
             case .proceed:
-                if trailers { return .none }  // Request trailers are delivered with bodies (#0048).
+                if trailers { return .acceptTrailers(streamID: id) }
                 sendWindows[id.rawValue] = peerInitialWindowSize
                 return .dispatch(streamID: id, endStream: endStream)
             case .ignore: return .none
@@ -249,9 +264,18 @@ public struct HTTP2Connection: Sendable {
             case .connectionError(let code): return fail(.connection(code, reason: "HEADERS on stream \(id)"))
             }
 
-        case .data(let id, let length, let endStream):
+        case .data(let id, let dataLength, let length, let endStream):
             if let error = requirePeerSettings() { return error }
-            return data(id, length: length, endStream: endStream)
+            return data(id, dataLength: dataLength, length: length, endStream: endStream)
+
+        case .bodyConsumed(let id, let length, let streamIncrement):
+            let connection = credit(length)
+            var stream: UInt32?
+            if let streamIncrement, let state = streams.stream(id)?.state, state == .open || state == .halfClosedLocal {
+                stream = streamIncrement
+            }
+            guard connection != nil || stream != nil else { return .none }
+            return .sendWindowUpdate(connectionIncrement: connection, streamID: id, streamIncrement: stream)
 
         case .unknownFrame:
             if let error = requirePeerSettings() { return error }
@@ -363,30 +387,39 @@ public struct HTTP2Connection: Sendable {
         }
     }
 
-    private mutating func data(_ id: HTTP2StreamID, length: Int, endStream: Bool) -> Action {
+    private mutating func data(_ id: HTTP2StreamID, dataLength: Int, length: Int, endStream: Bool) -> Action {
         // Connection-level accounting applies to every DATA frame, whatever the stream's state.
         connectionReceiveWindow -= length
         guard connectionReceiveWindow >= 0 else {
             return fail(.connection(.flowControlError, reason: "DATA beyond the connection window"))
         }
-        // The body is not buffered here (request bodies arrive with #0048), so the credit is
-        // returned at once, batched until half the window is consumed.
-        pendingReceiveCredit += length
-        var credit: UInt32?
-        if pendingReceiveCredit * 2 >= Int(configuration.connectionWindowSize) {
-            credit = UInt32(pendingReceiveCredit)
-            connectionReceiveWindow += pendingReceiveCredit
-            pendingReceiveCredit = 0
-        }
         switch streams.handle(.received(id, .data(endStream: endStream))) {
-        case .proceed, .ignore:
-            return credit.map { .sendWindowUpdate(increment: $0) } ?? .none
+        case .proceed:
+            // The payload goes to the request body and is credited as it is consumed; the
+            // padding is credited now.
+            return .acceptData(connectionIncrement: credit(length - dataLength))
+        case .ignore:
+            guard let increment = credit(length) else { return .none }
+            return .sendWindowUpdate(connectionIncrement: increment, streamID: .connection, streamIncrement: nil)
         case .streamError(let code):
             sendWindows.removeValue(forKey: id.rawValue)
-            return .resetStream(streamID: id, code, windowIncrement: credit)
+            return .resetStream(streamID: id, code, windowIncrement: credit(length))
         case .connectionError(let code):
             return fail(.connection(code, reason: "DATA on stream \(id)"))
         }
+    }
+
+    /// Adds `length` bytes of connection credit; returns the WINDOW_UPDATE increment once half
+    /// the window is pending.
+    private mutating func credit(_ length: Int) -> UInt32? {
+        pendingReceiveCredit += length
+        guard pendingReceiveCredit > 0, pendingReceiveCredit * 2 >= Int(configuration.connectionWindowSize) else {
+            return nil
+        }
+        let increment = UInt32(pendingReceiveCredit)
+        connectionReceiveWindow += pendingReceiveCredit
+        pendingReceiveCredit = 0
+        return increment
     }
 
     private mutating func sendData(_ id: HTTP2StreamID, length: Int, endStream: Bool) -> Action {

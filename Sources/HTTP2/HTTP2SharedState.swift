@@ -67,16 +67,20 @@ struct HTTP2OutboundQueue: Sendable {
     }
 }
 
-/// Continuations to resume once the lock is released (ROADMAP §5.4: never inside the lock).
+/// Continuations to resume once the lock is released (ROADMAP §5.4: never inside the lock),
+/// and request bodies to end there (ending one resumes its reader and returns credit).
 struct HTTP2Wakeups: Sendable {
     var writer: CheckedContinuation<Void, Never>?
     var waiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+    /// Bodies of streams that were reset.
+    var resetBodies: [HTTP2BodyChannel] = []
 
     init() {}
 
     func resume() {
         writer?.resume()
         for waiter in waiters.values { waiter.resume() }
+        for body in resetBodies { body.fail(TransportError.connectionReset) }
     }
 }
 
@@ -104,6 +108,10 @@ struct HTTP2SharedState: Sendable {
     var activeStreams = 0
     /// The graceful GOAWAY was sent: close once the last stream finishes.
     var draining = false
+    /// Request bodies of streams whose handler runs and whose peer may still send DATA
+    /// (#0048). The reader adds and completes them; a reset or the end of the handler removes
+    /// them.
+    var bodies: [UInt32: HTTP2BodyChannel] = [:]
 
     init(configuration: HTTP2Configuration) {
         machine = HTTP2Connection(configuration: configuration.connection)
@@ -122,9 +130,20 @@ struct HTTP2SharedState: Sendable {
     /// settings and dispatches streams; stream writers learn whether to send).
     mutating func handle(_ event: HTTP2Connection.Event, wakeups: inout HTTP2Wakeups) -> HTTP2Connection.Action {
         let action = machine.handle(event)
+        if case .rstStream(let id, _) = event, let body = bodies.removeValue(forKey: id.rawValue) {
+            // The peer reset the stream: its body ends and what is buffered is credited.
+            wakeups.resetBodies.append(body)
+        }
         switch action {
-        case .none, .applyLocalSettings, .send, .sendData, .waitForWindow, .drop:
+        case .none, .applyLocalSettings, .send, .sendData, .waitForWindow, .drop, .acceptTrailers:
             break
+
+        case .acceptData(let increment):
+            if let increment {
+                HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: increment, into: &outbound.priority)
+                if let flood = countControlFrame(wakeups: &wakeups) { return flood }
+                wakeWriter(&wakeups)
+            }
 
         case .dispatch:
             // Counted in the same critical section as the decision, so a graceful shutdown
@@ -153,12 +172,19 @@ struct HTTP2SharedState: Sendable {
             if let flood = countControlFrame(wakeups: &wakeups) { return flood }
             wakeWriter(&wakeups)
 
-        case .sendWindowUpdate(let increment):
-            HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: increment, into: &outbound.priority)
+        case .sendWindowUpdate(let connectionIncrement, let id, let streamIncrement):
+            // Neither has an ordering constraint with other frames: the priority lane.
+            if let connectionIncrement {
+                HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: connectionIncrement, into: &outbound.priority)
+            }
+            if let streamIncrement {
+                HTTP2FrameEncoder.encodeWindowUpdate(streamID: id, increment: streamIncrement, into: &outbound.priority)
+            }
             if let flood = countControlFrame(wakeups: &wakeups) { return flood }
             wakeWriter(&wakeups)
 
         case .resetStream(let id, let code, let increment):
+            if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
             HTTP2FrameEncoder.encodeRSTStream(streamID: id, code, into: &outbound.ordered)
             if let increment {
                 HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: increment, into: &outbound.priority)
@@ -295,6 +321,8 @@ struct HTTP2SharedState: Sendable {
     /// graceful drain after the last stream.
     mutating func streamEnded(_ streamID: HTTP2StreamID, wakeups: inout HTTP2Wakeups) {
         activeStreams -= 1
+        // DATA that still arrives has no reader: the reader credits it at once.
+        bodies.removeValue(forKey: streamID.rawValue)
         if isOpen { _ = handle(.responseFinished(streamID: streamID), wakeups: &wakeups) }
         if draining && activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
     }
