@@ -11,12 +11,15 @@
 /// | ``rejectedOverConcurrencyLimit`` | stream | RESET_STREAM + STOP_SENDING | `H3_REQUEST_REJECTED` |
 /// | ``headerTimeout`` | stream | RESET_STREAM + STOP_SENDING | `H3_REQUEST_REJECTED` |
 /// | ``bodyTimeout`` | stream | RESET_STREAM + STOP_SENDING | `H3_REQUEST_CANCELLED` |
+/// | ``requestCancelled`` | stream | RESET_STREAM + STOP_SENDING | `H3_REQUEST_CANCELLED` |
+/// | ``sendTimeout`` | stream | RESET_STREAM + STOP_SENDING | `H3_REQUEST_CANCELLED` |
 /// | ``responseFailed`` | stream | RESET_STREAM | `H3_INTERNAL_ERROR` |
 /// | ``unreadBodyAbandoned`` | stream | STOP_SENDING | `H3_NO_ERROR` |
 /// | ``unknownStreamType`` | stream | STOP_SENDING | `H3_STREAM_CREATION_ERROR` |
 /// | ``protocolViolation(_:)`` | connection | CONNECTION_CLOSE | its `H3_*` code |
 /// | ``qpackFailure(code:)`` | connection | CONNECTION_CLOSE | its `QPACK_*` code |
 /// | ``localStreamFailure`` | connection | CONNECTION_CLOSE | `H3_INTERNAL_ERROR` |
+/// | ``excessiveLoad(_:)`` | connection | CONNECTION_CLOSE | `H3_EXCESSIVE_LOAD` |
 /// | ``gracefulShutdown`` | connection | CONNECTION_CLOSE | `H3_NO_ERROR` |
 /// | ``idleTimeout`` | connection | CONNECTION_CLOSE | `H3_NO_ERROR` |
 /// | ``drainTimeout`` | connection | CONNECTION_CLOSE | `H3_NO_ERROR` |
@@ -46,6 +49,12 @@ public enum H3Failure: Sendable, Hashable {
     /// The handler waited longer than ``H3Timeouts/body`` for body bytes after its response had
     /// started (before that, the answer is `408`).
     case bodyTimeout
+    /// The handler was cancelled (or threw `CancellationError`), or the peer abandoned the
+    /// request (RESET_STREAM or STOP_SENDING) before its response was complete (#0104).
+    case requestCancelled
+    /// One response send waited longer than ``H3Timeouts/send``: a client that does not read
+    /// (#0104).
+    case sendTimeout
     /// The response failed after its head was sent (a `.stream` writer or file read threw).
     case responseFailed
     /// The response is complete but the request body is not; it is no longer read (§4.1.1).
@@ -61,6 +70,8 @@ public enum H3Failure: Sendable, Hashable {
     case qpackFailure(code: UInt64)
     /// Our control or QPACK streams could not be opened.
     case localStreamFailure
+    /// The peer went over one of the ``H3AbuseLimits`` (#0104).
+    case excessiveLoad(H3AbuseKind)
     /// The drain after GOAWAY finished.
     case gracefulShutdown
     /// The connection had no request stream for ``H3Timeouts/idle``.
@@ -103,7 +114,7 @@ public enum H3Failure: Sendable, Hashable {
             .resetStream(code: HTTP3Error.requestIncomplete.rawValue)
         case .rejectedAfterGoaway, .rejectedOverConcurrencyLimit, .headerTimeout:
             .resetStream(code: HTTP3Error.requestRejected.rawValue)
-        case .bodyTimeout:
+        case .bodyTimeout, .requestCancelled, .sendTimeout:
             .resetStream(code: HTTP3Error.requestCancelled.rawValue)
         case .responseFailed:
             .resetSending(code: HTTP3Error.internalError.rawValue)
@@ -117,6 +128,8 @@ public enum H3Failure: Sendable, Hashable {
             .closeConnection(code: code)
         case .localStreamFailure:
             .closeConnection(code: HTTP3Error.internalError.rawValue)
+        case .excessiveLoad:
+            .closeConnection(code: HTTP3Error.excessiveLoad.rawValue)
         case .gracefulShutdown, .idleTimeout, .drainTimeout:
             .closeConnection(code: HTTP3Error.noError.rawValue)
         }

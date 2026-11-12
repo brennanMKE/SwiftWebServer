@@ -30,12 +30,20 @@ final class H3BodyChannel: HTTPRequestBodySource {
     let streamID: UInt64
     /// Limits the handler's waits for body bytes (``H3Timeouts/body``), when set.
     let watch: H3StreamWatch?
+    /// Counts live channels (#0104 leak checks).
+    let tracker: H3ConnectionTracker?
     private let state = Mutex(State())
 
-    init(capacity: Int, streamID: UInt64, watch: H3StreamWatch? = nil) {
+    init(capacity: Int, streamID: UInt64, watch: H3StreamWatch? = nil, tracker: H3ConnectionTracker? = nil) {
         queue = BoundedAsyncQueue(capacity: capacity)
         self.streamID = streamID
         self.watch = watch
+        self.tracker = tracker
+        tracker?.bodyChannelCreated()
+    }
+
+    deinit {
+        tracker?.bodyChannelReleased()
     }
 
     /// True when the body ended with an error.

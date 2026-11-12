@@ -233,3 +233,50 @@ Tests: `Tests/NetworkTransportTests/MultiplexedTransportConformanceTests.swift` 
 against both implementations. `QUICTransportTests.swift` covers a raw `NWConnectionGroup`
 client, stream bounds, credit, the identity loader, the state machines, and one
 `curl --http3-only -k` request served with the spike's hand-encoded HTTP/3 response.
+
+## Peer aborts and the connection close code (#0104)
+
+### Peer aborts while nothing is pending
+
+`QUICStreamTransport` is `PeerAbortObserving` (HTTPCore): `waitForPeerAbort()` returns when the
+peer resets the stream or sends STOP_SENDING, even if no receive or send is in progress.
+HTTP/3 uses it to cancel a handler that is still computing after the request ended.
+
+6. **A peer abort fails the stream `NWConnection` on its own.** With the request already read
+   to FIN and nothing pending, a peer `reset(applicationError:)`, `forceCancel()` or even a
+   plain `cancel()` of its stream moved the server's stream to `.failed(ECONNRESET)` (then
+   `.cancelled`) within a few milliseconds; the next send failed with `connectionReset`.
+   `waitForPeerAbort()` resumes on that state change, on a receive or send failing with
+   `connectionReset`, or on the stream ending. A raw NW receive issued after FIN completes at
+   once with `ENOMSG`, so polling receives would not work.
+
+### Spike open question 6: is our CONNECTION_CLOSE code on the wire? No.
+
+`QUICConnection.close(applicationError:)` sets the group's
+`NWProtocolQUIC.Metadata.applicationError` and cancels the group. To see what reaches the
+peer, `Tests/NetworkTransportTests/QUICCloseCodeTests.swift` runs Homebrew curl (ngtcp2)
+through a loopback UDP relay (`UDPRelay`) that keeps every datagram, with `SSLKEYLOGFILE` and
+`QLOGDIR` set. It decrypts the server's 1-RTT packets after the close with curl's
+`SERVER_TRAFFIC_SECRET_0` (`QUICShortHeaderDecryptor`; NW and curl negotiate
+TLS_AES_256_GCM_SHA384 on loopback) and reads curl's qlog. No capture, root or new installs.
+
+7. **Network.framework never sends an application CONNECTION_CLOSE (0x1d).** In 20+ runs with
+   codes 0x100 and 0x107, both with the adapter's close (reset every stream, then cancel the
+   group) and with only setting `applicationError` and cancelling the group:
+   - after the cancel the server sends only STOP_SENDING / RESET_STREAM with code 0 for every
+     stream, plus STOP_SENDING and a FIN on server-initiated stream 1, which it never opened
+     (compare observation 3 above);
+   - curl then closes the connection itself (transport NO_ERROR after a reset request stream,
+     or transport INTERNAL_ERROR after the unexpected stream 1);
+   - the only CONNECTION_CLOSE from the server, in some runs, is a transport one (0x1c) with
+     NO_ERROR, mostly sent after curl's own close.
+
+   So the code we pass to `close(applicationError:)` (`H3_NO_ERROR`, `H3_EXCESSIVE_LOAD`,
+   `H3_CLOSED_CRITICAL_STREAM`, ...) does not reach the peer over Network.framework. This is a
+   **known limitation**: a peer sees the connection end, but not why. Per-stream codes
+   (RESET_STREAM, STOP_SENDING) do reach it. The in-memory transport still reports the code
+   (`peerCloseApplicationError`), so HTTP/3 tests assert it there. The probe test records
+   "our code arrived" as a known issue, so it reports when a macOS release starts sending it.
+
+The abuse limits that end with `H3_EXCESSIVE_LOAD` (#0104) therefore look like a plain
+connection teardown to an NW-hosted server's peer.

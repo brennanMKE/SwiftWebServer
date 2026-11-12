@@ -52,6 +52,27 @@ struct H3ShutdownTests {
         #expect(calls.withLock { $0 } == 2)
     }
 
+    /// #0104: the race behind the flaky failure of the test above. A stream reaches the server
+    /// when the client opens it, so the server can reject it after GOAWAY (RESET_STREAM +
+    /// STOP_SENDING) before the client's HEADERS send runs; that send then throws
+    /// `connectionReset`. `H3TestClient.send` treats it as the rejection it is.
+    @Test func streamRejectedBeforeItsHeadersAreSentStillReportsTheResetCode() async throws {
+        let shutdown = ShutdownSignal()
+        try await withH3Server(handler: PathHandler(), shutdown: shutdown) { client, _ in
+            var inbound = client.inboundStreams.makeAsyncIterator()
+            var control = H3ControlReader(stream: try #require(try await inbound.next()))
+            shutdown.trigger()
+            #expect(try await control.nextGoaway() == 0)
+            let stream = try await client.openBidirectionalStream()
+            try await waitUntil { stream.receivedStopSendingCode != nil }
+            await #expect(throws: TransportError.connectionReset) {
+                try await stream.send(ByteBuffer(bytes: H3Wire.headers(H3Wire.request())), endOfStream: true)
+            }
+            #expect(await H3TestResponse.read(stream).resetCode == HTTP3Error.requestRejected.rawValue)
+            #expect(try await H3TestClient(transport: client).send().resetCode == HTTP3Error.requestRejected.rawValue)
+        }
+    }
+
     @Test func goawayIDFollowsTheLastRequestAndTheCloseFollowsTheLinger() async throws {
         let shutdown = ShutdownSignal()
         let configuration = H3Configuration(timeouts: H3Timeouts(closeLinger: .milliseconds(100)))
