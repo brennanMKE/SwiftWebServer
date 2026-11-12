@@ -32,8 +32,8 @@
 
 ## 🌍 Virtual Hosting
 
-* [ ] Define HostConfig mapping domains to roots
-* [ ] Route requests based on Host header
+* [x] Define HostConfig mapping domains to roots (#0092: `hosts` key)
+* [x] Route requests based on Host header (#0092: `VirtualHosts`)
 
 ## 🧩 Extension Support
 
