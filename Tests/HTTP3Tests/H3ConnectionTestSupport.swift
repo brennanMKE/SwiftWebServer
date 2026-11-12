@@ -17,12 +17,13 @@ func withH3Server<H: HTTPHandler, R: Sendable>(
     configuration: H3Configuration = H3Configuration(),
     shutdown: ShutdownSignal = ShutdownSignal(),
     serverTransport: InMemoryMultiplexedTransport.Configuration = InMemoryMultiplexedTransport.Configuration(),
+    tracker: H3ConnectionTracker = H3ConnectionTracker(),
     _ body: (InMemoryMultiplexedTransport, InMemoryMultiplexedTransport) async throws -> R
 ) async throws -> R {
     let (client, server) = InMemoryMultiplexedTransport.makePair(server: serverTransport)
     return try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask {
-            await HTTP3(configuration: configuration).run(
+            await HTTP3(configuration: configuration, tracker: tracker).run(
                 server, handler: handler, context: ConnectionContext(info: server.info, shutdown: shutdown))
         }
         do {
@@ -134,7 +135,14 @@ struct H3TestClient {
     ) async throws -> H3TestResponse {
         var bytes = H3Wire.headers(fields)
         if let body { bytes += H3Wire.data(body) }
-        let stream = try await openRequest(bytes)
+        let stream = try await transport.openBidirectionalStream()
+        do {
+            try await stream.send(ByteBuffer(bytes: bytes), endOfStream: true)
+        } catch TransportError.connectionReset {
+            // The stream reaches the server when it is opened, so the server can refuse it
+            // (RESET_STREAM + STOP_SENDING, e.g. after GOAWAY) before this send runs. The send
+            // then fails; the response read below reports the server's reset code.
+        }
         return await H3TestResponse.read(stream)
     }
 }

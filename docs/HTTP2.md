@@ -180,6 +180,26 @@ Pure Swift target `HPACK` with no Foundation:
 | `timeouts.drain` | off | After the final GOAWAY; off leaves it to the server's drain deadline |
 | `timeouts.goawayGrace` | off | When set, a first GOAWAY with 2^62-4, the final one after this |
 | `timeouts.closeLinger` | 1 s | After the drain, before CONNECTION_CLOSE (ends early when the peer closes) |
+| `timeouts.send` | 30 s | One response send waits (send budget or a client that does not read): RESET_STREAM `H3_REQUEST_CANCELLED` |
+
+### HTTP/3 abuse limits (#0104)
+
+`H3AbuseLimits` in `H3Configuration.abuseLimits`, the h3 counterparts of the DoS list above.
+Counts are per connection, in a fixed window (`window`, 10 s) that starts at the first event.
+Over Network.framework the CONNECTION_CLOSE code does not reach the peer
+(`docs/notes/nw-transport.md`, spike Q6); the connection still closes.
+
+| Setting | Default | Abuse | Response |
+|---|---|---|---|
+| `maxAbortedRequestsPerWindow` | 100 | Rapid reset: request streams reset or STOP_SENDING'd by the peer before the response completed, or ended without a request | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
+| `maxIgnoredUniStreamsPerWindow` | 16 | Reserved/unknown unidirectional streams (each refused with STOP_SENDING `H3_STREAM_CREATION_ERROR`) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
+| `maxQPACKInstructionsPerWindow` | 1,000 | QPACK encoder/decoder stream instruction floods (with table capacity 0, Set Dynamic Table Capacity 0 is a free no-op) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
+| `maxControlFramesPerWindow` | 1,000 | Control-stream frame floods (any type, unknown included) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
+| `maxUnknownRequestFramesPerWindow` | 1,000 | Reserved/unknown frames on request streams | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
+| `maxUnknownFrameLength` | 16 KiB | One reserved/unknown frame's declared length, any stream (skipped, never buffered) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
+| `maxConnectionSendBuffer` | 4 MiB | Response bytes held in sends across the connection (slow readers); per stream, the transport holds at most one chunk plus its own buffer | Further sends wait; `timeouts.send` resets stalled streams |
+| `maxIdleConnections` | 1,000 | Connections of one `HTTP3` value with no open request | The longest-idle one: GOAWAY, then CONNECTION_CLOSE `H3_NO_ERROR` |
+| (always) | | Handler cancelled, or the peer abandoned the request | RESET_STREAM `H3_REQUEST_CANCELLED` |
 
 ## Configuration additions
 
