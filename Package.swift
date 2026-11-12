@@ -40,7 +40,7 @@ let libraries: [Library] = [
     Library("HPACK", dependencies: ["HeaderCompression", "HTTPCore"]),
     Library("QPACK", dependencies: ["HeaderCompression", "HTTPCore"]),
     // Optional protocols
-    Library("HTTP2", dependencies: ["HPACK", "HTTPCore"]),
+    Library("HTTP2", dependencies: ["HPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "HTTPServer", "HTTP1", "NetworkTransport"]),
     Library("HTTP3", dependencies: ["QPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "NetworkTransport"]),
     Library("WebSockets", dependencies: ["HTTPCore"]),
     // Optional components

@@ -11,14 +11,17 @@ import Synchronization
 ///    the choice to the server).
 /// 3. With a single protocol, it serves every connection; nothing is read ahead.
 /// 4. Otherwise the first bytes are sniffed: each protocol's
-///    ``ConnectionProtocol/matchesCleartextPreface(_:)`` is asked in registration order and the
-///    first ``SniffResult/match`` wins. The sniffed bytes are replayed to the chosen protocol.
+///    ``ConnectionProtocol/matchesCleartextPreface(_:)`` is asked in registration order, and
+///    the first one that has not ruled the bytes out decides: ``SniffResult/match`` selects it,
+///    ``SniffResult/needMoreBytes`` reads more (even if a later protocol already matches). So
+///    `[HTTP2(), HTTP1()]` routes a preface split anywhere to HTTP/2. The sniffed bytes are
+///    replayed to the chosen protocol.
 ///    A client that sends too little within ``sniffTimeout`` is closed.
 ///
 /// A connection no protocol accepts is closed with ``CloseReason/protocolError``.
 ///
 /// ``alpnTokens`` is what a TLS listener should offer: `TLSConfiguration(alpn:)` in
-/// NetworkTransport. `h2` is offered only once an HTTP/2 protocol is registered (Track B).
+/// NetworkTransport. `h2` is offered when `HTTP2` is registered (#0042).
 public struct ProtocolRegistry: Sendable {
     /// The registered protocols, in priority order.
     public let protocols: [any ConnectionProtocol]
@@ -73,15 +76,16 @@ public struct ProtocolRegistry: Sendable {
         }
         if secure, let index = index(forALPN: Self.defaultALPN) { return .selected(index: index) }
         if protocols.count == 1 { return .selected(index: 0) }
-        var undecided = false
         for (index, proto) in protocols.enumerated() {
             switch type(of: proto).matchesCleartextPreface(preface) {
             case .match: return .selected(index: index)
-            case .needMoreBytes: undecided = true
-            case .noMatch: break
+            // An earlier protocol may still match: it has priority over later ones that
+            // already do (HTTP/1.1 matches `PRI ` long before the HTTP/2 preface is complete).
+            case .needMoreBytes: return .needMoreBytes
+            case .noMatch: continue
             }
         }
-        return undecided ? .needMoreBytes : .unsupported
+        return .unsupported
     }
 
     private func index(forALPN token: String) -> Int? {
