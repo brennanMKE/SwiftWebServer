@@ -32,6 +32,13 @@ load average and method; the rules for recording are in
   per-read timeout race (about 17 allocations and 8–10 µs per request); a kqueue-armed
   deadline is the planned fix.
 
+## Tried and dropped: SIMD and Accelerate
+
+SIMD scanning made WebSocket UTF-8 validation about 3x faster and small-frame unmasking about 2x faster, but it
+didn't change requests per second: the server's own code is about 0.3 µs of a roughly 22 µs request. Accelerate
+has nothing for byte parsing. The experiment wasn't merged; the measurements are in
+[`../notes/simd-accelerate.md`](../notes/simd-accelerate.md).
+
 ## Measuring yourself
 
 ```bash

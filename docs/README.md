@@ -11,7 +11,7 @@
 | [MIDDLEWARE.md](MIDDLEWARE.md) | Middleware builder, `RequestContext` and server components (#0083) |
 | [PROJECT.md](PROJECT.md) | Historical: original description of the deleted legacy server |
 | [TODO.md](TODO.md) | Historical: original to-do list; superseded by `issues/` |
-| `notes/` | Technical findings (e.g. Span availability) |
+| `notes/` | Technical findings (e.g. Span availability; the dropped SIMD/Accelerate experiment in `notes/simd-accelerate.md`) |
 | `spikes/` | Spike reports (e.g. QUIC) |
 | `benchmarks/` | Per-milestone benchmark results |
 
