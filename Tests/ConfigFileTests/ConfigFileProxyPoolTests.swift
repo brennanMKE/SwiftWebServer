@@ -23,6 +23,18 @@ import Testing
         #expect(mount.rewriteCookiePath)
     }
 
+    /// #0124: a `maxIdle` over the client's default per-target cap (16) raises the cap, so the
+    /// setting takes effect (it was silently capped at 16, churning upstream connections).
+    @Test func largeMaxIdleRaisesTheClientCap() throws {
+        #expect(try parse("{}").settings.upstreamClientConfiguration.maxIdlePerTarget == 16)
+        let file = try parse("""
+            {"proxy": [{"path": "/a", "upstream": "http://127.0.0.1:9000", "pool": {"maxIdle": 4}}],
+             "hosts": [{"names": ["a.test"], "root": "x",
+                        "proxy": [{"path": "/b", "upstream": "http://127.0.0.1:9001", "pool": {"maxIdle": 512}}]}]}
+            """)
+        #expect(file.settings.upstreamClientConfiguration.maxIdlePerTarget == 512)
+    }
+
     @Test func defaultsAndOff() throws {
         let file = try parse("""
             {"proxy": {"path": "/api", "upstream": "http://127.0.0.1:9000", "pool": {"maxConnections": 0, "idleTimeout": 0}}}

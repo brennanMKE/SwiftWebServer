@@ -70,7 +70,7 @@ extension ServerSettings {
         // #0124: one upstream client (and pool) for every mount, server-level and per site.
         let mounts = proxyMounts
         let siteMounts = hosts.contains { !$0.proxy.isEmpty }
-        let client = mounts.isEmpty && !siteMounts ? nil : UpstreamHTTP1Client()
+        let client = mounts.isEmpty && !siteMounts ? nil : UpstreamHTTP1Client(configuration: upstreamClientConfiguration)
         let serverProxy = mounts.isEmpty ? nil : client.map { ReverseProxy(mounts: mounts, client: $0) }
         let terminal: EitherHandler<VirtualHosts, StaticFiles>
         if hosts.isEmpty {
@@ -120,6 +120,14 @@ extension ServerSettings {
     }
 
     static func handler(_ handler: some HTTPHandler) -> some HTTPHandler { handler }
+
+    /// The shared upstream client's settings. The client caps every mount's `pool.maxIdle` at
+    /// its own per-target limit (default 16), so that limit is raised to the largest
+    /// configured `maxIdle`; otherwise a larger setting would be silently ignored.
+    var upstreamClientConfiguration: UpstreamHTTP1Client.Configuration {
+        let configured = (proxy + hosts.flatMap(\.proxy)).map(\.pool.maxIdle).max() ?? 0
+        return UpstreamHTTP1Client.Configuration(maxIdlePerTarget: max(configured, UpstreamPoolPolicy().maxIdle))
+    }
 
     static func describe(_ error: ErrorPages.InitError, root: String, pages: [Int: String]) -> ConfigFileError {
         switch error {
