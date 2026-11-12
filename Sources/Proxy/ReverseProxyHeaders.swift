@@ -30,61 +30,169 @@ enum ReverseProxyHeaders {
             || connectionTokens.contains(lowercasedName)
     }
 
-    static func stripHopByHop(_ fields: HTTPFields) -> HTTPFields {
-        let tokens = connectionTokens(fields)
-        var out = HTTPFields()
-        for i in 0..<fields.count {
-            let name = fields.nameString(at: i)
-            if isHopByHop(name.lowercased(), connectionTokens: tokens) { continue }
-            out.append(name: name, value: fields.valueString(at: i))
+    /// Whether the field at `i` is hop-by-hop (RFC 9110 §7.6.1): a fixed hop-by-hop name, any
+    /// `Proxy-*`, or a name listed in `Connection`. On bytes, without building strings.
+    static func isHopByHop(at i: Int, index: HTTPFieldIndex, arena: ByteBuffer, hasConnection: Bool) -> Bool {
+        let name = index.names[i]
+        switch name {
+        case .connection, .keepAlive, .te, .trailer, .transferEncoding, .upgrade,
+             .proxyConnection, .proxyAuthenticate, .proxyAuthorization:
+            return true
+        default:
+            break
         }
-        return out
+        if name == .unknown, arena.withSpan(of: index.nameViews[i], { startsWithCaseInsensitive($0, "proxy-") }) {
+            return true
+        }
+        guard hasConnection else { return false }
+        return name == .unknown
+            ? arena.withSpan(of: index.nameViews[i]) { isNamedByConnection($0, index: index, arena: arena) }
+            : name.canonicalName.withUTF8Buffer { isNamedByConnection($0.span, index: index, arena: arena) }
     }
 
+    /// Whether some `Connection` field lists `name` (any case).
+    static func isNamedByConnection(_ name: Span<UInt8>, index: HTTPFieldIndex, arena: ByteBuffer) -> Bool {
+        var position = 0
+        while let c = index.firstIndex(of: .connection, from: position) {
+            let found = arena.withSpan(of: index.valueViews[c]) { value in
+                var start = 0
+                while start <= value.count {
+                    var end = start
+                    while end < value.count, value[end] != 0x2C { end += 1 }
+                    var s = start
+                    var e = end
+                    while s < e, value[s] == 0x20 || value[s] == 0x09 { s += 1 }
+                    while e > s, value[e - 1] == 0x20 || value[e - 1] == 0x09 { e -= 1 }
+                    if equalsCaseInsensitive(value.extracting(s..<e), name) { return true }
+                    start = end + 1
+                }
+                return false
+            }
+            if found { return true }
+            position = c + 1
+        }
+        return false
+    }
+
+    static func equalsCaseInsensitive(_ a: Span<UInt8>, _ b: Span<UInt8>) -> Bool {
+        guard a.count == b.count else { return false }
+        for i in a.indices where ASCII.lowercased(a[i]) != ASCII.lowercased(b[i]) { return false }
+        return true
+    }
+
+    static func startsWithCaseInsensitive(_ bytes: Span<UInt8>, _ prefix: StaticString) -> Bool {
+        prefix.withUTF8Buffer { p in
+            guard bytes.count >= p.count else { return false }
+            for i in 0..<p.count where ASCII.lowercased(bytes[i]) != p[i] { return false }
+            return true
+        }
+    }
+
+    /// `fields` without hop-by-hop fields, copied by bytes.
+    static func stripHopByHop(_ fields: HTTPFields) -> HTTPFields {
+        fields.withFieldStorage { index, arena in
+            let hasConnection = index.contains(.connection)
+            var out = HTTPFields(minimumCapacity: index.count, arenaCapacity: arena.readableBytes)
+            for i in 0..<index.count where !isHopByHop(at: i, index: index, arena: arena, hasConnection: hasConnection) {
+                out.append(i, of: fields)
+            }
+            return out
+        }
+    }
+
+    /// The upstream request's fields: the client's without hop-by-hop fields, pseudo-headers,
+    /// `Host`, `Expect` (the downstream protocol already answered it; see
+    /// `UpstreamHTTP1Client`) and forwarded fields, then the forwarded fields the mount asks for.
+    /// From a peer in `mount.trustedProxies` the incoming forwarded chain is kept and extended.
     static func requestHeaders(_ fields: HTTPFieldsView, mount: ProxyMount, clientHost: String?,
                                connection: ConnectionInfo) -> HTTPFields {
-        let tokens = connectionTokens(fields)
-        var out = HTTPFields()
-        for i in 0..<fields.count {
-            let name = fields.nameString(at: i)
-            let lower = name.lowercased()
-            if isHopByHop(lower, connectionTokens: tokens) || replaced.contains(lower) { continue }
-            if lower.hasPrefix(":") { continue }
-            out.append(name: name, value: fields.valueString(at: i))
-        }
         let peer = connection.remoteAddress?.host
-        let proto = connection.isSecure ? "https" : "http"
+        let trusted = mount.trustedProxies.containsAddress(peer)
+        var out = fields.withFieldStorage { index, arena in
+            let hasConnection = index.contains(.connection)
+            var out = HTTPFields(minimumCapacity: index.count + 4, arenaCapacity: arena.readableBytes + 128)
+            for i in 0..<index.count {
+                let name = index.names[i]
+                switch name {
+                case .host, .expect, .forwarded, .xForwardedFor, .xForwardedHost, .xForwardedProto: continue
+                default: if name.isPseudoHeader { continue }
+                }
+                if name == .unknown,
+                   arena.withSpan(of: index.nameViews[i], { ASCII.equalsCaseInsensitive($0, "x-forwarded-prefix") }) {
+                    continue
+                }
+                if isHopByHop(at: i, index: index, arena: arena, hasConnection: hasConnection) { continue }
+                out.append(i, of: fields)
+            }
+            return out
+        }
+        let proto: StaticString = connection.isSecure ? "https" : "http"
         switch mount.forwardedHeaders {
         case .xForwarded:
-            appendXForwarded(&out, peer: peer, proto: proto, host: clientHost, prefix: mount.path)
+            appendXForwarded(&out, incoming: fields, trusted: trusted, peer: peer, proto: proto, host: clientHost, prefix: mount.path)
         case .forwarded:
-            appendForwarded(&out, peer: peer, proto: proto, host: clientHost)
+            appendForwarded(&out, incoming: fields, trusted: trusted, peer: peer, proto: proto, host: clientHost)
         case .both:
-            appendXForwarded(&out, peer: peer, proto: proto, host: clientHost, prefix: mount.path)
-            appendForwarded(&out, peer: peer, proto: proto, host: clientHost)
+            appendXForwarded(&out, incoming: fields, trusted: trusted, peer: peer, proto: proto, host: clientHost, prefix: mount.path)
+            appendForwarded(&out, incoming: fields, trusted: trusted, peer: peer, proto: proto, host: clientHost)
         case .none:
             break
         }
         return out
     }
 
-    static func appendXForwarded(_ out: inout HTTPFields, peer: String?, proto: String,
-                                 host: String?, prefix: String) {
-        if let peer { out.append(name: "X-Forwarded-For", value: peer) }
-        out.append(name: "X-Forwarded-Proto", value: proto)
-        if let host { out.append(name: "X-Forwarded-Host", value: host) }
+    static func appendXForwarded(_ out: inout HTTPFields, incoming: HTTPFieldsView, trusted: Bool, peer: String?,
+                                 proto: StaticString, host: String?, prefix: String) {
+        if trusted && incoming.contains(.xForwardedFor) {
+            var chain = ByteBuffer()
+            incoming.combinedValue(for: .xForwardedFor, into: &chain)
+            if let peer {
+                chain.append(", ")
+                chain.append(contentsOf: peer.utf8)
+            }
+            chain.withReadableSpan { out.append(.xForwardedFor, value: $0) }
+        } else if let peer {
+            out.append(.xForwardedFor, string: peer)
+        }
+        if trusted, let i = incoming.firstIndex(named: "x-forwarded-proto") {
+            out.append(i, of: incoming)
+        } else {
+            out.append(.xForwardedProto, proto)
+        }
+        if trusted, let i = incoming.firstIndex(named: "x-forwarded-host") {
+            out.append(i, of: incoming)
+        } else if let host {
+            out.append(.xForwardedHost, string: host)
+        }
         out.append(name: "X-Forwarded-Prefix", value: prefix)
     }
 
-    /// RFC 7239 `Forwarded`.
-    static func appendForwarded(_ out: inout HTTPFields, peer: String?, proto: String, host: String?) {
-        var parts: [String] = []
-        if let peer {
-            parts.append(peer.contains(":") ? "for=\"[\(peer)]\"" : "for=\(peer)")
+    /// RFC 7239 `Forwarded`: one element per proxy, appended to a trusted peer's list.
+    static func appendForwarded(_ out: inout HTTPFields, incoming: HTTPFieldsView, trusted: Bool, peer: String?,
+                                proto: StaticString, host: String?) {
+        var value = ByteBuffer()
+        if trusted, incoming.combinedValue(for: .forwarded, into: &value) > 0 {
+            value.append(", ")
         }
-        parts.append("proto=\(proto)")
-        if let host { parts.append("host=\"\(host)\"") }
-        out.append(name: "Forwarded", value: parts.joined(separator: ";"))
+        if let peer {
+            value.append("for=")
+            if peer.contains(":") {
+                value.append("\"[")
+                value.append(contentsOf: peer.utf8)
+                value.append("]\"")
+            } else {
+                value.append(contentsOf: peer.utf8)
+            }
+            value.append(";")
+        }
+        value.append("proto=")
+        value.append(proto)
+        if let host {
+            value.append(";host=\"")
+            value.append(contentsOf: host.utf8)
+            value.append("\"")
+        }
+        value.withReadableSpan { out.append(.forwarded, value: $0) }
     }
 
     /// `host[:port]` for a `Host` header naming the upstream.
@@ -174,5 +282,49 @@ enum ReverseProxyLocation {
         }
         guard let clientHost else { return clientPath }
         return (secure ? "https://" : "http://") + clientHost + clientPath
+    }
+
+    /// The client-side path for an upstream path (`ProxyPassReverseCookiePath`): the target's
+    /// base path removed, and with `stripPrefix` the mount prefix added back. Nil when the
+    /// path is outside the base path.
+    static func clientPath(forUpstreamPath path: Substring, mount: ProxyMount, target: UpstreamTarget) -> String? {
+        var base = target.basePath
+        while base.hasSuffix("/") { base.removeLast() }
+        if !base.isEmpty, !base.hasPrefix("/") { base = "/" + base }
+        var rest = path
+        if !base.isEmpty {
+            guard rest.hasPrefix(base) else { return nil }
+            rest = rest.dropFirst(base.count)
+            guard rest.isEmpty || rest.first == "/" else { return nil }
+        }
+        var prefix = mount.stripPrefix ? mount.path : ""
+        while prefix.hasSuffix("/") { prefix.removeLast() }
+        if rest.isEmpty || rest == "/" { return prefix.isEmpty ? "/" : prefix }
+        return prefix + rest
+    }
+
+    /// Rewrites the `Path` attribute of every `Set-Cookie` into the client's path space. Only
+    /// does anything when paths differ (a stripped prefix or an upstream base path).
+    static func rewriteCookiePaths(_ fields: HTTPFields, mount: ProxyMount, target: UpstreamTarget) -> HTTPFields {
+        guard mount.stripPrefix || !target.basePath.isEmpty else { return fields }
+        var out = HTTPFields()
+        for i in 0..<fields.count {
+            guard fields[i].name == .setCookie else {
+                out.append(i, of: fields)
+                continue
+            }
+            let value = fields.valueString(at: i)
+            var attributes = value.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
+            for j in attributes.indices.dropFirst() {
+                let attribute = attributes[j].drop(while: { $0 == " " })
+                guard attribute.lowercased().hasPrefix("path=") else { continue }
+                let path = attribute.dropFirst(5)
+                if let mapped = clientPath(forUpstreamPath: path, mount: mount, target: target) {
+                    attributes[j] = " Path=" + mapped
+                }
+            }
+            out.append(.setCookie, string: attributes.joined(separator: ";"))
+        }
+        return out
     }
 }

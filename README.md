@@ -176,6 +176,27 @@ never are. A client that goes away cancels the upstream request, and that connec
 closed rather than pooled. WebSocket and Upgrade requests are tunnelled (#0123); an explicit
 `timeouts.idle` also closes an idle tunnel (default 300 seconds).
 
+More mount keys:
+
+- `pool` `{"maxConnections": 0, "maxIdle": 16, "queue": 256, "queueTimeout": 10, "idleTimeout": 60}`:
+  at most `maxConnections` connections per upstream (`0`: no limit); requests over it wait in
+  a queue of `queue` for up to `queueTimeout` seconds, then get `503 Service Unavailable` (as
+  does a request that finds the queue full). Up to `maxIdle` kept-alive connections are
+  pooled, each closed after `idleTimeout` idle seconds (`0` keeps them). Before reusing a
+  pooled connection the proxy checks (one non-blocking peek) that the upstream has not closed
+  it, so a POST does not fail on a connection the app dropped while it sat idle.
+- `trustedProxies` `["10.0.0.0/8", "::1"]`: peers (IPs or CIDR ranges) whose forwarded fields
+  are kept: `X-Forwarded-For` and `Forwarded` are appended to, `X-Forwarded-Proto` and
+  `X-Forwarded-Host` passed on. From any other peer those fields are replaced.
+  `X-Forwarded-Prefix` is always the mount path.
+- `rewriteCookiePath` (default `false`): with `stripPrefix` or an upstream base path, rewrite
+  the `Path` of `Set-Cookie` into the client's path space (`Path=/` becomes `Path=/api`).
+
+Interim `1xx` answers from the upstream (`100 Continue`, `103 Early Hints`) are consumed, not
+relayed: each downstream protocol answers `Expect: 100-continue` itself when the proxy starts
+reading the body, and `Expect` is not forwarded. Requests over HTTP/2 and HTTP/3 go upstream
+as HTTP/1.1.
+
 ## Architecture
 
 The design, the target layout and the milestone plan are in
