@@ -142,6 +142,38 @@ import Testing
         await listener.close()
     }
 
+    /// #0115: a peer reset moves the stream to `.failed(ECONNRESET)` on its own (nw-transport
+    /// observation 6). Under load that state change can land before the next receive is issued,
+    /// so the receive fails from the stored failure and never reads the code. The code must be
+    /// captured when the stream fails, whatever the ordering; this forces the late ordering.
+    @Test(.timeLimit(.minutes(1)))
+    func peerResetCodeIsCapturedWhenTheStreamFailsBeforeAReceive() async throws {
+        let listener = try await makeQUICListener()
+        let (_, certificate) = try quicTestIdentity()
+        let client = RawQUICClient(port: listener.port, certificate: certificate)
+        try await client.start()
+        let server = try await accept(listener)
+
+        let stream = try await client.openStream()
+        try await RawQUICClient.send(stream, Array("x".utf8), final: false)
+        let peer = try await acceptStream(server)
+        var buffer = ByteBuffer()
+        #expect(try await peer.receive(into: &buffer, maxLength: 64) == 1)
+        (stream.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata)?.streamApplicationErrorCode = 0x10b
+        stream.cancel()
+        // No receive is pending: wait for the stream itself to fail, then receive.
+        await peer.waitForPeerAbort()
+        #expect(try await eventually { peer.isClosed })
+        await #expect(throws: TransportError.connectionReset) {
+            _ = try await peer.receive(into: &buffer, maxLength: 64)
+        }
+        #expect(peer.receivedResetCode == 0x10b)
+
+        client.cancel()
+        await server.close(applicationError: 0x100)
+        await listener.close()
+    }
+
     // MARK: Bounds
 
     @Test(.timeLimit(.minutes(1)))

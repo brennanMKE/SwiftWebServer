@@ -445,3 +445,47 @@ final class CountingTransport<Base: ByteStreamTransport>: ByteStreamTransport {
         await base.close(reason)
     }
 }
+
+/// A mutable reference for test closures.
+final class Box<Value: Sendable>: Sendable {
+    private let stored = Mutex<Value?>(nil)
+
+    var value: Value? {
+        get { stored.withLock { $0 } }
+        set { stored.withLock { $0 = newValue } }
+    }
+}
+
+/// Runs an `HTTP2ConnectionDriver` on the server end of an in-memory pair, so a test can call
+/// into it (PINGs, counters, shared state) while `body` drives the client end; then closes the
+/// client and waits for the driver to return.
+func withH2Driver<H: HTTPHandler>(
+    configuration: HTTP2Configuration = HTTP2Configuration(),
+    handler: H,
+    shutdown: ShutdownSignal = ShutdownSignal(),
+    _ body: (inout H2Client, HTTP2ConnectionDriver<InMemoryTransport, H>) async throws -> Void
+) async throws {
+    let (client, server) = InMemoryTransport.makePair()
+    let context = ConnectionContext(info: ConnectionInfo(), shutdown: shutdown)
+    let driver = HTTP2ConnectionDriver(transport: server, handler: handler, context: context, configuration: configuration)
+    try await withThrowingTaskGroup { group in
+        group.addTask { await driver.run() }
+        var h2 = H2Client(client)
+        do {
+            try await body(&h2, driver)
+        } catch {
+            await client.close(.abort)
+            throw error
+        }
+        await client.close(.normal)
+        try await group.waitForAll()
+    }
+}
+
+func withH2Driver(
+    configuration: HTTP2Configuration = HTTP2Configuration(),
+    shutdown: ShutdownSignal = ShutdownSignal(),
+    _ body: (inout H2Client, HTTP2ConnectionDriver<InMemoryTransport, HelloHandler>) async throws -> Void
+) async throws {
+    try await withH2Driver(configuration: configuration, handler: HelloHandler(), shutdown: shutdown, body)
+}

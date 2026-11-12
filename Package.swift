@@ -42,7 +42,7 @@ let libraries: [Library] = [
     // Optional protocols
     Library("HTTP2", dependencies: ["HPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "HTTPServer", "HTTP1", "NetworkTransport"]),
     Library("HTTP3", dependencies: ["QPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "NetworkTransport"]),
-    Library("WebSockets", dependencies: ["HTTPCore"]),
+    Library("WebSockets", dependencies: ["HTTPCore"], testDependencies: ["HTTPTestSupport", "HTTP1", "HTTPServer", "NetworkTransport"]),
     // Optional components
     Library("StaticFiles", dependencies: ["HTTPCore", "Compression"], testDependencies: ["HTTP1"]),
     Library("Compression", dependencies: ["HTTPCore"], testDependencies: ["HTTP1", "HTTPServer", "HTTPTestSupport", "NetworkTransport", "StaticFiles"]),
@@ -85,7 +85,7 @@ targets += [
         swiftSettings: modernSwiftSettings),
     .executableTarget(
         name: "SWSBench",
-        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HeaderCompression", "HTTP2", "HTTP3", "QPACK", "HPACK", "StaticFiles", "ConfigFile", "AccessLog", "Compression"],
+        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HeaderCompression", "HTTP2", "HTTP3", "QPACK", "HPACK", "StaticFiles", "ConfigFile", "AccessLog", "WebSockets", "Compression"],
         path: "Sources/sws-bench",
         swiftSettings: modernSwiftSettings),
     .testTarget(

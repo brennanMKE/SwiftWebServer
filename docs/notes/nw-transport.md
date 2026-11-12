@@ -280,3 +280,24 @@ TLS_AES_256_GCM_SHA384 on loopback) and reads curl's qlog. No capture, root or n
 
 The abuse limits that end with `H3_EXCESSIVE_LOAD` (#0104) therefore look like a plain
 connection teardown to an NW-hosted server's peer.
+
+## Races seen under heavy load (#0115)
+
+8. **The reset code must be read when the stream fails, not only on a failed receive.** A peer
+   reset moves the stream to `.failed(ECONNRESET)` on its own (observation 6). Under load that
+   state change can land between two receives; the next receive then fails from the stored
+   failure and never read `streamApplicationErrorCode`, so `receivedResetCode` stayed `nil`.
+   `QUICStreamTransport` now also reads the code in its `.failed(ECONNRESET)` handler (as the
+   RESET_STREAM code while this end still receives, else as the STOP_SENDING code). Forcing
+   that ordering (`waitForPeerAbort()` before the receive) failed every time before the fix.
+9. **The phantom server stream 1 reaches an NW peer on every close.** A raw NW client's
+   `newConnectionHandler` got a new stream after every `QUICConnection.close` (15 of 15),
+   also with no `applicationError` set and without reading the group metadata at ready, so
+   neither is the trigger. A `QUICConnection` client normally fails its group (`EINVAL`) before
+   that stream becomes ready, and its pending inbound streams are dropped with the group. In
+   about 1 of 150 closes under load it became ready first (ID 1, no data, then
+   `.failed(ENOTCONN)` with no code) and was handed to `inboundStreams`. The transport cannot
+   tell it from a real server-opened bidirectional stream 1 when it becomes ready (other QUIC
+   stacks may legitimately open one), and it is only seen by clients, which
+   HTTP/3 here never is, so it is surfaced; tests that drain a client's inbound streams after a
+   peer close allow that one dead stream.
