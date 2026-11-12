@@ -48,7 +48,7 @@ let libraries: [Library] = [
     Library("HTTP3", dependencies: ["QPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "NetworkTransport"]),
     Library("WebSockets", dependencies: ["HTTPCore"]),
     // Optional components
-    Library("StaticFiles", dependencies: ["HTTPCore"]),
+    Library("StaticFiles", dependencies: ["HTTPCore"], testDependencies: ["HTTP1"]),
     Library("Compression", dependencies: ["HTTPCore"]),
     Library("VirtualHosts", dependencies: ["HTTPCore"]),
     Library("Auth", dependencies: ["HTTPCore"]),

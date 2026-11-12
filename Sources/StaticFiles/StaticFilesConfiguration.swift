@@ -31,9 +31,22 @@ public struct StaticFilesConfiguration: Sendable {
     /// such as `["md": "text/markdown; charset=utf-8"]`. Checked before the built-in table.
     public var mimeTypes: [String: String] = [:]
 
-    /// A `Cache-Control` value added to every file response, such as `public, max-age=3600`;
-    /// `nil` sends none.
+    /// A `Cache-Control` value added to every file response and every `304`, such as
+    /// `public, max-age=3600`; `nil` sends none (unless ``maxAge`` is set). Takes precedence
+    /// over ``maxAge``.
     public var cacheControl: String?
+
+    /// Freshness lifetime in seconds: when set and ``cacheControl`` is `nil`, file responses
+    /// and `304`s carry `Cache-Control: public, max-age=<maxAge>` (the legacy `caching.maxAge`
+    /// setting). `nil` (the default) sends none.
+    public var maxAge: Int?
+
+    /// The `Cache-Control` value sent: ``cacheControl``, else one built from ``maxAge``.
+    public var effectiveCacheControl: String? {
+        if let cacheControl { return cacheControl }
+        if let maxAge { return "public, max-age=\(Swift.max(maxAge, 0))" }
+        return nil
+    }
 
     /// Files up to this size are read once into memory and served from the cache with
     /// pre-rendered headers; larger files are sent from an open descriptor with
