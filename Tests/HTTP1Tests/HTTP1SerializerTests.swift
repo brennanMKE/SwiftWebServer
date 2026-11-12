@@ -219,7 +219,7 @@ private let noopWriter: @Sendable (any HTTPBodyWriter) async throws -> Void = { 
         let headers = fields([("Upgrade", "websocket"), ("Connection", "Upgrade"),
                               ("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")])
         let (upgrade, framing) = serialize(HTTPResponse(status: .switchingProtocols, headers: headers,
-                                                        body: .tunnel({ _ in })))
+                                                        body: .tunnel({ _, _ in })))
         #expect(upgrade == "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n"
                 + "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
         #expect(framing == .tunnel)
@@ -229,7 +229,7 @@ private let noopWriter: @Sendable (any HTTPBodyWriter) async throws -> Void = { 
     }
 
     @Test func tunnelAfterConnectHasNoFraming() {
-        let (bytes, framing) = serialize(HTTPResponse(body: .tunnel({ _ in })), method: .connect)
+        let (bytes, framing) = serialize(HTTPResponse(body: .tunnel({ _, _ in })), method: .connect)
         #expect(bytes == "HTTP/1.1 200 OK\r\n" + dateLine + "\r\n")
         #expect(framing == .tunnel)
     }

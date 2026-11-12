@@ -35,8 +35,9 @@ public struct WebSocketRequest: Sendable {
 }
 
 /// The WebSocket component (RFC 6455 over the `.tunnel` hook): a middleware that answers
-/// opening handshakes with `101 Switching Protocols` and runs a ``WebSocket`` session over
-/// the connection's byte stream.
+/// opening handshakes with `101 Switching Protocols` (HTTP/1.1) or `200` (an extended CONNECT
+/// over HTTP/3, RFC 9220) and runs a ``WebSocket`` session over the connection's byte stream
+/// or the request stream.
 ///
 /// ```swift
 /// Server(configuration: config, listeners: [listener], protocols: [HTTP1()]) {
@@ -56,11 +57,19 @@ public struct WebSocketRequest: Sendable {
 ///   check it against your own origins to stop cross-site WebSocket hijacking).
 /// - ``subprotocol`` picks one of the offered subprotocols (or `nil` for none); a choice the
 ///   client did not offer is ignored.
+/// - With ``WebSocketConfiguration/compression`` set, a permessage-deflate offer in
+///   `Sec-WebSocket-Extensions` is accepted (RFC 7692, ``PerMessageDeflate``) and answered in
+///   the response's `Sec-WebSocket-Extensions`.
 /// - Requests on other paths go to the next handler untouched.
 ///
-/// The session itself only needs a ``ByteStreamTransport``, so the same handler can run
-/// over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) extended CONNECT streams.
-public struct WebSocketUpgrade: HTTPMiddleware {
+/// The session itself only needs a ``ByteStreamTransport``, so the same handler runs over
+/// HTTP/3 (RFC 9220, #0111) and later HTTP/2 (RFC 8441, #0067) extended CONNECT streams: an
+/// extended CONNECT with `:protocol websocket` and `Sec-WebSocket-Version: 13` on the path is
+/// answered `200` (`400` otherwise, with `Sec-WebSocket-Version: 13` for a wrong version), with
+/// the same Origin, subprotocol and permessage-deflate handling. The component is an
+/// ``ExtendedConnectProvider``, so HTTP/3 advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` when it
+/// is in the chain.
+public struct WebSocketUpgrade: HTTPMiddleware, ExtendedConnectProvider {
     public typealias Handler = @Sendable (WebSocket, WebSocketRequest) async throws -> Void
 
     public let path: [UInt8]?
@@ -96,13 +105,21 @@ public struct WebSocketUpgrade: HTTPMiddleware {
         return upgrade(request, context: context)
     }
 
+    /// `websocket`, for HTTP/2 and HTTP/3 extended CONNECT.
+    public var extendedConnectProtocols: [String] { ["websocket"] }
+
     /// The handshake response for a request on this component's path.
     public func upgrade(_ request: HTTPRequest, context: RequestContext) -> HTTPResponse {
-        let accept: String
+        let extendedConnect = request.method == .connect
+        var accept: String?
         do {
-            accept = try WebSocketHandshake.validate(request)
+            if extendedConnect {
+                try WebSocketHandshake.validateExtendedConnect(request)
+            } else {
+                accept = try WebSocketHandshake.validate(request)
+            }
         } catch {
-            return error.response
+            return extendedConnect ? error.extendedConnectResponse : error.response
         }
         let info = WebSocketRequest(request, context: context)
         if let origin, !origin(info) { return HTTPResponse(status: .forbidden) }
@@ -110,25 +127,47 @@ public struct WebSocketUpgrade: HTTPMiddleware {
             pick(info).flatMap { info.offeredSubprotocols.contains($0) ? $0 : nil }
         }
 
+        let agreement = negotiateCompression(request)
+
         var headers = HTTPFields()
-        headers.append(.upgrade, "websocket")
-        headers.append(.connection, "Upgrade")
-        headers.append(.secWebSocketAccept, string: accept)
+        if let accept {
+            headers.append(.upgrade, "websocket")
+            headers.append(.connection, "Upgrade")
+            headers.append(.secWebSocketAccept, string: accept)
+        }
         if let chosen { headers.append(.secWebSocketProtocol, string: chosen) }
+        if let agreement { headers.append(.secWebSocketExtensions, string: agreement.responseValue) }
         let configuration = configuration
         let handler = handler
-        return HTTPResponse(status: .switchingProtocols, headers: headers, body: .tunnel { transport in
-            await Self.serve(transport, subprotocol: chosen, configuration: configuration) { socket in
+        let compression = agreement?.parameters
+        return HTTPResponse(status: extendedConnect ? .ok : .switchingProtocols, headers: headers, body: .tunnel { transport, tunnel in
+            await Self.serve(transport, subprotocol: chosen, configuration: configuration, compression: compression,
+                             shutdown: tunnel.shutdown) { socket in
                 try await handler(socket, info)
             }
         })
     }
 
+    /// The permessage-deflate agreement for `request`'s `Sec-WebSocket-Extensions` offers, when
+    /// ``WebSocketConfiguration/compression`` enables the extension.
+    func negotiateCompression(_ request: HTTPRequest) -> PerMessageDeflate.Agreement? {
+        guard let compression = configuration.compression else { return nil }
+        var offers = ""
+        for value in request.headers.values(for: .secWebSocketExtensions) {
+            if !offers.isEmpty { offers += "," }
+            offers += request.string(of: value)
+        }
+        guard !offers.isEmpty else { return nil }
+        return PerMessageDeflate.negotiate(offers: offers, configuration: compression)
+    }
+
     /// Opens the existential so the session is specialized on the transport type.
     static func serve<T: ByteStreamTransport>(
         _ transport: T, subprotocol: String?, configuration: WebSocketConfiguration,
+        compression: PerMessageDeflate.Parameters?, shutdown: ShutdownSignal,
         handler: @escaping @Sendable (WebSocket) async throws -> Void
     ) async {
-        await WebSocket.run(over: transport, subprotocol: subprotocol, configuration: configuration, handler: handler)
+        await WebSocket.run(over: transport, subprotocol: subprotocol, configuration: configuration,
+                            compression: compression, shutdown: shutdown, handler: handler)
     }
 }

@@ -28,7 +28,7 @@ struct PathHandler: HTTPHandler {
             var headers = HTTPFields()
             headers.append(.connection, "upgrade")
             headers.append(.upgrade, "echo")
-            return HTTPResponse(status: .switchingProtocols, headers: headers, body: .tunnel { stream in
+            return HTTPResponse(status: .switchingProtocols, headers: headers, body: .tunnel { stream, _ in
                 // Echo four bytes, then end.
                 var buffer = ByteBuffer()
                 while buffer.readableBytes < 4 {

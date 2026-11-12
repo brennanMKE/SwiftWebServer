@@ -15,6 +15,7 @@ func registerAllBenchmarks() {
     registerRouterBenchmarks()   // M6: RouterBench.swift
     registerVirtualHostsBenchmarks()   // M6: VirtualHostsBench.swift
     registerAuthBenchmarks()   // M6: AuthBench.swift
+    registerWebSocketBenchmarks()   // M15: WebSocketBench.swift (#0110)
     registerSelfTimedSuites()
 }
 

@@ -7,6 +7,6 @@ import WebSockets
     }
 
     @Test func dependenciesMatchRoadmapLayering() {
-        #expect(WebSocketsModule.dependencies == ["HTTPCore"])
+        #expect(WebSocketsModule.dependencies == ["HTTPCore", "Compression"])
     }
 }

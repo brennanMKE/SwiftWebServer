@@ -125,8 +125,10 @@ public struct HTTP1Configuration: Sendable, Hashable {
 /// ## Hooks
 ///
 /// - `.tunnel` responses (#0108): the head (`101` from the handler) is flushed, then the byte
-///   stream is handed to the closure, replaying any bytes buffered after the request. No
-///   HTTP/1.1 limit applies to a tunnel.
+///   stream is handed to the closure, replaying any bytes buffered after the request, with
+///   the connection's shutdown signal in its ``TunnelContext`` (#0116). No HTTP/1.1 limit
+///   applies to a tunnel, and draining does not interrupt it: the tunnel ends itself when
+///   the signal triggers, or the server's drain deadline cancels it.
 public struct HTTP1: ConnectionProtocol {
     public var configuration: HTTP1Configuration
 
@@ -763,13 +765,14 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
 
     /// Hands the byte stream to a tunnel closure, first replaying bytes the client sent after
     /// the request (an HTTP/2 preface after `Upgrade: h2c`, say).
-    func startTunnel(_ body: @Sendable (any ByteStreamTransport) async -> Void) async {
+    func startTunnel(_ body: @Sendable (any ByteStreamTransport, TunnelContext) async -> Void) async {
+        let tunnelContext = TunnelContext(shutdown: shutdown)
         if storage.buffer.isEmpty {
-            await body(transport)
+            await body(transport, tunnelContext)
         } else {
             var leftover = ByteBuffer(capacity: storage.buffer.readableBytes)
             leftover.append(storage.buffer)
-            await body(HTTP1ReplayTransport(base: transport, prefix: leftover))
+            await body(HTTP1ReplayTransport(base: transport, prefix: leftover), tunnelContext)
         }
     }
 

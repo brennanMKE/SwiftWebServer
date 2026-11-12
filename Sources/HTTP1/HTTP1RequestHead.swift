@@ -94,7 +94,8 @@ public struct HTTP1RequestHead: Sendable, Hashable {
     @inlinable
     public func request(in storage: HTTPRequestStorage) -> HTTPRequest {
         HTTPRequest(method: method, scheme: scheme, authority: authority, path: path,
-                    query: query, headers: storage.fieldsView)
+                    query: query, headers: storage.fieldsView,
+                    version: version == .http1_1 ? .http1_1 : .http1_0)
     }
 }
 

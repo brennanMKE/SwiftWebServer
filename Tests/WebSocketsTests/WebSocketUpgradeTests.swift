@@ -34,13 +34,14 @@ func withServer(
     request: String,
     trailing: [UInt8] = [],
     serverConfiguration: InMemoryTransport.Configuration = .init(),
+    shutdown: ShutdownSignal = ShutdownSignal(),
     _ body: @Sendable (InMemoryTransport, ResponseHead, ByteBuffer) async throws -> Void
 ) async throws {
     let (client, server) = InMemoryTransport.makePair(server: serverConfiguration)
     try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask {
             await HTTP1().run(server, handler: MiddlewareChain(middleware: middleware, next: NotFoundHandler()),
-                              context: ConnectionContext(info: server.info))
+                              context: ConnectionContext(info: server.info, shutdown: shutdown))
         }
         var request = ByteBuffer(bytes: Array(request.utf8) + trailing)
         try await client.send(request, endOfStream: false)
@@ -134,6 +135,21 @@ let echo = WebSocketUpgrade(path: "/ws") { socket, _ in
             #expect(head.status == status)
             #expect(head.header("Sec-WebSocket-Version") == version)
             if status == 426 { #expect(head.header("Upgrade") == "websocket") }
+        }
+    }
+
+    /// #0117: `Upgrade` is ignored on HTTP/1.0 (RFC 9110 §7.8): `400` on the component's
+    /// path, the next handler otherwise, never `101`.
+    @Test(.timeLimit(.minutes(1)))
+    func http10HandshakeIsRejected() async throws {
+        let http10 = handshake().replacingOccurrences(of: "HTTP/1.1", with: "HTTP/1.0")
+        try await withServer(echo, request: http10) { _, head, _ in
+            #expect(head.status == 400)
+            #expect(head.header("Sec-WebSocket-Accept") == nil)
+        }
+        let any = WebSocketUpgrade { _, _ in }
+        try await withServer(any, request: http10) { _, head, _ in
+            #expect(head.status == 404)
         }
     }
 

@@ -65,9 +65,25 @@ import Synchronization
 /// gracefully). ``tracker`` counts live connections, request streams, handlers and body
 /// channels.
 ///
+/// ## Extended CONNECT (RFC 9220, #0111)
+///
+/// When the handler chain holds an ``ExtendedConnectProvider`` (the WebSocket component) or
+/// ``H3Configuration/enableConnectProtocol`` is set, SETTINGS carries
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`; otherwise a request with `:protocol` is malformed.
+/// An extended CONNECT reaches the handler like any request, with
+/// ``HTTPRequest/connectProtocol`` set. A `2xx` response with a `.tunnel` body sends its
+/// HEADERS without FIN and hands the closure the request stream as a ``ByteStreamTransport``
+/// (``H3TunnelTransport``): DATA frame payloads in, each send one DATA frame out, its end of
+/// stream our FIN. The peer's FIN is the tunnel's end of stream; a peer reset fails its
+/// receive with `TransportError.connectionReset` and cancels it. Closing the tunnel normally
+/// sends FIN; an abortive close resets the stream with `H3_REQUEST_CANCELLED`. Request body
+/// limits do not apply to a tunnel; the response send deadline does. The closure's
+/// ``TunnelContext`` carries the server's drain signal. A `.tunnel` body for any other
+/// request is answered `501`.
+///
 /// ## Not yet
 ///
-/// Trailers in responses and `.tunnel` / extended CONNECT (#0111; answered `501`).
+/// Trailers in responses.
 public struct HTTP3: MultiplexedConnectionProtocol {
     public var configuration: H3Configuration
     /// Shared by every connection this value runs: the idle-connection limit and the debug
@@ -88,6 +104,12 @@ public struct HTTP3: MultiplexedConnectionProtocol {
         // read it back, so the chain can tell HTTP/3 requests apart (``AltSvc``, #0103).
         var context = context
         if context.info.negotiatedALPN == nil { context.info.negotiatedALPN = "h3" }
+        var configuration = configuration
+        if !configuration.enableConnectProtocol
+            && !MiddlewareChainInspector.extendedConnectProtocols(in: handler).isEmpty {
+            // A component serves extended CONNECT (WebSockets, RFC 9220): advertise it.
+            configuration.enableConnectProtocol = true
+        }
         let driver = H3ConnectionDriver(
             transport: t, handler: handler, context: context, configuration: configuration, tracker: tracker)
         await driver.run()
@@ -694,8 +716,11 @@ where Transport.Stream: ResettableStream {
     func serve(_ head: HTTPRequest?, rejection: HTTPStatus?, on stream: Stream, reader: H3RequestReader, watch: H3StreamWatch?) async -> RequestEnd {
         let channel = H3BodyChannel(capacity: configuration.bodyQueueCapacity, streamID: stream.streamID, watch: watch, tracker: tracker)
         let declared = reader.machine.contentLength
+        // An extended CONNECT's DATA is a tunnel's byte stream, not a body to bound.
+        let isExtendedConnect = head.map { $0.method == .connect && !$0.connectProtocol.isEmpty } ?? false
+        let bodyLimit = isExtendedConnect ? Int.max : configuration.maxRequestBodySize
         var rejection = rejection
-        if rejection == nil, let declared, declared > UInt64(configuration.maxRequestBodySize) {
+        if rejection == nil, let declared, declared > UInt64(bodyLimit) {
             rejection = .contentTooLarge
         }
         let length = declared.flatMap { Int(exactly: $0) }
@@ -709,7 +734,7 @@ where Transport.Stream: ResettableStream {
         let (end, abandonBody) = await withTaskGroup(of: StreamOutcome.self) { group -> (RequestEnd, Bool) in
             group.addTask {
                 var reader = reader
-                return await self.pumpBody(from: stream, reader: &reader, into: channel)
+                return await self.pumpBody(from: stream, reader: &reader, into: channel, limit: bodyLimit)
             }
             group.addTask {
                 await self.respond(to: request, rejection: status, storage: reader.storage, on: stream, body: channel, watch: watch)
@@ -733,7 +758,9 @@ where Transport.Stream: ResettableStream {
                         continue
                     case .peerReset:
                         aborted = true
-                        group.cancelAll()
+                        // A running tunnel sees the reset in its receive and ends itself (a
+                        // WebSocket reports 1006); anything else is cancelled.
+                        if !channel.isTunnelling { group.cancelAll() }
                     case .failed:
                         cancelled = true
                         group.cancelAll()
@@ -764,7 +791,7 @@ where Transport.Stream: ResettableStream {
                     group.cancelAll()
                 case .peerAborted:
                     aborted = true
-                    group.cancelAll()
+                    if !channel.isTunnelling { group.cancelAll() }
                 case .watcherStopped:
                     continue
                 }
@@ -784,14 +811,13 @@ where Transport.Stream: ResettableStream {
 
     /// Feeds DATA payload to `channel` until FIN or an error, and reports how the body ended.
     /// Suspends (and so stops reading the stream) while the channel is full.
-    func pumpBody(from stream: Stream, reader: inout H3RequestReader, into channel: H3BodyChannel) async -> StreamOutcome {
-        let limit = configuration.maxRequestBodySize
+    func pumpBody(from stream: Stream, reader: inout H3RequestReader, into channel: H3BodyChannel, limit: Int) async -> StreamOutcome {
         var received = 0
         while true {
             let event = await reader.next(from: stream)
             switch event {
             case .data(let chunk):
-                received += chunk.readableBytes
+                received &+= chunk.readableBytes
                 if received > limit {
                     channel.fail(HTTPRequestBodyError.tooLarge)
                     return .bodyTooLarge
@@ -831,9 +857,11 @@ where Transport.Stream: ResettableStream {
         body: H3BodyChannel, watch: H3StreamWatch?
     ) async -> StreamOutcome {
         var isHead = false
+        var isConnect = false
         let response: HTTPResponse
         if let request {
             isHead = request.method == .head
+            isConnect = request.method == .connect
             var requestContext = context.requestContext
             if context.recordsRequestStartTime { requestContext.startTime = .now() }
             tracker.handlerStarted()
@@ -861,6 +889,9 @@ where Transport.Stream: ResettableStream {
             response = HTTPResponse(status: rejection)
         }
         guard !Task.isCancelled else { return .responseEnded(.cancelled) }
+        if isConnect, case .tunnel(let tunnel) = response.body, (200..<300).contains(response.status.code) {
+            return await runTunnel(response, tunnel, on: stream, body: body, watch: watch)
+        }
         let written = await write(response, isHead: isHead, on: stream, watch: watch)
         guard written == .completed else { return .responseEnded(written) }
         guard !Task.isCancelled else { return .responded(bodyDrained: true) }
@@ -871,6 +902,44 @@ where Transport.Stream: ResettableStream {
             if discarded > configuration.maxUnreadBodySize { return .responded(bodyDrained: false) }
         }
         return .responded(bodyDrained: true)
+    }
+
+    /// Answers an extended CONNECT with `response`'s HEADERS (no FIN) and runs its tunnel over
+    /// the request stream (RFC 9220 §3); see ``HTTP3`` "Extended CONNECT".
+    func runTunnel(
+        _ response: HTTPResponse, _ tunnel: @Sendable (any ByteStreamTransport, TunnelContext) async -> Void,
+        on stream: Stream, body: H3BodyChannel, watch: H3StreamWatch?
+    ) async -> StreamOutcome {
+        let sink = H3ResponseSink(stream: stream, budget: sendBudget, watch: watch)
+        var encoder = H3ResponseHeadEncoder()
+        var out = ByteBuffer(capacity: 256)
+        encoder.encode(status: response.status, headers: response.headers, contentLength: nil, into: &out)
+        if UInt64(encoder.fieldSectionSize) > peerMaxFieldSectionSize.load(ordering: .relaxed) {
+            // As in ``write(_:isHead:on:watch:)``: the peer would refuse the head.
+            let written = await write(HTTPResponse(status: .internalServerError), isHead: false, on: stream, watch: watch)
+            return written == .completed ? .responded(bodyDrained: false) : .responseEnded(written)
+        }
+        watch?.markResponseStarted()
+        do {
+            try await sink.send(out, endOfStream: false)
+        } catch {
+            if Task.isCancelled || error is CancellationError { return .responseEnded(.cancelled) }
+            if let error = error as? TransportError, error == .connectionReset { return .responseEnded(.peerAborted) }
+            return .responseEnded(.cancelled)
+        }
+        let transport = H3TunnelTransport(sink: sink, stream: stream, channel: body)
+        body.beginTunnel()
+        await tunnel(transport, TunnelContext(shutdown: context.shutdown))
+        switch await transport.finish() {
+        case .finished:
+            return .responded(bodyDrained: true)
+        case .reset:
+            return .responseEnded(.signalled)
+        case .failed:
+            if Task.isCancelled { return .responseEnded(.cancelled) }
+            return body.failure.map { ($0 as? TransportError) == .connectionReset } == true
+                ? .responseEnded(.peerAborted) : .responseEnded(.cancelled)
+        }
     }
 
     /// Writes `response` as HEADERS and DATA frames, then FIN, through the connection's send

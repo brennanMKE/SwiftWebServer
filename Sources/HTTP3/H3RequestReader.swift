@@ -29,6 +29,8 @@ struct H3RequestReader {
 
     let storage: HTTPRequestStorage
     let receiveSize: Int
+    /// We advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so `:protocol` is allowed.
+    let allowsExtendedConnect: Bool
     var parser: H3FrameParser
     var machine = H3RequestStream()
     var decoder: QPACKDecoder
@@ -45,6 +47,7 @@ struct H3RequestReader {
     init(configuration: H3Configuration, storage: HTTPRequestStorage, skippedFrames: (@Sendable (Int) -> Bool)? = nil) {
         self.storage = storage
         self.receiveSize = configuration.receiveSize
+        self.allowsExtendedConnect = configuration.enableConnectProtocol
         self.skippedFrames = skippedFrames
         parser = H3FrameParser(configuration: .init(
             streamKind: .request, role: .server,
@@ -171,8 +174,10 @@ struct H3RequestReader {
     mutating func decodeHead() -> Event {
         do throws(H3HeadError) {
             let storage = self.storage
+            let allowsExtendedConnect = self.allowsExtendedConnect
             let request = try withSection { (bytes, decoder) throws(H3HeadError) -> HTTPRequest in
-                try H3RequestHeadDecoder.decode(bytes, decoder: &decoder, storage: storage)
+                try H3RequestHeadDecoder.decode(bytes, decoder: &decoder, storage: storage,
+                                                allowsExtendedConnect: allowsExtendedConnect)
             }
             let contentLength: UInt64?
             switch request.headers.contentLength() {

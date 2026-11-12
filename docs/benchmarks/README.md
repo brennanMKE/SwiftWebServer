@@ -12,6 +12,7 @@ dependencies beyond the package.
 | `M5-tls.md` | HTTPS keep-alive throughput (`sws-bench serve --tls`) against cleartext over NW and BSD (#0087, #0088) |
 | `M5-listeners.md` | The shipped binary serving cleartext, HTTPS and HTTP/3 at once: oha for HTTP/1.1, curl `--parallel` for HTTPS and HTTP/3 (#0089, #0103) |
 | `M13-h2.md` | HTTP/2 with prior knowledge under h2load (`sws-bench serve --h2`), small and 256 KiB bodies, with nginx h2c for scale (#0053–#0056) |
+| `M15-websockets.md` | permessage-deflate (#0110): compression ratio and CPU per message for a JSON message stream (`sws-bench micro --filter WebSocket`) |
 | `compare-servers*.md` | `scripts/bench-compare.sh` runs against nginx, Apache, Caddy, lighttpd, h2o (and the legacy server, before #0086); `-staticfiles` is the run with StaticFiles (#0084) serving from disk |
 | `M<N>-<name>.md` | One file per milestone: what changed, results, comparison with the previous record |
 

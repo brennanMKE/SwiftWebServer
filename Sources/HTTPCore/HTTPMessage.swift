@@ -9,12 +9,19 @@
 /// absolute form; the `host` field carries the authority.
 public struct HTTPRequest: Sendable {
     public var method: HTTPMethod
+    /// The protocol version the request arrived with: HTTP/1.0 or HTTP/1.1 from the request
+    /// line, ``HTTPVersion/http3`` on HTTP/3 (#0117). Runners that do not set it (HTTP/2 for
+    /// now) leave the default, HTTP/1.1.
+    public var version: HTTPVersion
     public var scheme: ByteView
     public var authority: ByteView
     /// The path, still percent-encoded (decoded once, on demand, in #0084).
     public var path: ByteView
     /// The query without the `?`; empty when absent.
     public var query: ByteView
+    /// The `:protocol` pseudo-header of an extended CONNECT (RFC 8441, RFC 9220), such as
+    /// `websocket`; empty for every other request (#0111).
+    public var connectProtocol: ByteView
     public var headers: HTTPFieldsView
     public var body: HTTPRequestBody
 
@@ -26,9 +33,13 @@ public struct HTTPRequest: Sendable {
         path: ByteView,
         query: ByteView = .empty,
         headers: HTTPFieldsView,
-        body: HTTPRequestBody = .empty
+        body: HTTPRequestBody = .empty,
+        version: HTTPVersion = .http1_1,
+        connectProtocol: ByteView = .empty
     ) {
         self.method = method
+        self.version = version
+        self.connectProtocol = connectProtocol
         self.scheme = scheme
         self.authority = authority
         self.path = path
@@ -61,7 +72,7 @@ public struct HTTPRequest: Sendable {
     /// returning if it is needed.
     public func snapshot() -> HTTPRequest {
         headers.withFieldStorage { index, arena in
-            var bytes = scheme.length + authority.length + path.length + query.length
+            var bytes = scheme.length + authority.length + path.length + query.length + connectProtocol.length
             for i in 0..<index.count { bytes += index.nameViews[i].length + index.valueViews[i].length }
             let copy = HTTPRequestStorage(bufferCapacity: bytes, fieldCapacity: index.count)
             func move(_ view: ByteView) -> ByteView {
@@ -73,13 +84,43 @@ public struct HTTPRequest: Sendable {
             let authority = move(authority)
             let path = move(path)
             let query = move(query)
+            let connectProtocol = move(connectProtocol)
             for i in 0..<index.count {
                 let field = index[i]
                 copy.fields.append(field.name, nameView: move(field.nameView), valueView: move(field.valueView))
             }
             return HTTPRequest(method: method, scheme: scheme, authority: authority, path: path,
-                               query: query, headers: copy.fieldsView, body: .empty)
+                               query: query, headers: copy.fieldsView, body: .empty, version: version,
+                               connectProtocol: connectProtocol)
         }
+    }
+}
+
+/// An HTTP protocol version (RFC 9110 §2.5): `major.minor` for HTTP/1.x, the major version
+/// alone for HTTP/2 and HTTP/3.
+public struct HTTPVersion: Sendable, Hashable, Comparable, CustomStringConvertible {
+    public var major: UInt8
+    public var minor: UInt8
+
+    @inlinable
+    public init(major: UInt8, minor: UInt8) {
+        self.major = major
+        self.minor = minor
+    }
+
+    public static let http1_0 = HTTPVersion(major: 1, minor: 0)
+    public static let http1_1 = HTTPVersion(major: 1, minor: 1)
+    public static let http2 = HTTPVersion(major: 2, minor: 0)
+    public static let http3 = HTTPVersion(major: 3, minor: 0)
+
+    @inlinable
+    public static func < (lhs: HTTPVersion, rhs: HTTPVersion) -> Bool {
+        (lhs.major, lhs.minor) < (rhs.major, rhs.minor)
+    }
+
+    /// `HTTP/1.1`, `HTTP/2`, `HTTP/3`.
+    public var description: String {
+        major >= 2 && minor == 0 ? "HTTP/\(major)" : "HTTP/\(major).\(minor)"
     }
 }
 
@@ -116,8 +157,9 @@ public enum HTTPResponseBody: Sendable {
     case file(FileRegion)
     /// The single protocol-switch hook: after the head is sent (`101` for HTTP/1.1, `200` for
     /// extended CONNECT on HTTP/2 and HTTP/3), the connection hands its byte stream to the
-    /// closure and does no more HTTP on it.
-    case tunnel(@Sendable (any ByteStreamTransport) async -> Void)
+    /// closure and does no more HTTP on it. The ``TunnelContext`` carries the server's drain
+    /// signal, so a long-lived tunnel (a WebSocket) can end itself gracefully (#0116).
+    case tunnel(@Sendable (any ByteStreamTransport, TunnelContext) async -> Void)
 
     /// The content length when it is known without running a writer.
     @inlinable
@@ -129,6 +171,19 @@ public enum HTTPResponseBody: Sendable {
         case .file(let region): Int(region.length)
         case .tunnel: nil
         }
+    }
+}
+
+/// What a ``HTTPResponseBody/tunnel(_:)`` closure learns from the connection besides its
+/// byte stream (#0116).
+public struct TunnelContext: Sendable {
+    /// Triggers when the server starts draining. The connection keeps running the tunnel, so
+    /// a long-lived protocol should finish its conversation (a WebSocket sends Close 1001) and
+    /// return; tunnels still running at the server's drain deadline are cancelled.
+    public var shutdown: ShutdownSignal
+
+    public init(shutdown: ShutdownSignal = ShutdownSignal()) {
+        self.shutdown = shutdown
     }
 }
 

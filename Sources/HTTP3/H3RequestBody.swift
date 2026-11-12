@@ -23,6 +23,7 @@ final class H3BodyChannel: HTTPRequestBodySource {
         var trailers: HTTPFields?
         var reading = false
         var expired = false
+        var tunnelling = false
     }
 
     let queue: BoundedAsyncQueue<ByteBuffer>
@@ -48,6 +49,17 @@ final class H3BodyChannel: HTTPRequestBodySource {
 
     /// True when the body ended with an error.
     var failed: Bool { state.withLock { $0.failure != nil } }
+
+    /// The error the body ended with, if any.
+    var failure: (any Error)? { state.withLock { $0.failure } }
+
+    /// The stream's DATA now feeds a tunnel (an extended CONNECT answered `2xx`, #0111): a
+    /// peer abort reaches the tunnel through its receive instead of cancelling it.
+    func beginTunnel() {
+        state.withLock { $0.tunnelling = true }
+    }
+
+    var isTunnelling: Bool { state.withLock { $0.tunnelling } }
 
     /// True when the body ended because it grew past ``H3Configuration/maxRequestBodySize``.
     var isTooLarge: Bool {

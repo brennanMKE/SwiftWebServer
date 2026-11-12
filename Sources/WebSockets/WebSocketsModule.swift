@@ -1,3 +1,4 @@
+import Compression
 import HTTPCore
 
 /// Optional WebSockets (RFC 6455; RFC 8441/9220 via the tunnel hook).
@@ -8,5 +9,5 @@ public enum WebSocketsModule {
     public static let name = "WebSockets"
 
     /// Direct dependencies; referencing them checks the target graph at compile time.
-    public static let dependencies: [String] = [HTTPCoreModule.name]
+    public static let dependencies: [String] = [HTTPCoreModule.name, CompressionModule.name]
 }

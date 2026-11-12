@@ -34,6 +34,12 @@ public enum WebSocketMessage: Sendable, Equatable {
 ///   1007, as is a message that ends inside a code point.
 /// - A Close payload of one byte or with a code no endpoint may send is 1002; a reason that
 ///   is not UTF-8 is 1007.
+///
+/// With permessage-deflate (RFC 7692, #0110) negotiated, RSV1 on the first frame of a data
+/// message marks it compressed; RSV1 on a continuation or control frame is 1002. Compressed
+/// payload is inflated as it arrives, so the size and UTF-8 checks apply to the inflated
+/// bytes: past ``Configuration/maxMessageSize`` is 1009 (decompression bombs stop there),
+/// data that does not inflate is 1007.
 public struct WSConnection: Sendable {
     public struct Configuration: Sendable, Hashable {
         /// Largest payload in one frame (1009 beyond).
@@ -107,6 +113,15 @@ public struct WSConnection: Sendable {
     /// The message being assembled and its opcode (`nil` between messages).
     var message = ByteBuffer()
     var messageOpcode: WSOpcode?
+    /// The permessage-deflate decompressor, when negotiated.
+    let inflater: PerMessageDeflate.Inflater?
+    /// The message being assembled is compressed (RSV1 on its first frame).
+    var messageCompressed = false
+    /// Compressed bytes of the current message so far, and the bound on them.
+    var compressedReceived = 0
+    var compressed = ByteBuffer()
+    /// Compressed messages received (for tests and statistics).
+    public private(set) var compressedMessages = 0
     var utf8 = UTF8Validator()
     var control = ByteBuffer(capacity: 125)
     var scratch = ByteBuffer()
@@ -124,10 +139,23 @@ public struct WSConnection: Sendable {
     public private(set) var failure: WebSocketCloseCode?
 
     public init(configuration: Configuration = Configuration()) {
+        self.init(configuration: configuration, inflater: nil)
+    }
+
+    /// A connection with permessage-deflate negotiated (`inflater` decompresses).
+    init(configuration: Configuration, inflater: PerMessageDeflate.Inflater?) {
         self.configuration = configuration
+        self.inflater = inflater
+        let reserved = configuration.allowedReservedBits | (inflater != nil ? 0x40 : 0)
         parser = WSFrameParser(configuration: .init(
-            maxFrameSize: configuration.maxFrameSize, allowedReservedBits: configuration.allowedReservedBits,
+            maxFrameSize: configuration.maxFrameSize, allowedReservedBits: reserved,
             expectsMaskedFrames: true))
+    }
+
+    /// Compressed input may run slightly past the inflated limit (deflate's stored blocks cost
+    /// 5 bytes per 64 KiB).
+    var maxCompressedMessageSize: Int {
+        configuration.maxMessageSize &+ configuration.maxMessageSize / 8192 &+ 64
     }
 
     // MARK: Received bytes
@@ -143,7 +171,11 @@ public struct WSConnection: Sendable {
             let result: WSFrameParser.Result
             switch phase {
             case .data:
-                result = parser.parse(&input, payloadInto: &message)
+                if messageCompressed {
+                    result = parser.parse(&input, payloadInto: &compressed)
+                } else {
+                    result = parser.parse(&input, payloadInto: &message)
+                }
             case .control, .idle:
                 result = parser.parse(&input, payloadInto: &control)
             case .discard:
@@ -164,6 +196,9 @@ public struct WSConnection: Sendable {
     }
 
     mutating func startFrame(_ header: WSFrameHeader) -> Action? {
+        // RSV1 (permessage-deflate) belongs on the first frame of a data message only.
+        let rsv1 = header.reservedBits & 0x40 != 0
+        if rsv1 && (header.opcode.isControl || header.opcode == .continuation) { return fail(.protocolError) }
         if header.opcode.isControl {
             control.clear()
             phase = state == .open || header.opcode == .close ? .control(header.opcode) : .discard
@@ -179,9 +214,14 @@ public struct WSConnection: Sendable {
         default:
             guard messageOpcode == nil else { return fail(.protocolError) }
             messageOpcode = header.opcode
+            messageCompressed = rsv1
+            compressedReceived = 0
             utf8.reset()
         }
-        if UInt64(message.readableBytes) + header.payloadLength > UInt64(configuration.maxMessageSize) {
+        if messageCompressed {
+            compressedReceived &+= Int(clamping: header.payloadLength)
+            if compressedReceived > maxCompressedMessageSize { return fail(.messageTooBig) }
+        } else if UInt64(message.readableBytes) + header.payloadLength > UInt64(configuration.maxMessageSize) {
             return fail(.messageTooBig)
         }
         phase = .data(fin: header.fin)
@@ -191,9 +231,15 @@ public struct WSConnection: Sendable {
     mutating func payload(count: Int, frameEnd: Bool) -> Action? {
         switch phase {
         case .data(let fin):
-            if messageOpcode == .text && count > 0 {
+            var added = count
+            if messageCompressed {
+                let before = message.readableBytes
+                if let failure = inflateCompressed(finish: frameEnd && fin) { return fail(failure) }
+                added = message.readableBytes - before
+            }
+            if messageOpcode == .text && added > 0 {
                 let valid = message.withUnsafeReadableBytes { bytes in
-                    utf8.validate(UnsafeRawBufferPointer(rebasing: bytes[(bytes.count - count)...]))
+                    utf8.validate(UnsafeRawBufferPointer(rebasing: bytes[(bytes.count - added)...]))
                 }
                 if !valid { return fail(.invalidFramePayloadData) }
             }
@@ -213,9 +259,33 @@ public struct WSConnection: Sendable {
         }
     }
 
+    /// Inflates the compressed bytes received so far into ``message`` (and the removed tail at
+    /// the end of the message). Returns the close code on failure.
+    mutating func inflateCompressed(finish: Bool) -> WebSocketCloseCode? {
+        guard let inflater else { return .protocolError }
+        let limit = configuration.maxMessageSize
+        do throws(PerMessageDeflate.InflateError) {
+            if compressed.readableBytes > 0 {
+                let input = compressed
+                try input.withUnsafeReadableBytes { (bytes) throws(PerMessageDeflate.InflateError) in
+                    try inflater.inflate(bytes, into: &message, limit: limit)
+                }
+                compressed.clear()
+            }
+            if finish {
+                try inflater.finishMessage(into: &message, limit: limit)
+                compressedMessages &+= 1
+            }
+        } catch {
+            return error == .tooBig ? .messageTooBig : .invalidFramePayloadData
+        }
+        return nil
+    }
+
     mutating func finishMessage() -> Action {
         let opcode = messageOpcode
         messageOpcode = nil
+        messageCompressed = false
         let bytes = message
         message = ByteBuffer()
         if opcode == .text {
@@ -276,7 +346,9 @@ public struct WSConnection: Sendable {
     mutating func fail(_ code: WebSocketCloseCode) -> Action {
         failure = failure ?? code
         message = ByteBuffer()
+        compressed = ByteBuffer()
         messageOpcode = nil
+        messageCompressed = false
         switch state {
         case .open:
             state = .closed
