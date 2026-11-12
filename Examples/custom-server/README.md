@@ -2,7 +2,9 @@
 
 A separate Swift package that depends on SwiftWebServer's library products by path and builds
 a server with `StaticFiles`, a `Router` JSON API, a `WebSocketUpgrade` echo, `Compression` and
-`AccessLog`, over HTTP/1.1 on loopback. It is not part of the main package's build.
+`AccessLog`, over HTTP/1.1 on loopback. It registers
+`TLSNegotiated(HTTP2(), fallback: HTTP1())`, so a TLS listener you add offers HTTP/2 by ALPN
+while cleartext stays unsniffed HTTP/1.1. It is not part of the main package's build.
 
 ```bash
 cd Examples/custom-server
