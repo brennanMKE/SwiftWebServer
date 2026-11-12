@@ -119,6 +119,19 @@ struct H2PrefaceTests {
         #expect(frames.last == .goaway(last: 0, .protocolError, debug: "PROTOCOL_ERROR"))
     }
 
+    /// #0061 (h2spec 3.5/2): on a cleartext port that serves only HTTP/2 there is no sniff,
+    /// so a client that does not send the preface gets GOAWAY(PROTOCOL_ERROR) and the
+    /// connection closes. With HTTP/1.1 next to it, the same bytes are an HTTP/1.1 request
+    /// (a 400), which is right for a shared port.
+    @Test func invalidPrefaceOnAnHTTP2OnlyCleartextPortIsAProtocolError() async {
+        let transport = InMemoryTransport.scripted(ByteBuffer("INVALID CONNECTION PREFACE\r\n\r\n"))
+        let registry = ProtocolRegistry([HTTP2()], sniffTimeout: .seconds(5))
+        await registry.serve(transport, handler: HelloHandler(), context: ConnectionContext(info: ConnectionInfo()))
+        #expect(transport.isClosed)
+        let frames = H2FrameReader.frames(in: transport.sentBytes)
+        #expect(frames.last == .goaway(last: 0, .protocolError, debug: "PROTOCOL_ERROR"), "\(frames)")
+    }
+
     @Test func firstFrameMustBeSettings() async {
         var encoder = RequestEncoder()
         let firstFrames: [ByteBuffer] = [

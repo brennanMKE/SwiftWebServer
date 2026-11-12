@@ -220,7 +220,7 @@ struct H2GoawayTests {
     /// client reads the GOAWAY and end of stream, may keep sending (the server discards it),
     /// and `run()` returns once the client closes, without waiting for the linger timeout.
     @Test func connectionErrorClosesLingering() async throws {
-        let config = HTTP2Configuration(lingerTimeout: .seconds(30))
+        let config = HTTP2Configuration(lingerTimeout: .seconds(30), lingerQuietTimeout: .seconds(30))
         try await withRunningDriver(configuration: config, handler: HelloHandler()) { client, _, returned in
             try await client.handshake()
             try await client.send(F.headers(1, block: client.requests.get("/")))
@@ -247,6 +247,40 @@ struct H2GoawayTests {
             #expect(frames.last == .goaway(last: 0, .protocolError, debug: "PROTOCOL_ERROR"), "\(frames)")
             try await Self.waitUntil(returned, timeout: .seconds(5))
             #expect(ContinuousClock.now - start >= .milliseconds(150))
+        }
+    }
+
+    /// #0061 (h2spec 5.4.1/1 over TLS): a client that keeps its side open but sends nothing
+    /// is closed after the quiet period, not after the full linger timeout. Network.framework
+    /// TLS does not pass the half-close on, so such a client never sees end of stream until
+    /// the server closes.
+    @Test func quietClientEndsTheLingeringClose() async throws {
+        let config = HTTP2Configuration(lingerTimeout: .seconds(30), lingerQuietTimeout: .milliseconds(100))
+        try await withRunningDriver(configuration: config, handler: HelloHandler()) { client, _, returned in
+            try await client.handshake()
+            let start = ContinuousClock.now
+            // PING with a 6-octet payload: FRAME_SIZE_ERROR (RFC 9113 §6.7).
+            try await client.send(F.raw(type: .ping, streamID: 0, payload: [0, 0, 0, 0, 0, 0]))
+            let frames = try await client.framesUntilClosed()
+            #expect(frames.last == .goaway(last: 0, .frameSizeError, debug: "FRAME_SIZE_ERROR"), "\(frames)")
+            try await Self.waitUntil(returned, timeout: .seconds(5))
+            #expect(ContinuousClock.now - start < .seconds(5))
+        }
+    }
+
+    /// A client that keeps sending during the lingering close is read until it stops.
+    @Test func busyClientKeepsTheLingeringCloseOpen() async throws {
+        let config = HTTP2Configuration(lingerTimeout: .seconds(30), lingerQuietTimeout: .milliseconds(200))
+        try await withRunningDriver(configuration: config, handler: HelloHandler()) { client, _, returned in
+            try await client.handshake()
+            try await client.send(F.raw(type: .ping, streamID: 0, payload: [0, 0, 0, 0, 0, 0]))
+            _ = try await client.framesUntilClosed()
+            for _ in 0..<5 {
+                try await client.send(F.ping(7))
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            #expect(returned.value == nil, "run() returned while the client was still sending")
+            try await Self.waitUntil(returned, timeout: .seconds(5))
         }
     }
 

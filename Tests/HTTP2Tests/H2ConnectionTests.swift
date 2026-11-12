@@ -151,8 +151,8 @@ struct H2ConnectionTests {
 
     /// A body the handler does not read is discarded, but its connection credit comes back
     /// (in one or two WINDOW_UPDATEs, depending on whether the DATA arrived before or after the
-    /// handler returned), and a stream still sending when its response ends is reset with
-    /// NO_ERROR.
+    /// handler returned), and a stream still sending after its response ended is reset with
+    /// NO_ERROR when its next DATA arrives (#0061).
     @Test func requestDataIsCreditedAndUnfinishedStreamsReset() async throws {
         let config = HTTP2Configuration(connectionWindowSize: 65_535)
         try await withH2Connection(configuration: config) { client in
@@ -163,6 +163,9 @@ struct H2ConnectionTests {
                                   F.data(1, Array(repeating: 1, count: 8_000), endStream: false))
             let response = try await client.response(on: 1)
             #expect(String(decoding: response.body, as: UTF8.self) == "hello /post")
+            let resets = response.others.filter { if case .rstStream = $0 { return true }; return false }
+            #expect(resets.isEmpty, "\(response.others)")
+            try await client.send(F.data(1, Array(repeating: 1, count: 1_000), endStream: false))
             let frames = try await client.frames(until: { if case .rstStream = $0 { return true }; return false })
             var all = response.others + frames
             #expect(all.last == .rstStream(stream: 1, .noError), "\(all)")
@@ -171,7 +174,7 @@ struct H2ConnectionTests {
             }
             // Every byte is credited; the last WINDOW_UPDATE may wait for more pending credit.
             while credited() < 32_000, let frame = try await client.nextFrame(timeout: .seconds(2)) { all.append(frame) }
-            #expect(credited() == 40_000 || credited() == 32_000, "\(all)")
+            #expect(credited() == 41_000 || credited() == 40_000 || credited() == 32_000, "\(all)")
         }
     }
 

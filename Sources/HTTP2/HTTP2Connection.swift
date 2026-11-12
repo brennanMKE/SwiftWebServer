@@ -96,8 +96,10 @@ public struct HTTP2Connection: Sendable {
         case sendData(streamID: HTTP2StreamID, length: Int, endStream: Bool)
         /// A stream task resets its stream (for example, its body failed after HEADERS).
         case sendReset(streamID: HTTP2StreamID, HTTP2ErrorCode)
-        /// A stream task finished its response. If the peer is still sending the request,
-        /// the stream is reset with `NO_ERROR` (§8.1) so its DATA stops.
+        /// A stream task finished its response. If the peer has not finished the request,
+        /// the stream stays half-closed (local) until the peer sends more DATA, which is then
+        /// answered with `RST_STREAM(NO_ERROR)` (§8.1) so its upload stops, or ends the
+        /// request. Until then WINDOW_UPDATE on the stream is still checked (#0061).
         case responseFinished(streamID: HTTP2StreamID)
         /// The server drains (or the connection was idle): send the first GOAWAY(NO_ERROR) with
         /// the largest stream identifier (§6.8), so the client stops opening streams while
@@ -194,8 +196,14 @@ public struct HTTP2Connection: Sendable {
     public var pendingReceiveCredit: Int { connectionReceive.pending }
     /// Bytes this endpoint may still send on the connection.
     public private(set) var connectionSendWindow = Int(HTTP2Connection.defaultWindowSize)
-    /// Send windows of streams with a response in progress.
+    /// Send windows of streams with a response in progress, and of streams in
+    /// ``unfinishedRequests``.
     var sendWindows: [UInt32: Int] = [:]
+    /// Streams whose response is complete while the peer has not finished the request
+    /// (half-closed local). The `RST_STREAM(NO_ERROR)` of §8.1 waits for the peer's next DATA:
+    /// resetting at once would make a WINDOW_UPDATE that races the response (h2spec 6.9.1/3)
+    /// hit a closed stream, where it must be ignored instead of checked.
+    var unfinishedRequests: Set<UInt32> = []
 
     /// Set once a connection error was answered with GOAWAY: everything after is ignored.
     public private(set) var failed: HTTP2Error?
@@ -230,7 +238,7 @@ public struct HTTP2Connection: Sendable {
     public func sendWindow(of streamID: HTTP2StreamID) -> Int? { sendWindows[streamID.rawValue] }
 
     /// The number of streams with a response in progress.
-    public var respondingStreams: Int { sendWindows.count }
+    public var respondingStreams: Int { sendWindows.count - unfinishedRequests.count }
 
     public mutating func handle(_ event: Event) -> Action {
         if failed != nil {
@@ -300,8 +308,9 @@ public struct HTTP2Connection: Sendable {
             switch streams.handle(.received(id, .rstStream)) {
             case .proceed:
                 receiveWindows.removeValue(forKey: id.rawValue)
+                let finished = unfinishedRequests.remove(id.rawValue) != nil
                 // The response, if any, stops; wake its writer so it sees the closed stream.
-                return sendWindows.removeValue(forKey: id.rawValue) != nil ? .windowChanged : .none
+                return sendWindows.removeValue(forKey: id.rawValue) != nil && !finished ? .windowChanged : .none
             case .ignore: return .none
             case .streamError(let code): return reset(id, code)
             case .connectionError(let code): return fail(.connection(code, reason: "RST_STREAM on stream \(id)"))
@@ -322,6 +331,7 @@ public struct HTTP2Connection: Sendable {
             case .proceed:
                 if trailers {
                     receiveWindows.removeValue(forKey: id.rawValue)
+                    if unfinishedRequests.remove(id.rawValue) != nil { sendWindows.removeValue(forKey: id.rawValue) }
                     return .acceptTrailers(streamID: id)
                 }
                 sendWindows[id.rawValue] = peerInitialWindowSize
@@ -372,7 +382,7 @@ public struct HTTP2Connection: Sendable {
         case .sendHeaders(let id, let endStream):
             switch streams.handle(.sent(id, .headers(endStream: endStream))) {
             case .proceed:
-                if endStream { sendWindows.removeValue(forKey: id.rawValue) }
+                if endStream { responseEnded(id) }
                 return .send
             case .ignore, .streamError:
                 sendWindows.removeValue(forKey: id.rawValue)
@@ -393,11 +403,13 @@ public struct HTTP2Connection: Sendable {
             }
 
         case .responseFinished(let id):
-            sendWindows.removeValue(forKey: id.rawValue)
-            guard streams.stream(id)?.state == .halfClosedLocal else { return .none }
-            receiveWindows.removeValue(forKey: id.rawValue)
-            _ = streams.handle(.sent(id, .rstStream))
-            return .resetStream(streamID: id, .noError, windowIncrement: nil)
+            guard streams.stream(id)?.state == .halfClosedLocal else {
+                sendWindows.removeValue(forKey: id.rawValue)
+                return .none
+            }
+            // The reset waits for the peer's next DATA (``unfinishedRequests``).
+            unfinishedRequests.insert(id.rawValue)
+            return .none
 
         case .shutdown:
             guard goawaySent == nil, !shutdownStarted else { return .none }
@@ -419,6 +431,7 @@ public struct HTTP2Connection: Sendable {
         goawaySent = last
         _ = streams.handle(.goawaySent(lastStreamID: last))
         for id in sendWindows.keys where id > last.rawValue { sendWindows.removeValue(forKey: id) }
+        for id in unfinishedRequests where id > last.rawValue { unfinishedRequests.remove(id) }
         for id in receiveWindows.keys where id > last.rawValue { receiveWindows.removeValue(forKey: id) }
         return .gracefulGoaway(lastStreamID: last, final: true)
     }
@@ -471,12 +484,11 @@ public struct HTTP2Connection: Sendable {
             guard let window = sendWindows[id.rawValue] else { return .none }
             let updated = window + Int(increment)
             guard updated <= Int(HTTP2Settings.maxWindowSize) else {
-                sendWindows.removeValue(forKey: id.rawValue)
-                _ = streams.handle(.sent(id, .rstStream))
-                return .resetStream(streamID: id, .flowControlError, windowIncrement: nil)
+                return reset(id, .flowControlError)
             }
             sendWindows[id.rawValue] = updated
-            return .windowChanged
+            // A stream whose response is complete has no writer to wake.
+            return unfinishedRequests.contains(id.rawValue) ? .none : .windowChanged
         case .ignore: return .none
         case .streamError(let code): return reset(id, code)
         case .connectionError(let code): return fail(.connection(code, reason: "WINDOW_UPDATE on stream \(id)"))
@@ -490,6 +502,15 @@ public struct HTTP2Connection: Sendable {
         }
         switch streams.handle(.received(id, .data(endStream: endStream))) {
         case .proceed:
+            if unfinishedRequests.contains(id.rawValue) {
+                // The response is complete: §8.1 asks the peer to stop sending the request.
+                if !endStream { return reset(id, .noError, windowIncrement: credit(length)) }
+                unfinishedRequests.remove(id.rawValue)
+                sendWindows.removeValue(forKey: id.rawValue)
+                receiveWindows.removeValue(forKey: id.rawValue)
+                guard let increment = credit(length) else { return .none }
+                return .sendWindowUpdate(connectionIncrement: increment, streamID: .connection, streamIncrement: nil)
+            }
             if var window = receiveWindows[id.rawValue] {
                 guard window.receive(length) else {
                     // §6.9.1: a stream error; the frame is discarded and credited.
@@ -512,6 +533,7 @@ public struct HTTP2Connection: Sendable {
         case .streamError(let code):
             sendWindows.removeValue(forKey: id.rawValue)
             receiveWindows.removeValue(forKey: id.rawValue)
+            unfinishedRequests.remove(id.rawValue)
             return .resetStream(streamID: id, code, windowIncrement: credit(length))
         case .connectionError(let code):
             return fail(.connection(code, reason: "DATA on stream \(id)"))
@@ -536,11 +558,8 @@ public struct HTTP2Connection: Sendable {
         switch streams.handle(.sent(id, .data(endStream: ends))) {
         case .proceed:
             connectionSendWindow -= grant
-            if ends {
-                sendWindows.removeValue(forKey: id.rawValue)
-            } else {
-                sendWindows[id.rawValue] = window - grant
-            }
+            sendWindows[id.rawValue] = window - grant
+            if ends { responseEnded(id) }
             return .sendData(length: grant, endStream: ends)
         case .ignore, .streamError:
             sendWindows.removeValue(forKey: id.rawValue)
@@ -550,11 +569,18 @@ public struct HTTP2Connection: Sendable {
         }
     }
 
+    /// Our response on `id` ended. Its send window goes, unless the peer may still send
+    /// (half-closed local): it stays so WINDOW_UPDATE overflow is still detected (§6.9.1).
+    private mutating func responseEnded(_ id: HTTP2StreamID) {
+        if streams.stream(id)?.state != .halfClosedLocal { sendWindows.removeValue(forKey: id.rawValue) }
+    }
+
     // MARK: Errors
 
     /// A stream error: the stream table already moved the stream to closed.
     private mutating func reset(_ id: HTTP2StreamID, _ code: HTTP2ErrorCode, windowIncrement: UInt32? = nil) -> Action {
         sendWindows.removeValue(forKey: id.rawValue)
+        unfinishedRequests.remove(id.rawValue)
         receiveWindows.removeValue(forKey: id.rawValue)
         _ = streams.handle(.sent(id, .rstStream))
         return .resetStream(streamID: id, code, windowIncrement: windowIncrement)
@@ -564,6 +590,7 @@ public struct HTTP2Connection: Sendable {
         precondition(error.isConnectionError, "fail takes connection errors")
         failed = error
         sendWindows.removeAll()
+        unfinishedRequests.removeAll()
         receiveWindows.removeAll()
         let last = Swift.min(streams.highestClientStreamID, goawaySent ?? HTTP2StreamID(HTTP2StreamID.maxValue))
         return .goaway(lastStreamID: last, error)
