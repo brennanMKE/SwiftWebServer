@@ -10,6 +10,7 @@ public import StaticFiles
 import Compression
 import VirtualHosts
 import Auth
+import Proxy
 
 // Settings to the server's configuration values and middleware chain (docs/ROADMAP.md §5.2).
 // Components are registered with the middleware builder only when enabled, so a disabled
@@ -91,13 +92,14 @@ extension ServerSettings {
         }
         // #0091: outermost, so generated error pages are compressed too.
         let compressor = compression.map { Compression(configuration: $0.configuration) }
+        let mounts = proxyMounts
+        let reverseProxy = mounts.isEmpty ? nil : ReverseProxy(mounts: mounts, client: UpstreamHTTP1Client())
         return MiddlewareBuilder.build {
             if let compressor { compressor }
             if let pages { pages }
             if let authenticator { authenticator }
-            // TODO(#0121/#0124): register `proxy.map(\.mount)` here, after auth and before the
-            // static files/error pages terminal, once the `ReverseProxy` component lands.
-            // Nothing is registered yet: `proxy` is parsed and validated only.
+            // #0124: after auth, before the static files terminal.
+            if let reverseProxy { reverseProxy }
             terminal
         }
     }

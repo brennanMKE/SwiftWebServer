@@ -130,7 +130,7 @@ Relative paths resolve against the directory that holds the config file.
 | `http3` | off | HTTP/3 over QUIC; needs `tls`. `true`, or `{"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`. `port` (UDP) defaults to the TLS port number, even when that was `0`. `altSvcMaxAge` is the `ma` of the `Alt-Svc` header on HTTPS responses |
 | `hosts` | `[]` | Virtual hosts: `[{"names": ["a.test", "*.a.test"], "root": "sites/a"}, {"default": true, "root": "Public"}]`. Each site serves its own `root` (the other file keys are shared); `root` at the top level is then unused. Names match `Host`/`:authority` without the port, case-insensitively; `*.a.test` matches any subdomain. An unknown host gets the `default` site, or `421` without one |
 | `auth` | `[]` | Authentication for path prefixes: `[{"paths": ["/admin"], "realm": "Admin", "basic": {"file": "users.htpasswd"}}]`. `basic` takes a credential file of `user:$pbkdf2-sha256$…` lines (make one with `scripts/hash-password.sh USER`), inline `"users"` lines, or `"usersEnv": "VAR"`; plaintext passwords are refused. `jwt` verifies HS256 bearer tokens: `{"keys": [{"id": "k1", "secretEnv": "JWT_KEY"}], "issuer": "…", "audience": "api", "leeway": 60}` (keys ≥ 32 bytes, `secret` inline or `secretEnv`; `exp` required unless `"requireExp": false`). `tokens` are static bearer tokens by SHA-256: `[{"name": "ci", "sha256": "…"}]`. Missing or wrong credentials get `401` with `WWW-Authenticate`; repeated failures from one address get `429` |
-| `proxy` | `[]` | Reverse-proxy mounts (parsed and validated; serving lands with #0121): `[{"path": "/api", "upstream": "http://127.0.0.1:9000"}]`. Each mount takes `path` (prefix starting with `/`, default `/`), optional `host`/`hosts`, `upstream` or `upstreams` (`http://HOST:PORT[/base]` or `unix:/path/to.sock`; https upstreams are not supported yet), `stripPrefix`, `preserveHost`, `forwardedHeaders` (`x-forwarded`, `forwarded`, `both`, `none`), `rewriteLocation`, `websocket`, and `timeouts` `{"connect", "response", "idle"}` in seconds. The same `path` twice for the same hosts is an error |
+| `proxy` | `[]` | Reverse-proxy mounts (see [Reverse proxy](#reverse-proxy); WIP): `[{"path": "/api", "upstream": "http://127.0.0.1:9000"}]`. Each mount takes `path` (prefix starting with `/`, default `/`), optional `host`/`hosts`, `upstream` or `upstreams` (`http://HOST:PORT[/base]` or `unix:/path/to.sock`; https upstreams are not supported yet), `stripPrefix`, `preserveHost`, `forwardedHeaders` (`x-forwarded`, `forwarded`, `both`, `none`), `rewriteLocation`, `websocket`, and `timeouts` `{"connect", "response", "idle"}` in seconds. The same `path` twice for the same hosts is an error |
 | `accessLog` | | Reserved. The `AccessLog` component exists (#0090), but the config file does not wire it yet. The key is accepted with a warning and ignored; use the `Server` builder or `sws-bench serve --access-log` |
 | `compression` | off | Response compression (#0091): `true`, or `{"encodings": ["br", "gzip", "deflate"], "minimumSize": 1024, "level": 4, "precompressionLevel": 9, "mimeTypes": ["text/*", "application/json", …], "precompress": true, "sidecars": true}`. Negotiates `Accept-Encoding` (q-values; `br` > `gzip` > `deflate` at equal weight) and adds `Vary: Accept-Encoding`. Small static files are compressed once into the file cache (`precompress`), `file.br`/`file.gz` next to a file are served as its variants (`sidecars`), and everything else of a listed type is compressed per response, streamed for large files. Encoded variants get a suffixed `ETag` (`"…-gz"`). Never applied to `206`, `304`, `HEAD`, already-encoded responses or bodies under `minimumSize`. The legacy `enableCompression: true` is the same as `true` |
 | `enableETags` | | Legacy key with no effect: ETags are always sent. Accepted with a warning |
@@ -142,6 +142,34 @@ A config containing only `{"port": 0}` starts a server with every other default.
 Disabled features are left out of the request path entirely. The config is turned into a
 middleware chain once at startup (`ServerSettings.makeHandler()` in `Sources/ConfigFile`), and
 a component that is turned off is never registered.
+
+### Reverse proxy
+
+Requests under a `proxy` mount are forwarded to an upstream HTTP/1.1 app; everything else
+falls through to the static files. The proxy sits after `auth`, so protected paths are
+checked before anything is forwarded. [`Root/http-config.proxy.json`](Root/http-config.proxy.json)
+serves `Root/Public` at `/` and proxies `/api` to the Go example app (it also enables TLS,
+so it needs the test identity in `.test-identity/`). A minimal cleartext equivalent:
+
+```json
+{
+  "port": 8080,
+  "root": "Public",
+  "proxy": [
+    { "path": "/api", "upstream": "http://127.0.0.1:9000", "forwardedHeaders": "x-forwarded" }
+  ]
+}
+```
+
+```bash
+(cd Examples/go-api && go run . -addr 127.0.0.1:9000) &
+swift run SwiftWebServer --config Root/http-config.proxy.json
+curl http://127.0.0.1:8080/api/health    # {"status":"ok"}
+```
+
+**Work in progress.** Upstream connections are pooled and `unix:` sockets work, but the
+`timeouts` key is not enforced and failed requests are not retried (#0122), and WebSocket
+upgrades are not proxied (#0123).
 
 ## Architecture
 
