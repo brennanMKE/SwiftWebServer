@@ -85,7 +85,7 @@ targets += [
         swiftSettings: modernSwiftSettings),
     .executableTarget(
         name: "SWSBench",
-        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HeaderCompression", "HTTP2", "HTTP3", "QPACK", "HPACK", "StaticFiles", "ConfigFile", "AccessLog", "WebSockets"],
+        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HeaderCompression", "HTTP2", "HTTP3", "QPACK", "HPACK", "StaticFiles", "ConfigFile", "AccessLog", "WebSockets", "Router"],
         path: "Sources/sws-bench",
         swiftSettings: modernSwiftSettings),
     .testTarget(
