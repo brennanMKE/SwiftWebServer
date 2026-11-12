@@ -161,6 +161,27 @@ Pure Swift target `HPACK` with no Foundation:
 | Queued outbound control frames | 1,000 | Defends PING/SETTINGS floods |
 | Idle connection | `keepAliveTimeout` | Graceful `GOAWAY(NO_ERROR)` |
 
+### HTTP/2 abuse limits (#0056)
+
+`HTTP2AbuseLimits` in `HTTP2Configuration.abuseLimits`, modelled on `H3AbuseLimits` below.
+Counts are per connection, in a fixed window (`window`, 10 s) that starts at the first event.
+`nil` turns a limit off.
+
+| Setting | Default | Abuse | Response |
+|---|---|---|---|
+| `maxResetStreamsPerWindow` | 100 | Rapid reset (CVE-2023-44487): RST_STREAM on a stream whose handler still runs, and streams refused over MAX_CONCURRENT_STREAMS | `GOAWAY(ENHANCE_YOUR_CALM)` |
+| (always) | 2 × MAX_CONCURRENT_STREAMS | Handler tasks of reset streams still being cancelled | New streams get `RST_STREAM(REFUSED_STREAM)` (counted above) |
+| `maxControlFramesPerWindow` | 1,000 | PING, SETTINGS, PRIORITY and unknown-type frame floods | `GOAWAY(ENHANCE_YOUR_CALM)` |
+| `maxQueuedControlFrames` (`HTTP2Configuration`) | 1,000 | Replies (PING/SETTINGS ACK, WINDOW_UPDATE, RST_STREAM) queued faster than the client reads them | `GOAWAY(ENHANCE_YOUR_CALM)` |
+| `maxEmptyFramesPerWindow` | 100 | DATA without payload or END_STREAM; HEADERS and CONTINUATION without fragment or END_HEADERS | `GOAWAY(ENHANCE_YOUR_CALM)` |
+| `maxContinuationFrames`, `headerBlockLimit` (`HTTP2Configuration`) | 32, 2 × `maxHeaderListSize` | CONTINUATION flood (VU#421644), checked on every frame | `GOAWAY(ENHANCE_YOUR_CALM)` |
+| `headerBlockLimit` | 2 × `maxHeaderListSize` | HPACK bomb: decoded list size, checked while decoding | `GOAWAY(COMPRESSION_ERROR)` |
+| `maxWindowUpdatesPerWindow` | 10,000 | WINDOW_UPDATE floods | `GOAWAY(ENHANCE_YOUR_CALM)` |
+| `maxSmallDataFramesPerWindow`, `smallDataFrameSize` | 1,000, 256 B | Small-window slow read: DATA frames a send window cut below 256 bytes | `GOAWAY(ENHANCE_YOUR_CALM)` |
+| `windowStallTimeout` | 30 s | Zero-window stall: a response waits this long for send window | Stream window: `RST_STREAM(ENHANCE_YOUR_CALM)`; connection window: `GOAWAY(ENHANCE_YOUR_CALM)` |
+| `maxStreamsPerConnection` | 100,000 | Stream-identifier exhaustion: one connection used for ever more streams | Graceful `GOAWAY(NO_ERROR)` (two GOAWAYs and a PING); the client reconnects |
+| `settingsTimeout` (`HTTP2Configuration`) | 10 s | Slow preface: no preface or SETTINGS ACK | `GOAWAY(SETTINGS_TIMEOUT)` |
+
 ### HTTP/3 default limits (#0102)
 
 `H3Configuration` and `H3Timeouts` in the `HTTP3` target. Every failure's code comes from the

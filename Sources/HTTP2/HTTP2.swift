@@ -140,6 +140,16 @@ import Darwin
 /// - A stream error on an idle stream (a PRIORITY frame that depends on itself) closes the
 ///   connection, because RST_STREAM must not be sent on an idle stream (§6.4).
 ///
+/// ## Denial of service (#0056)
+///
+/// ``HTTP2AbuseLimits`` (``HTTP2Configuration/abuseLimits``) rate-limits rapid reset, control,
+/// empty, WINDOW_UPDATE and window-limited small DATA frames (`GOAWAY(ENHANCE_YOUR_CALM)`),
+/// resets responses stalled on a zero window, and shuts a connection down gracefully after
+/// ``HTTP2AbuseLimits/maxStreamsPerConnection`` streams. Handler tasks of reset streams count
+/// against twice MAX_CONCURRENT_STREAMS. The CONTINUATION flood, HPACK bomb, reply-queue flood
+/// and slow preface are bounded by the header block limits, `maxQueuedControlFrames` and
+/// `settingsTimeout`.
+///
 /// ## Not yet
 ///
 /// Extended CONNECT (#0067: `.tunnel` answers `501`).
@@ -180,6 +190,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// Triggers when the reader stopped: the peer closed, the transport failed, or a lingering
     /// close finished discarding. The writer's lingering close waits for it.
     let readerDone = ShutdownSignal()
+    /// Triggers when ``HTTP2AbuseLimits/maxStreamsPerConnection`` streams were dispatched: the
+    /// connection shuts down gracefully, so the client moves to a new one (#0056).
+    let streamLimit = ShutdownSignal()
 
     init(transport: Transport, handler: Handler, context: ConnectionContext, configuration: HTTP2Configuration) {
         self.transport = transport
@@ -207,6 +220,16 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                         if await self.waitForIdle(idle) { await self.shutDownGracefully() }
                     }
                 }
+                if configuration.abuseLimits.maxStreamsPerConnection != nil {
+                    let limit = streamLimit
+                    streams.addTask {
+                        await limit.wait()
+                        if limit.isTriggered { await self.shutDownGracefully() }
+                    }
+                }
+                if let stall = configuration.abuseLimits.windowStallTimeout {
+                    streams.addTask { await self.runWindowStallWatchdog(stall) }
+                }
                 await runReader(streams: &streams)
                 readerDone.trigger()
                 // End of input, a connection error, or the writer closed the transport.
@@ -226,6 +249,27 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         let action = state.withLock { $0.handle(event, wakeups: &wakeups) }
         wakeups.resume()
         return action
+    }
+
+    /// ``handle(_:)`` after counting the frame as `kind` (#0056), in one critical section.
+    /// Over the limit the connection closes and the event is not handled.
+    func handle(_ event: HTTP2Connection.Event, counting kind: HTTP2AbuseKind?) -> HTTP2Connection.Action {
+        guard let kind else { return handle(event) }
+        var wakeups = HTTP2Wakeups()
+        let action = state.withLock { shared -> HTTP2Connection.Action in
+            if let flood = shared.recordAbuse(kind, wakeups: &wakeups) { return flood }
+            return shared.handle(event, wakeups: &wakeups)
+        }
+        wakeups.resume()
+        return action
+    }
+
+    /// Counts one frame as `kind` (#0056). Returns false when that closed the connection.
+    func countAbuse(_ kind: HTTP2AbuseKind) -> Bool {
+        var wakeups = HTTP2Wakeups()
+        let flood = state.withLock { $0.recordAbuse(kind, wakeups: &wakeups) }
+        wakeups.resume()
+        return flood == nil
     }
 
     func closeOutbound(_ reason: CloseReason) {
@@ -452,6 +496,26 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
 
     // MARK: Timers
 
+    /// Zero-window stall (#0056): every quarter of `limit`, resets streams (or closes the
+    /// connection) whose response waited longer than `limit` for send window.
+    func runWindowStallWatchdog(_ limit: Duration) async {
+        while true {
+            do {
+                try await Task.sleep(for: limit / 4)
+            } catch {
+                return
+            }
+            var wakeups = HTTP2Wakeups()
+            let cutoff = ContinuousClock.now - limit
+            let open = state.withLock { shared -> Bool in
+                shared.expireStalledWriters(before: cutoff, wakeups: &wakeups)
+                return shared.isOpen
+            }
+            wakeups.resume()
+            if !open { return }
+        }
+    }
+
     func runSettingsTimer(_ timeout: Duration) async {
         do {
             try await Task.sleep(for: timeout)
@@ -603,6 +667,8 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         // Every frame passes the assembler first: nothing may interrupt a header block.
         let gate: HeaderBlockAssembler.Action
         let machineEvent: HTTP2Connection.Event
+        // Frames that cost work without carrying a request count toward a flood limit (#0056).
+        var abuse: HTTP2AbuseKind?
         switch event {
         case .needsMoreData:
             return .proceed
@@ -619,6 +685,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                 handle(.connectionError(.connection(code, reason: "frame inside a header block")))
                 return .stop
             }
+            // A DATA frame with no payload (padding at most) that does not end the stream does
+            // nothing but cost a frame.
+            if frame.dataLength == 0 && !frame.endStream && !countAbuse(.emptyFrames) { return .stop }
             var target = DataTarget(
                 streamID: frame.streamID, accepted: false, body: nil, remaining: frame.dataLength, endStream: frame.endStream)
             switch receiveData(frame, body: &target.body) {
@@ -634,12 +703,14 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             return .proceed
         case .headers(let id, let endStream, let endHeaders, let priority, let location):
             return parser.withPayload(location, in: input) { fragment in
+                if fragment.isEmpty && !endHeaders && !countAbuse(.emptyFrames) { return .stop }
                 let action = assembler.handle(.headers(
                     streamID: id, endStream: endStream, endHeaders: endHeaders, priority: priority, fragment: fragment))
                 return headerBlock(action, fragment: fragment, assembler: assembler, decoder: &decoder)
             }
         case .continuation(let id, let endHeaders, let location):
             return parser.withPayload(location, in: input) { fragment in
+                if fragment.isEmpty && !endHeaders && !countAbuse(.emptyFrames) { return .stop }
                 let action = assembler.handle(.continuation(streamID: id, endHeaders: endHeaders, fragment: fragment))
                 return headerBlock(action, fragment: fragment, assembler: assembler, decoder: &decoder)
             }
@@ -650,27 +721,32 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         case .priority(let id, _):
             gate = assembler.handle(.otherFrame(.priority, streamID: id))
             machineEvent = .priority(streamID: id)
+            abuse = .controlFrames
         case .rstStream(let id, let code):
             gate = assembler.handle(.otherFrame(.rstStream, streamID: id))
             machineEvent = .rstStream(streamID: id, code)
         case .settings(let settings):
             gate = assembler.handle(.otherFrame(.settings, streamID: .connection))
             machineEvent = .settings(settings)
+            abuse = .controlFrames
         case .settingsAck:
             gate = assembler.handle(.otherFrame(.settings, streamID: .connection))
             machineEvent = .settingsAck
         case .ping(let ack, let data):
             gate = assembler.handle(.otherFrame(.ping, streamID: .connection))
             machineEvent = .ping(ack: ack, opaqueData: data)
+            if !ack { abuse = .controlFrames }
         case .goaway(let last, let code, _):
             gate = assembler.handle(.otherFrame(.goaway, streamID: .connection))
             machineEvent = .goaway(lastStreamID: last, code)
         case .windowUpdate(let id, let increment):
             gate = assembler.handle(.otherFrame(.windowUpdate, streamID: id))
             machineEvent = .windowUpdate(streamID: id, increment: increment)
+            abuse = .windowUpdates
         case .unknown(let header):
             gate = assembler.handle(.otherFrame(header.type, streamID: header.streamID))
             machineEvent = .unknownFrame
+            abuse = .controlFrames
         case .streamError(let error):
             gate = assembler.handle(.otherFrame(.priority, streamID: error.streamID ?? .connection))
             machineEvent = .streamError(error)
@@ -679,7 +755,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             handle(.connectionError(.connection(code, reason: "frame inside a header block")))
             return .stop
         }
-        switch handle(machineEvent) {
+        switch handle(machineEvent, counting: abuse) {
         case .goaway:
             return .stop
         case .applyLocalSettings(let settings):
@@ -828,10 +904,12 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             body = channel
         }
         // Registered before any later frame on the stream is read, so a reset finds them.
-        state.withLock { shared in
+        let limitReached = state.withLock { shared -> Bool in
             shared.tasks[id.rawValue] = task
             if let body { shared.bodies[id.rawValue] = body }
+            return shared.streamLimitReached
         }
+        if limitReached { streamLimit.trigger() }
         return .serve(id, request, rejection: nil, storage, body: body, task: task)
     }
 
@@ -839,7 +917,11 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// still sends has no body and is credited at once; the stream is reset with `NO_ERROR`
     /// once the response ends (§8.1).
     func reject(_ id: HTTP2StreamID, _ status: HTTPStatus, storage: HTTPRequestStorage, task: HTTP2StreamTask) -> ReadStep {
-        state.withLock { $0.tasks[id.rawValue] = task }
+        let limitReached = state.withLock { shared -> Bool in
+            shared.tasks[id.rawValue] = task
+            return shared.streamLimitReached
+        }
+        if limitReached { streamLimit.trigger() }
         return .serve(id, nil, rejection: status, storage, body: nil, task: task)
     }
 

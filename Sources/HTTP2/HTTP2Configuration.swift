@@ -63,6 +63,8 @@ public struct HTTP2Configuration: Sendable, Hashable {
     public var lingerTimeout: Duration?
     /// The most bytes a lingering close discards after a connection error.
     public var maxLingerSize: Int
+    /// Rate limits and timeouts against denial-of-service patterns (#0056).
+    public var abuseLimits: HTTP2AbuseLimits
 
     public static let defaultMaxConcurrentStreams = 100
     public static let defaultInitialWindowSize: UInt32 = 65_535
@@ -97,7 +99,8 @@ public struct HTTP2Configuration: Sendable, Hashable {
         drainTimeout: Duration? = nil,
         idleTimeout: Duration? = nil,
         lingerTimeout: Duration? = .seconds(2),
-        maxLingerSize: Int = 1024 * 1024
+        maxLingerSize: Int = 1024 * 1024,
+        abuseLimits: HTTP2AbuseLimits = HTTP2AbuseLimits()
     ) {
         precondition((0...HTTP2StreamTable.Configuration.maxSupportedConcurrentStreams).contains(maxConcurrentStreams),
                      "maxConcurrentStreams out of range")
@@ -136,6 +139,7 @@ public struct HTTP2Configuration: Sendable, Hashable {
         self.idleTimeout = idleTimeout
         self.lingerTimeout = lingerTimeout
         self.maxLingerSize = maxLingerSize
+        self.abuseLimits = abuseLimits
     }
 
     /// The SETTINGS frame the server sends first. `SETTINGS_ENABLE_PUSH` is omitted: a server

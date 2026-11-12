@@ -197,10 +197,13 @@ struct H2ResetTests {
 
     // MARK: Leaks
 
-    /// 1,000 streams opened and reset by the client leave no task, body or count behind.
+    /// 1,000 streams opened and reset by the client leave no task, body or count behind. (This
+    /// is the rapid-reset pattern, so its limits are lifted here; H2AbuseTests covers them.)
     @Test func thousandResetsLeakNothing() async throws {
         let handler = SleepingHandler()
-        try await withH2Driver(handler: handler) { client, driver in
+        let config = HTTP2Configuration(
+            maxConcurrentStreams: 1_000, abuseLimits: HTTP2AbuseLimits(maxResetStreamsPerWindow: nil))
+        try await withH2Driver(configuration: config, handler: handler) { client, driver in
             try await client.handshake()
             var stream: UInt32 = 1
             for _ in 0..<20 {

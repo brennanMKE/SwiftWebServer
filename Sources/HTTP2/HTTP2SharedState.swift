@@ -133,6 +133,20 @@ struct HTTP2SharedState: Sendable {
     var pingWaiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
     /// The opaque data of the last PING sent.
     var lastPingData: UInt64 = 0x5357_5300_0000_0000
+    /// Denial-of-service counters (#0056).
+    var abuse: HTTP2AbuseMonitor
+    /// Handler tasks allowed to run at once: twice MAX_CONCURRENT_STREAMS, so the tasks of reset
+    /// streams that are still being cancelled are bounded too (rapid reset, #0056).
+    let maxRunningStreams: Int
+    /// Streams dispatched over the connection's life (``HTTP2AbuseLimits/maxStreamsPerConnection``).
+    var streamsOpened = 0
+    /// Set once ``HTTP2AbuseLimits/maxStreamsPerConnection`` was reached: the connection shuts
+    /// down gracefully.
+    var streamLimitReached = false
+    /// DATA frames shorter than this, cut by a send window, count as slow-read frames.
+    let smallDataFrameSize: Int
+    /// Whether waiters record when they started (``HTTP2AbuseLimits/windowStallTimeout``).
+    let tracksWindowStalls: Bool
 
     init(configuration: HTTP2Configuration) {
         machine = HTTP2Connection(configuration: configuration.connection)
@@ -141,6 +155,10 @@ struct HTTP2SharedState: Sendable {
             capacity: configuration.outboundQueueSize, maxControlFrames: configuration.maxQueuedControlFrames)
         tracksIdleTime = configuration.idleTimeout != nil
         if tracksIdleTime { idleSince = .now }
+        abuse = HTTP2AbuseMonitor(limits: configuration.abuseLimits)
+        maxRunningStreams = configuration.maxConcurrentStreams * 2
+        smallDataFrameSize = configuration.abuseLimits.smallDataFrameSize
+        tracksWindowStalls = configuration.abuseLimits.windowStallTimeout != nil
         sendWaiters.reserveCapacity(configuration.maxConcurrentStreams)
         fairQueue.reserveCapacity(configuration.maxConcurrentStreams)
         streamWaiters.reserveCapacity(configuration.maxConcurrentStreams)
@@ -160,7 +178,11 @@ struct HTTP2SharedState: Sendable {
             // The peer reset the stream: its body ends (what is buffered is credited) and its
             // handler is cancelled.
             if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
-            if let task = tasks[id.rawValue] { wakeups.cancelledTasks.append(task) }
+            if let task = tasks[id.rawValue] {
+                wakeups.cancelledTasks.append(task)
+                // A reset while the handler runs costs a task and its cancellation (rapid reset).
+                if let flood = recordAbuse(.resetStreams, wakeups: &wakeups) { return flood }
+            }
         }
         switch action {
         case .none, .applyLocalSettings, .send, .sendData, .waitForWindow, .drop, .acceptTrailers:
@@ -173,11 +195,17 @@ struct HTTP2SharedState: Sendable {
                 wakeWriter(&wakeups)
             }
 
-        case .dispatch:
+        case .dispatch(let id, _):
+            if activeStreams >= maxRunningStreams {
+                // Handlers of reset streams are still being cancelled: refuse (#0056).
+                return refuse(id, wakeups: &wakeups)
+            }
             // Counted in the same critical section as the decision, so a graceful shutdown
             // never closes under a stream it already promised to serve (GOAWAY last-stream-ID).
             activeStreams += 1
             idleSince = nil
+            streamsOpened += 1
+            if let limit = abuse.limits.maxStreamsPerConnection, streamsOpened >= limit { streamLimitReached = true }
 
         case .sendPreface(let settings, let increment):
             HTTP2FrameEncoder.encodeSettings(settings, into: &outbound.ordered)
@@ -204,7 +232,13 @@ struct HTTP2SharedState: Sendable {
 
         case .sendPing(let data):
             // Our own PING: ahead of DATA, so the round trip does not include queued responses.
-            HTTP2FrameEncoder.encodePing(opaqueData: data, ack: false, into: &outbound.priority)
+            // During a graceful shutdown it must follow the first GOAWAY instead: its ACK is
+            // the proof that the client saw that GOAWAY (§6.8).
+            if machine.shutdownStarted {
+                HTTP2FrameEncoder.encodePing(opaqueData: data, ack: false, into: &outbound.ordered)
+            } else {
+                HTTP2FrameEncoder.encodePing(opaqueData: data, ack: false, into: &outbound.priority)
+            }
             wakeWriter(&wakeups)
 
         case .pingAcknowledged(let data):
@@ -222,6 +256,10 @@ struct HTTP2SharedState: Sendable {
             wakeWriter(&wakeups)
 
         case .resetStream(let id, let code, let increment):
+            if code == .refusedStream, case .headers = event {
+                // Refused over MAX_CONCURRENT_STREAMS: as cheap to provoke as a reset.
+                if let flood = recordAbuse(.resetStreams, wakeups: &wakeups) { return flood }
+            }
             // The stream is over: its body ends and its handler, if still running, is cancelled.
             if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
             if let task = tasks[id.rawValue] { wakeups.cancelledTasks.append(task) }
@@ -261,6 +299,22 @@ struct HTTP2SharedState: Sendable {
             }
         }
         return action
+    }
+
+    /// Refuses a stream the machine dispatched: `RST_STREAM(REFUSED_STREAM)`, counted as abuse.
+    private mutating func refuse(_ id: HTTP2StreamID, wakeups: inout HTTP2Wakeups) -> HTTP2Connection.Action {
+        if let flood = recordAbuse(.resetStreams, wakeups: &wakeups) { return flood }
+        return handle(.sendReset(streamID: id, .refusedStream), wakeups: &wakeups)
+    }
+
+    /// Counts one event of `kind` (#0056). Over the limit the connection closes with
+    /// `GOAWAY(ENHANCE_YOUR_CALM)`, whose action is returned.
+    mutating func recordAbuse(
+        _ kind: HTTP2AbuseKind, amount: Int = 1, wakeups: inout HTTP2Wakeups
+    ) -> HTTP2Connection.Action? {
+        guard abuse.limit(kind) != nil, isOpen else { return nil }
+        guard !abuse.record(kind, amount: amount, now: .now) else { return nil }
+        return handle(.connectionError(.connection(.enhanceYourCalm, reason: kind.reason)), wakeups: &wakeups)
     }
 
     /// Counts a reply control frame; past the limit the peer is flooding (#0056).
@@ -334,6 +388,11 @@ struct HTTP2SharedState: Sendable {
                 outbound.ordered.append(ByteView(offset: bytes.readerIndex, length: length), from: bytes)
             }
             wakeWriter(&wakeups)
+            if length < bytes.readableBytes && length < smallDataFrameSize && length < machine.peerMaxFrameSize {
+                // A send window cut this frame short: a client that keeps its windows tiny
+                // makes the server send many small frames (slow read, #0056).
+                if recordAbuse(.smallDataFrames, wakeups: &wakeups) != nil { return .dropped }
+            }
             return .sent(length: length, endStream: ends)
         case .waitForWindow:
             // `admit` saw both windows open; keep the rule total.
@@ -353,6 +412,8 @@ struct HTTP2SharedState: Sendable {
         /// Set when its turn came (or the stream or connection closed) before it parked.
         var woken = false
         var continuation: CheckedContinuation<Void, Never>?
+        /// When it started to wait, for ``HTTP2AbuseLimits/windowStallTimeout``.
+        var since: ContinuousClock.Instant?
     }
 
     /// Decides whether a writer may send now (`nil`) or waits (`.wait`, with a new ticket) or
@@ -402,7 +463,8 @@ struct HTTP2SharedState: Sendable {
     private mutating func park(_ streamID: HTTP2StreamID, needsWindow: Bool, front: Bool) -> UInt64 {
         let ticket = nextWaiterID
         nextWaiterID &+= 1
-        sendWaiters[ticket] = SendWaiter(streamID: streamID.rawValue, needsWindow: needsWindow)
+        sendWaiters[ticket] = SendWaiter(
+            streamID: streamID.rawValue, needsWindow: needsWindow, since: tracksWindowStalls ? .now : nil)
         if needsWindow, let window = machine.sendWindow(of: streamID), window <= 0 {
             streamWaiters[streamID.rawValue] = ticket
         } else if front {
@@ -455,8 +517,8 @@ struct HTTP2SharedState: Sendable {
         if let ticket = streamWaiters[id.rawValue] {
             if (machine.sendWindow(of: id) ?? 1) > 0 {
                 streamWaiters.removeValue(forKey: id.rawValue)
-                // Back into the fair queue's order: it still needs queue space and connection
-                // window, which `admit` checks when it comes back.
+                // It still needs queue space and connection window, which `admit` checks when
+                // it comes back.
                 wake(ticket, &wakeups)
             }
         } else if machine.sendWindow(of: id) == nil,
@@ -481,6 +543,27 @@ struct HTTP2SharedState: Sendable {
         fairQueue.removeAll(keepingCapacity: true)
         streamWaiters.removeAll(keepingCapacity: true)
         granted = nil
+    }
+
+    /// Zero-window stall (#0056): a writer that has waited since before `cutoff` for its
+    /// stream's window gets its stream reset with `ENHANCE_YOUR_CALM`; one that waited that long
+    /// for the connection window closes the connection with `GOAWAY(ENHANCE_YOUR_CALM)`.
+    mutating func expireStalledWriters(before cutoff: ContinuousClock.Instant, wakeups: inout HTTP2Wakeups) {
+        guard isOpen else { return }
+        for (stream, ticket) in streamWaiters {
+            guard let since = sendWaiters[ticket]?.since, since < cutoff else { continue }
+            // The reset wakes the writer, whose retry drops.
+            _ = handle(.sendReset(streamID: HTTP2StreamID(stream), .enhanceYourCalm), wakeups: &wakeups)
+        }
+        guard machine.connectionSendWindow <= 0 else { return }
+        for ticket in fairQueue {
+            guard let waiter = sendWaiters[ticket], waiter.needsWindow, let since = waiter.since, since < cutoff else {
+                continue
+            }
+            _ = handle(.connectionError(.connection(.enhanceYourCalm, reason: "connection send window stalled")),
+                       wakeups: &wakeups)
+            return
+        }
     }
 
     /// Parks `continuation` for `ticket`. Returns false (and keeps nothing) when the writer
