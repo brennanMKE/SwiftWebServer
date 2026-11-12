@@ -51,8 +51,17 @@ public enum SniffResult: Sendable, Hashable {
 
 /// Per-connection information and signals handed to ``ConnectionProtocol/run(_:handler:context:)``.
 public struct ConnectionContext: Sendable {
-    /// Addresses and security properties of the connection.
-    public var info: ConnectionInfo
+    /// Addresses and security properties of the connection (the same as
+    /// `requestContext.connection`).
+    public var info: ConnectionInfo {
+        get { requestContext.connection }
+        set { requestContext.connection = newValue }
+    }
+    /// The context every request on this connection starts from: ``info`` plus the
+    /// connection-scoped values that ``ConnectionObserver``s set when the connection opened
+    /// (#0090). Protocol runners pass it (with ``RequestContext/startTime`` stamped when
+    /// ``recordsRequestStartTime``) to the handler.
+    public var requestContext: RequestContext
     /// Triggers when the server starts draining. A protocol finishes the exchange in progress,
     /// stops reading new requests (HTTP/1.1 `Connection: close`, HTTP/2 `GOAWAY`) and returns.
     /// The server cancels connections that are still running at the drain deadline.
@@ -63,7 +72,7 @@ public struct ConnectionContext: Sendable {
 
     public init(info: ConnectionInfo, shutdown: ShutdownSignal = ShutdownSignal(),
                 recordsRequestStartTime: Bool = false) {
-        self.info = info
+        self.requestContext = RequestContext(connection: info)
         self.shutdown = shutdown
         self.recordsRequestStartTime = recordsRequestStartTime
     }

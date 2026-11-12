@@ -92,3 +92,49 @@ server once the listeners are bound and are cancelled after the last connection 
 can flush what the final requests produced. A component that throws (other than
 `CancellationError`) shuts the server down, and `Server.run()` rethrows the error. `ServerHandle`
 gives the bound addresses, the draining signal and `requestShutdown()`.
+
+## Connection observers
+
+```swift
+public protocol ConnectionObserver: Sendable {
+    func connectionWillStart(_ connection: inout ConnectionContext)
+    func connectionDidEnd(_ connection: ConnectionContext)
+}
+```
+
+For components with per-connection state (#0090): a log buffer, metric counters. The server
+finds them like components (in the chain and in `components:`), calls `connectionWillStart`
+before the protocol runs and `connectionDidEnd` after the connection closed. In
+`connectionWillStart` the observer sets a typed value on `connection.requestContext`, the
+context every request on the connection starts from, so each request finds its connection's
+state in `context[Key.self]` without a lookup table or a lock. Requests on one HTTP/1.1
+connection run one at a time; on HTTP/2 and HTTP/3 they overlap, so the state must tolerate
+concurrent requests. With no observer registered a connection pays one empty-array check.
+Code that drives a runner directly (benchmarks) calls them through `ConnectionObservers`.
+
+## The pattern in one component: AccessLog
+
+`AccessLog` (target `AccessLog`) is the reference optional component. One value in the chain
+plays four roles, each found by the server at startup:
+
+| Role | Protocol | Effect |
+|---|---|---|
+| Records each request | `HTTPMiddleware` | Called in chain order; formats a line after `next` returns |
+| Needs the start time | `RequestStartTimeConsumer` | Runners stamp `startTime` (one clock read) |
+| Per-connection buffer and counters | `ConnectionObserver` | Opened and merged with each connection |
+| Writes the lines | `ServerComponent` | Runs beside the listeners; cancelled after the last connection, then flushes |
+
+```swift
+let metrics = AccessLogMetrics()
+let server = Server(listeners: [listener], protocols: [HTTP1()]) {
+    if config.metrics { MetricsEndpoint(metrics: metrics) }   // GET /metrics, Prometheus text
+    AccessLog(format: .combined, destination: .file(path: logPath), metrics: metrics)
+    StaticFiles(root: publicURL)
+}
+```
+
+The request path does no I/O and allocates nothing per request: the line is escaped straight
+into the connection's buffer, full batches go to the writer with `BoundedAsyncQueue.trySend`
+(dropped and counted when the queue is full, never awaited), and metrics are relaxed atomic adds
+on the connection's own counters, merged into `AccessLogMetrics` when the connection closes and
+read live on a scrape. Costs: docs/benchmarks/M6-accesslog.md.

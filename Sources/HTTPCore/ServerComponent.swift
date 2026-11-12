@@ -41,6 +41,55 @@ public struct ServerHandle: Sendable {
     }
 }
 
+/// A chain element with per-connection state (#0090): an access log's line buffer and
+/// metric counters, kept per connection so the request path shares nothing between
+/// connections (docs/ROADMAP.md §7, "shard, don't share").
+///
+/// Whoever runs a connection (`Server` in HTTPServer, or a benchmark driving a
+/// runner directly) calls ``connectionWillStart(_:)`` before the protocol runs and
+/// ``connectionDidEnd(_:)`` after it returned, through ``ConnectionObservers``. In
+/// `connectionWillStart` the observer sets typed values on `connection.requestContext`
+/// (``RequestContext/subscript(_:)``); every request on the connection then sees them in its
+/// ``RequestContext``, and `connectionDidEnd` reads them back.
+///
+/// Requests on one connection run one at a time for HTTP/1.1 but may overlap for multiplexed
+/// protocols (HTTP/2, HTTP/3), so per-connection state must tolerate concurrent requests.
+///
+/// The server finds observers in the chain (and in its `components:`) at startup, like
+/// ``ServerComponent``s. With none, a connection pays one empty-array check.
+public protocol ConnectionObserver: Sendable {
+    /// Called once per connection, before its first request.
+    func connectionWillStart(_ connection: inout ConnectionContext)
+    /// Called once per connection, after its last response was handed to the transport.
+    func connectionDidEnd(_ connection: ConnectionContext)
+}
+
+/// The ``ConnectionObserver``s of a chain, found once at startup.
+public struct ConnectionObservers: Sendable {
+    public let observers: [any ConnectionObserver]
+
+    public init(_ observers: [any ConnectionObserver] = []) {
+        self.observers = observers
+    }
+
+    /// The observers in `chain` (see ``MiddlewareChainInspector/connectionObservers(in:)``).
+    public init(chain: Any) {
+        self.init(MiddlewareChainInspector.connectionObservers(in: chain))
+    }
+
+    @inlinable public var isEmpty: Bool { observers.isEmpty }
+
+    /// Lets every observer set its connection-scoped values, in chain order.
+    public func connectionWillStart(_ connection: inout ConnectionContext) {
+        for observer in observers { observer.connectionWillStart(&connection) }
+    }
+
+    /// Tells every observer the connection ended, in reverse chain order.
+    public func connectionDidEnd(_ connection: ConnectionContext) {
+        for observer in observers.reversed() { observer.connectionDidEnd(connection) }
+    }
+}
+
 /// A builder type that holds other chain elements: every composition type of
 /// ``MiddlewareBuilder`` conforms, so the server can inspect a built chain once at startup
 /// (find its ``ServerComponent``s and whether it has a ``RequestStartTimeConsumer``).
@@ -66,6 +115,13 @@ public enum MiddlewareChainInspector {
         var components: [any ServerComponent] = []
         visit(root) { if let component = $0 as? any ServerComponent { components.append(component) } }
         return components
+    }
+
+    /// The ``ConnectionObserver``s in the chain, outermost first.
+    public static func connectionObservers(in root: Any) -> [any ConnectionObserver] {
+        var observers: [any ConnectionObserver] = []
+        visit(root) { if let observer = $0 as? any ConnectionObserver { observers.append(observer) } }
+        return observers
     }
 
     /// True when an element of the chain reads ``RequestContext/startTime``.

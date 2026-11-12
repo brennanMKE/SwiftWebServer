@@ -25,6 +25,10 @@ import Synchronization
 /// connection closes. A component that throws shuts the server down, and `run()` rethrows the
 /// error after draining.
 ///
+/// ``ConnectionObserver``s (per-connection state: an access log's buffer and counters) are
+/// found the same way; each connection is opened with them before its protocol runs and
+/// closed with them after its transport closed (#0090).
+///
 /// ## Task tree
 ///
 /// `run()` is the root: one child task per component, one per listener, and under each listener
@@ -64,6 +68,9 @@ public final class Server<Listener, Handler: HTTPHandler>: Sendable {
     let components: [any ServerComponent]
     /// The chain reads ``RequestContext/startTime``, so the runners stamp each request.
     let recordsRequestStartTime: Bool
+    /// Elements with per-connection state (an access log): the `components:` that are
+    /// observers, then those found in the chain.
+    let connectionObservers: ConnectionObservers
 
     /// Triggers when draining starts; handed to every connection.
     let shutdownSignal = ShutdownSignal()
@@ -107,6 +114,9 @@ public final class Server<Listener, Handler: HTTPHandler>: Sendable {
         self.handler = handler
         self.components = components + MiddlewareChainInspector.serverComponents(in: handler)
         self.recordsRequestStartTime = MiddlewareChainInspector.needsRequestStartTime(handler)
+        self.connectionObservers = ConnectionObservers(
+            components.compactMap { $0 as? any ConnectionObserver }
+                + MiddlewareChainInspector.connectionObservers(in: handler))
         state.withLock { state in
             state.perListener = entries.map { ListenerStatistics(name: $0.name, kind: $0.kind) }
         }
@@ -371,10 +381,13 @@ public final class Server<Listener, Handler: HTTPHandler>: Sendable {
         await acceptLoop(listener.connections, index: index,
                          refuse: { connection in await listener.refuse(connection) },
                          serve: { connection in
-                             let context = ConnectionContext(info: listener.connectionInfo(connection),
+                             var context = ConnectionContext(info: listener.connectionInfo(connection),
                                                              shutdown: self.shutdownSignal,
                                                              recordsRequestStartTime: self.recordsRequestStartTime)
+                             let observers = self.connectionObservers
+                             if !observers.isEmpty { observers.connectionWillStart(&context) }
                              await proto.run(connection, handler: self.handler, context: context)
+                             if !observers.isEmpty { observers.connectionDidEnd(context) }
                          })
     }
 
@@ -450,10 +463,12 @@ public final class Server<Listener, Handler: HTTPHandler>: Sendable {
     }
 
     private func serveConnection<T: ByteStreamTransport>(_ transport: T) async {
-        let context = ConnectionContext(info: transport.info, shutdown: shutdownSignal,
+        var context = ConnectionContext(info: transport.info, shutdown: shutdownSignal,
                                         recordsRequestStartTime: recordsRequestStartTime)
+        if !connectionObservers.isEmpty { connectionObservers.connectionWillStart(&context) }
         await protocols.serve(transport, handler: handler, context: context)
         await transport.close(.normal)
+        if !connectionObservers.isEmpty { connectionObservers.connectionDidEnd(context) }
     }
 
     /// A listener or component failed while running: remember the first error, then shut down.

@@ -125,6 +125,43 @@ private func waitUntil(_ condition: () -> Bool) async {
         try await queue.send(ByteBuffer("chunk"))
         #expect(await queue.next() == ByteBuffer("chunk"))
     }
+
+    /// `trySend` never suspends: it accepts while there is room, hands off to a waiting
+    /// consumer, and refuses when full or finished (#0090).
+    @Test func trySendAcceptsHandsOffAndRefuses() async throws {
+        let queue = BoundedAsyncQueue<Int>(capacity: 2)
+        #expect(queue.trySend(1))
+        #expect(queue.trySend(2))
+        #expect(!queue.trySend(3))
+        #expect(queue.bufferedCount == 2)
+        #expect(await queue.next() == 1)
+        #expect(await queue.next() == 2)
+
+        // Delivered whether the consumer is already waiting (hand-off) or not yet (buffered).
+        async let waiting = queue.next()
+        for _ in 0..<10 { await Task.yield() }
+        #expect(queue.trySend(4))
+        #expect(await waiting == 4)
+
+        queue.finish()
+        #expect(!queue.trySend(5))
+        #expect(await queue.next() == nil)
+    }
+
+    /// `tryNext` takes a buffered element without suspending and admits a waiting producer.
+    @Test func tryNextTakesBufferedElementsAndAdmitsWaitingProducers() async throws {
+        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        #expect(queue.tryNext() == nil)
+        try await queue.send(1)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await queue.send(2) }
+            await waitUntil { queue.suspendedProducerCount == 1 }
+            #expect(queue.tryNext() == 1)
+            try await group.next()
+            #expect(queue.tryNext() == 2)
+            #expect(queue.tryNext() == nil)
+        }
+    }
 }
 
 @Suite struct DeadlineTests {

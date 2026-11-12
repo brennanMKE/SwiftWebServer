@@ -648,8 +648,8 @@ where Transport.Stream: ResettableStream {
         let response: HTTPResponse
         if let request {
             isHead = request.method == .head
-            let requestContext = RequestContext(
-                connection: context.info, startTime: context.recordsRequestStartTime ? .now() : nil)
+            var requestContext = context.requestContext
+            if context.recordsRequestStartTime { requestContext.startTime = .now() }
             do {
                 response = try await handler.handle(request, context: requestContext)
                 storage.endRequest()
