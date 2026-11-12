@@ -11,6 +11,7 @@ let usage = """
       serve    run the new-stack HTTP/1.1 server with a built-in hello handler
       h1conn   ns and allocations per request of the HTTP/1.1 connection loop
       accept   new-connection rate, per-phase latency and allocations per connection
+      router   Router match microbenchmarks (same as `micro --filter Router`)
 
     Run `sws-bench <command> --help` for options. With no command, runs `micro`.
     """
@@ -32,6 +33,8 @@ do {
         status = try await H1ConnBench.run(rest)
     case "accept":
         status = try await AcceptBench.run(rest)
+    case "router":
+        status = try MicroCommand.run(["--filter", "Router"] + rest)
     case "help", "--help", "-h":
         print(usage)
         status = 0
