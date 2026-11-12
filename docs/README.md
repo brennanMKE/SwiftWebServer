@@ -29,3 +29,10 @@ Scripts live in `../scripts/` and can be run from any directory:
 | `list-ports.sh` | List ports used by running SwiftWebServer processes |
 | `run-autobahn-*.sh` | Autobahn WebSocket test suite (needs Docker / `wstest`) |
 | `commands.txt` | Handy manual curl checks |
+
+Examples:
+
+| Path | Purpose |
+|---|---|
+| `Examples/go-api` | Stdlib-only Go REST API (`/api/health`, `/api/items`, `/api/echo`) used as the upstream for the reverse proxy (M17). `go run ./Examples/go-api` |
+| `Root/http-config.proxy.json` | Static site at `/` plus `/api` proxied to the Go app; takes effect once M17 lands |

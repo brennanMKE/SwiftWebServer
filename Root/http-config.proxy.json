@@ -1,0 +1,24 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "root": "Public",
+  "tls": {
+    "identity": "../.test-identity/server.p12",
+    "password": "sws-test-password",
+    "port": 8443
+  },
+  "http2": true,
+  "http3": { "enabled": true, "altSvcMaxAge": 86400 },
+  "proxy": [
+    {
+      "path": "/api",
+      "upstream": "http://127.0.0.1:9000",
+      "stripPrefix": false,
+      "preserveHost": false,
+      "forwardedHeaders": "x-forwarded",
+      "rewriteLocation": true,
+      "websocket": false,
+      "timeouts": { "connect": 2, "response": 30, "idle": 60 }
+    }
+  ]
+}
