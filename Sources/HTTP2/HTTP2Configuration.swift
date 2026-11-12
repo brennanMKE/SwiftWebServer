@@ -61,6 +61,10 @@ public struct HTTP2Configuration: Sendable, Hashable {
     /// so the client reads the GOAWAY instead of a reset caused by unread data. `nil` closes at
     /// once.
     public var lingerTimeout: Duration?
+    /// A lingering close also ends once the client sent nothing for this long: with no input
+    /// in flight, closing cannot reset the connection over unread data. `nil` waits for the
+    /// client to close or for ``lingerTimeout``.
+    public var lingerQuietTimeout: Duration?
     /// The most bytes a lingering close discards after a connection error.
     public var maxLingerSize: Int
     /// Rate limits and timeouts against denial-of-service patterns (#0056).
@@ -99,6 +103,7 @@ public struct HTTP2Configuration: Sendable, Hashable {
         drainTimeout: Duration? = nil,
         idleTimeout: Duration? = nil,
         lingerTimeout: Duration? = .seconds(2),
+        lingerQuietTimeout: Duration? = .milliseconds(500),
         maxLingerSize: Int = 1024 * 1024,
         abuseLimits: HTTP2AbuseLimits = HTTP2AbuseLimits()
     ) {
@@ -116,7 +121,7 @@ public struct HTTP2Configuration: Sendable, Hashable {
                      "HTTP2Configuration sizes must be positive")
         if let settingsTimeout { precondition(settingsTimeout > .zero, "settingsTimeout must be positive") }
         precondition(shutdownPingTimeout >= .zero && maxLingerSize >= 0, "shutdown limits must not be negative")
-        for timeout in [drainTimeout, idleTimeout, lingerTimeout] {
+        for timeout in [drainTimeout, idleTimeout, lingerTimeout, lingerQuietTimeout] {
             if let timeout { precondition(timeout > .zero, "HTTP2Configuration timeouts must be positive") }
         }
         self.cleartext = cleartext
@@ -138,6 +143,7 @@ public struct HTTP2Configuration: Sendable, Hashable {
         self.drainTimeout = drainTimeout
         self.idleTimeout = idleTimeout
         self.lingerTimeout = lingerTimeout
+        self.lingerQuietTimeout = lingerQuietTimeout
         self.maxLingerSize = maxLingerSize
         self.abuseLimits = abuseLimits
     }

@@ -190,6 +190,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// Triggers when the reader stopped: the peer closed, the transport failed, or a lingering
     /// close finished discarding. The writer's lingering close waits for it.
     let readerDone = ShutdownSignal()
+    /// Receives that returned bytes, counted so a lingering close can tell a quiet peer
+    /// (``HTTP2Configuration/lingerQuietTimeout``).
+    let receives = Atomic<Int>(0)
     /// Triggers when ``HTTP2AbuseLimits/maxStreamsPerConnection`` streams were dispatched: the
     /// connection shuts down gracefully, so the client moves to a new one (#0056).
     let streamLimit = ShutdownSignal()
@@ -385,6 +388,11 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// side (the peer reads end of stream after the GOAWAY) and wait for the reader to see the
     /// peer close, for at most ``HTTP2Configuration/lingerTimeout``. Closing at once could make
     /// TCP reset the connection over unread input and destroy the GOAWAY in flight.
+    ///
+    /// A peer that sends nothing for ``HTTP2Configuration/lingerQuietTimeout`` has no unread
+    /// input to provoke a reset, so the connection closes then. That matters where the
+    /// half-close does not reach the peer (Network.framework TLS sends no close_notify for it),
+    /// which would otherwise wait for the full timeout; h2spec's 5.4.1/1 waits 2 s (#0061).
     func linger() async {
         guard let limit = configuration.lingerTimeout, !readerDone.isTriggered else { return }
         do {
@@ -393,11 +401,29 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             return
         }
         let readerDone = self.readerDone
+        let quiet = configuration.lingerQuietTimeout
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await readerDone.wait() }
             group.addTask { try? await Task.sleep(for: limit) }
+            if let quiet {
+                group.addTask { await self.waitForQuietInput(quiet) }
+            }
             await group.next()
             group.cancelAll()
+        }
+    }
+
+    /// Returns once a whole `quiet` period passed without a receive returning bytes (or on
+    /// cancellation).
+    func waitForQuietInput(_ quiet: Duration) async {
+        while !Task.isCancelled {
+            let before = receives.load(ordering: .relaxed)
+            do {
+                try await Task.sleep(for: quiet)
+            } catch {
+                return
+            }
+            if receives.load(ordering: .relaxed) == before { return }
         }
     }
 
@@ -602,6 +628,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             buffer.clear()
             do {
                 guard try await transport.receive(into: &buffer, maxLength: configuration.receiveSize) > 0 else { return }
+                receives.add(1, ordering: .relaxed)
             } catch {
                 return
             }
@@ -630,6 +657,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             buffer.clear()
             guard let count = try? await transport.receive(into: &buffer, maxLength: configuration.receiveSize),
                   count > 0 else { break }
+            receives.add(1, ordering: .relaxed)
             discarded += count
         }
         buffer.clear()

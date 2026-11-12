@@ -93,6 +93,8 @@ struct H2LimitsTests {
                                             endStream: false))
             let response = try await client.response(on: 1)
             #expect(Self.status(response.head) == "431")
+            // The reset waits for the body's next DATA (#0061).
+            try await client.send(F.data(1, Array(repeating: 1, count: 100), endStream: false))
             let after = try await client.frames(until: { if case .rstStream = $0 { return true }; return $0.isGoaway })
             #expect(after.last == .rstStream(stream: 1, .noError), "\(after)")
         }
