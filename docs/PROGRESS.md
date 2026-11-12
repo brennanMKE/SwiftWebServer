@@ -15,7 +15,7 @@ Milestone status for docs/ROADMAP.md. Updated by the orchestrator at each milest
 | M8 QUIC transport | **done** | #0098 #0099 resolved | — |
 | M9 HTTP/3 MVP | **done** | #0100–#0103 resolved | shipped binary serves h3 + Alt-Svc |
 | M11 HTTP/2 codecs | done (early) | #0034 #0036 #0039–#0041 resolved | — |
-| M10 HTTP/3 hardening | mostly done | #0104 #0107 resolved; #0105 (browser interop) needs local CA; #0106 QPACK dynamic table optional | close code never reaches wire (NW limitation) |
+| M10 HTTP/3 hardening | mostly done | #0104 #0106 #0107 resolved (QPACK dynamic table, decoder side, off by default); #0105 (browser interop) needs local CA | close code never reaches wire (NW limitation) |
 | M12 HTTP/2 connections | **done** | #0042–#0052 resolved | — |
 | M13 HTTP/2 flow control and conformance | **done** | #0053–#0056, #0061, #0065, #0119 resolved; #0062 browser interop needs local CA | h2spec 146/146; h2load 375k req/s |
 | M14 WebSockets | **done** | #0108 #0109 #0116 #0117 resolved | URLSession echo |
@@ -30,8 +30,7 @@ M3 numbers (load average about 8–34): parse.head 10 headers 133 ns (was 369 ns
 Final check at b6fc9a6: 1479 debug and 1478 release tests pass ([M-final-micro](benchmarks/M-final-micro.md)). Server comparison: [SERVER-COMPARISON.md](SERVER-COMPARISON.md).
 
 Remaining:
-- **M17 Reverse proxy** (#0120–#0124), in progress: the shipped server serves `/` from disk and proxies `/api` to a localhost app (TCP or Unix socket); end-to-end test against `Examples/go-api` passes. Remaining: connection limits and idle eviction in the pool (#0120); trusted proxies and allocation-free matching (#0121); per-mount timeouts, retries and health checks (#0122); WebSocket and Upgrade passthrough (#0123); h2/h3 proxy tests, the per-host `hosts[].proxy` key, and the benchmark against Apache mod_proxy and nginx (#0124).
+- **M17 Reverse proxy** (#0120–#0125) resolved: static site at `/` plus proxied mounts (top-level and `hosts[].proxy`) to localhost apps over TCP or Unix sockets, from h1/h2/h3 clients; pooled keep-alive client with limits, idle eviction and liveness check; timeouts (502/504), retries for idempotent requests, round-robin and health checks; trusted proxies, cookie path rewriting; WebSocket passthrough (h1 Upgrade, h2/h3 extended CONNECT); access log via `accessLog` config key. Benchmark vs Apache mod_proxy and nginx in `docs/benchmarks/M17-proxy.md` (SWS 10–20% behind under concurrency; the per-read timeout race costs ~17 allocations and 8–10 µs per request — fix is a kqueue deadline in NetworkTransport).
 - #0072 local CA, #0062 and #0105 browser interop: need the owner to trust a local CA by hand.
-- #0106 QPACK dynamic table (optional).
 - Proposed M16 performance milestone (awaiting owner): CPU-per-request metric, same-thread executor resume, SO_REUSEPORT per-core listeners, writev, full-response cache, specialized protocol runners (#0083 boundary cost).
 - Legacy issues 0001–0060 superseded by the new issues are still `open`; they need an owner pass to close them.
