@@ -40,6 +40,37 @@ struct H3CurlTests {
         #expect(lines.allSatisfy { $0.hasPrefix("200 ") })
     }
 
+    /// #0106: with a QPACK dynamic table advertised, curl's encoder (nghttp3) inserts the
+    /// repeated request fields and references them; every request still gets the right answer.
+    @Test func curlUsesTheQPACKDynamicTable() async throws {
+        let tracker = H3ConnectionTracker()
+        let http3 = HTTP3(
+            configuration: H3Configuration(qpackMaxTableCapacity: 4096, qpackBlockedStreams: 16), tracker: tracker)
+        let handler = ClosureHandler { request in
+            var body = ByteBuffer(bytes: Array(request.string(of: request.path).utf8))
+            body.append(contentsOf: Array(" ".utf8))
+            let fields = request.headers.snapshot()
+            let value = fields.firstIndex(named: "x-dynamic").map { fields.valueString(at: $0) } ?? "-"
+            body.append(contentsOf: Array(value.utf8))
+            return HTTPResponse(status: .ok, body: .bytes(body))
+        }
+        let output = try await withQUICServer(handler: handler, http3: http3) { port in
+            var arguments = ["--http3-only", "-k", "-s", "-S", "--max-time", "30",
+                             "-H", "x-dynamic: a value worth indexing", "-w", " %{http_code}\\n"]
+            for i in 0..<10 {
+                arguments += ["https://127.0.0.1:\(port)/r\(i)"]
+            }
+            return try await runCurl(arguments)
+        }
+        let lines = output.split(separator: "\n")
+        #expect(lines.count == 10)
+        for (i, line) in lines.enumerated() {
+            #expect(line == "/r\(i) a value worth indexing 200")
+        }
+        #expect(tracker.qpackDynamicInserts > 0)
+        #expect(tracker.qpackDynamicSections > 0)
+    }
+
     /// #0102: a shutdown while curl waits on a slow handler sends GOAWAY, lets the request
     /// finish, then closes the connection, and the whole server (accept loop and connection
     /// tasks) returns well before QUIC's 10 s idle timeout could have ended it.
@@ -99,7 +130,7 @@ let h3CurlPath = "/opt/homebrew/opt/curl/bin/curl"
 /// Serves `handler` with `HTTP3` on a QUIC listener (127.0.0.1, port 0) while `body` runs,
 /// then closes the listener and every connection.
 func withQUICServer<H: HTTPHandler, R: Sendable>(
-    handler: H, _ body: @Sendable (UInt16) async throws -> R
+    handler: H, http3: HTTP3 = HTTP3(), _ body: @Sendable (UInt16) async throws -> R
 ) async throws -> R {
     let material = try TestIdentity.load()
     let identity = try TLSIdentity(pkcs12: material.pkcs12, password: TestIdentity.password)
@@ -114,8 +145,8 @@ func withQUICServer<H: HTTPHandler, R: Sendable>(
                 do {
                     for try await connection in listener.connections {
                         connections.addTask {
-                            await HTTP3().run(connection, handler: handler,
-                                              context: ConnectionContext(info: connection.info, shutdown: shutdown))
+                            await http3.run(connection, handler: handler,
+                                            context: ConnectionContext(info: connection.info, shutdown: shutdown))
                         }
                     }
                 } catch {}

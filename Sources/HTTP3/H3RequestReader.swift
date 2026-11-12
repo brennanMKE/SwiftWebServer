@@ -5,8 +5,9 @@ import QPACK
 /// ``H3RequestStream`` and decodes HEADERS. The runner first reads up to the request head,
 /// then keeps calling ``next(from:)`` in the stream's body pump.
 ///
-/// All state is local to the stream's task; nothing is shared with other streams (static-table
-/// QPACK has no connection state).
+/// All state is local to the stream's task, except with a QPACK dynamic table (#0106): then
+/// field sections are decoded through the connection's ``H3QPACKDecoderContext``, and a
+/// section that needs inserts not yet received waits for them (a blocked stream).
 struct H3RequestReader {
     enum Event {
         /// The request head decoded and validated.
@@ -43,9 +44,26 @@ struct H3RequestReader {
     /// returns `false` when that is too many for the connection (`H3_EXCESSIVE_LOAD`, #0104).
     let skippedFrames: (@Sendable (Int) -> Bool)?
     var reportedSkippedFrames = 0
+    /// The request stream's ID, for QPACK Section Acknowledgments and Stream Cancellations.
+    let streamID: UInt64
+    /// The connection's dynamic table state; `nil` for static-table-only QPACK.
+    let qpack: H3QPACKDecoderContext?
+    /// Sends queued QPACK decoder stream instructions (with ``qpack``).
+    let flushDecoderStream: (@Sendable () async -> Void)?
+    /// The Required Insert Count of the HEADERS frame being decoded (with ``qpack``).
+    var requiredInsertCount: UInt64 = 0
+    /// Called for each section decoded that referenced the dynamic table (debug counter).
+    var dynamicSectionDecoded: (@Sendable () -> Void)?
 
-    init(configuration: H3Configuration, storage: HTTPRequestStorage, skippedFrames: (@Sendable (Int) -> Bool)? = nil) {
+    init(
+        configuration: H3Configuration, storage: HTTPRequestStorage, streamID: UInt64 = 0,
+        qpack: H3QPACKDecoderContext? = nil, flushDecoderStream: (@Sendable () async -> Void)? = nil,
+        skippedFrames: (@Sendable (Int) -> Bool)? = nil
+    ) {
         self.storage = storage
+        self.streamID = streamID
+        self.qpack = qpack
+        self.flushDecoderStream = flushDecoderStream
         self.receiveSize = configuration.receiveSize
         self.allowsExtendedConnect = configuration.enableConnectProtocol
         self.skippedFrames = skippedFrames
@@ -97,17 +115,22 @@ struct H3RequestReader {
                 case .headers:
                     switch machine.handle(.headers) {
                     case .decodeRequestHead:
-                        return decodeHead()
+                        if qpack != nil, let event = await admitSection() { return event }
+                        let event = decodeHead()
+                        if qpack != nil, let failure = await acknowledgeSection() { return failure }
+                        return event
                     case .decodeTrailers:
+                        if qpack != nil, let event = await admitSection() { return event }
                         do throws(H3HeadError) {
-                            trailers = try withSection { (bytes, decoder) throws(H3HeadError) in
-                                try H3RequestHeadDecoder.decodeTrailers(bytes, decoder: &decoder)
-                            }
+                            trailers = try decodeTrailers()
                         } catch {
+                            cancelUnacknowledgedSection(error)
+                            await flushDecoderStream?()
                             machine.markFailed()
                             if case .qpack(let qpack) = error { return .connectionError(qpack.code.rawValue) }
                             return .streamError(.messageError)
                         }
+                        if qpack != nil, let failure = await acknowledgeSection() { return failure }
                         continue
                     case let action:
                         return failure(action)
@@ -171,14 +194,96 @@ struct H3RequestReader {
         return step
     }
 
-    mutating func decodeHead() -> Event {
-        do throws(H3HeadError) {
-            let storage = self.storage
-            let allowsExtendedConnect = self.allowsExtendedConnect
-            let request = try withSection { (bytes, decoder) throws(H3HeadError) -> HTTPRequest in
+    // MARK: QPACK dynamic table (#0106)
+
+    /// Reads the HEADERS frame's Required Insert Count and, when its inserts have not arrived,
+    /// waits for them. Returns the event to report instead of decoding, if any.
+    mutating func admitSection() async -> Event? {
+        guard let qpack else { return nil }
+        let result: Result<QPACKDynamicDecoder.Admission, QPACKError> = section.withUnsafeBytes { bytes in
+            do throws(QPACKError) {
+                return .success(try qpack.admit(bytes))
+            } catch {
+                return .failure(error)
+            }
+        }
+        let admission: QPACKDynamicDecoder.Admission
+        switch result {
+        case .success(let value):
+            admission = value
+        case .failure(let error):
+            machine.markFailed()
+            return .connectionError(error.code.rawValue)
+        }
+        switch admission {
+        case .ready(let count):
+            requiredInsertCount = count
+            return nil
+        case .blocked(let count):
+            requiredInsertCount = count
+            guard await qpack.waitForInserts(count) else {
+                // Cancelled (the stream timed out, or the connection is closing): tell the
+                // peer's encoder it need not keep this section's entries (RFC 9204 §4.4.2).
+                // The runner sends it once this stream's tasks have ended.
+                qpack.cancelStream(streamID)
+                machine.markFailed()
+                return .failed
+            }
+            return nil
+        }
+    }
+
+    /// Sends the Section Acknowledgment a dynamic section queued. Returns a connection error
+    /// when the peer does not read our decoder stream and its backlog grew too large.
+    func acknowledgeSection() async -> Event? {
+        guard let qpack, requiredInsertCount > 0 else { return nil }
+        dynamicSectionDecoded?()
+        if qpack.isDecoderStreamBacklogged { return .connectionError(HTTP3Error.excessiveLoad.rawValue) }
+        await flushDecoderStream?()
+        return nil
+    }
+
+    /// A dynamic section that failed to decode as a stream error (malformed or too large) was
+    /// not acknowledged: cancel the stream so the encoder can release its entries. A QPACK
+    /// error closes the connection, so there is nobody to tell.
+    func cancelUnacknowledgedSection(_ error: H3HeadError) {
+        guard let qpack, requiredInsertCount > 0, error.isStreamError else { return }
+        qpack.cancelStream(streamID)
+    }
+
+    mutating func decodeTrailers() throws(H3HeadError) -> HTTPFields {
+        let section = self.section
+        if let qpack {
+            var dynamic = H3DynamicSectionDecoder(context: qpack, streamID: streamID, requiredInsertCount: requiredInsertCount)
+            return try Self.withSection(section, decoder: &dynamic) { (bytes, decoder) throws(H3HeadError) in
+                try H3RequestHeadDecoder.decodeTrailers(bytes, decoder: &decoder)
+            }
+        }
+        return try Self.withSection(section, decoder: &decoder) { (bytes, decoder) throws(H3HeadError) in
+            try H3RequestHeadDecoder.decodeTrailers(bytes, decoder: &decoder)
+        }
+    }
+
+    mutating func decodeRequest() throws(H3HeadError) -> HTTPRequest {
+        let storage = self.storage
+        let allowsExtendedConnect = self.allowsExtendedConnect
+        let section = self.section
+        if let qpack {
+            var dynamic = H3DynamicSectionDecoder(context: qpack, streamID: streamID, requiredInsertCount: requiredInsertCount)
+            return try Self.withSection(section, decoder: &dynamic) { (bytes, decoder) throws(H3HeadError) in
                 try H3RequestHeadDecoder.decode(bytes, decoder: &decoder, storage: storage,
                                                 allowsExtendedConnect: allowsExtendedConnect)
             }
+        }
+        return try Self.withSection(section, decoder: &decoder) { (bytes, decoder) throws(H3HeadError) in
+            try H3RequestHeadDecoder.decode(bytes, decoder: &decoder, storage: storage,
+                                            allowsExtendedConnect: allowsExtendedConnect)
+        }
+    }
+
+    mutating func decodeHead() -> Event {
+        do throws(H3HeadError) {
+            let request = try decodeRequest()
             let contentLength: UInt64?
             switch request.headers.contentLength() {
             case .absent: contentLength = nil
@@ -190,6 +295,7 @@ struct H3RequestReader {
             _ = machine.handle(.requestHead(contentLength: contentLength))
             return .head(request)
         } catch {
+            cancelUnacknowledgedSection(error)
             if error == .fieldSectionTooLarge {
                 // Answered `431`: the stream stays readable so the body can be drained.
                 _ = machine.handle(.requestHead(contentLength: nil))
@@ -201,10 +307,10 @@ struct H3RequestReader {
     }
 
     /// Calls `body` with the copied HEADERS payload and the QPACK decoder.
-    mutating func withSection<R>(
-        _ body: (UnsafeRawBufferPointer, inout QPACKDecoder) throws(H3HeadError) -> R
+    static func withSection<Decoder: QPACKSectionDecoder, R>(
+        _ section: [UInt8], decoder: inout Decoder,
+        _ body: (UnsafeRawBufferPointer, inout Decoder) throws(H3HeadError) -> R
     ) throws(H3HeadError) -> R {
-        let section = self.section
         let result: Result<R, H3HeadError> = section.withUnsafeBytes { bytes in
             do throws(H3HeadError) {
                 return .success(try body(bytes, &decoder))

@@ -36,6 +36,15 @@ public struct H3Configuration: Sendable, Hashable {
     public var timeouts: H3Timeouts
     /// Rapid reset, stream, frame and QPACK floods, slow readers and idle connections (#0104).
     public var abuseLimits: H3AbuseLimits
+    /// The QPACK dynamic table capacity we let the peer's encoder use, advertised as
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §5, #0106). 0 (the default) keeps request
+    /// decoding static-table only, with no state shared between request streams; a non-zero
+    /// value makes the connection keep a dynamic table for the peer's encoder stream.
+    public var qpackMaxTableCapacity: Int
+    /// The most request streams that may wait for QPACK inserts at once, advertised as
+    /// `SETTINGS_QPACK_BLOCKED_STREAMS`; one more is `QPACK_DECOMPRESSION_FAILED`. Only
+    /// meaningful with a non-zero ``qpackMaxTableCapacity``. Default 0.
+    public var qpackBlockedStreams: Int
 
     public static let defaultMaxConcurrentRequestStreams = 100
     public static let defaultMaxRequestBodySize = 10 * 1024 * 1024
@@ -51,13 +60,20 @@ public struct H3Configuration: Sendable, Hashable {
         maxRequestBodySize: Int = H3Configuration.defaultMaxRequestBodySize,
         maxUnreadBodySize: Int = H3Configuration.defaultMaxUnreadBodySize,
         timeouts: H3Timeouts = H3Timeouts(),
-        abuseLimits: H3AbuseLimits = H3AbuseLimits()
+        abuseLimits: H3AbuseLimits = H3AbuseLimits(),
+        qpackMaxTableCapacity: Int = 0,
+        qpackBlockedStreams: Int = 0
     ) {
         precondition(maxFieldSectionSize > 0 && maxEncodedFieldSectionLength > 0,
                      "H3Configuration field section limits must be positive")
         precondition(receiveSize > 0 && bodyQueueCapacity > 0, "H3Configuration sizes must be positive")
         precondition(maxConcurrentRequestStreams > 0, "H3Configuration.maxConcurrentRequestStreams must be positive")
         precondition(maxRequestBodySize >= 0 && maxUnreadBodySize >= 0, "H3Configuration body limits must not be negative")
+        // Capacity is bounded so 2 × capacity (the table's arena) and the entry ring stay small.
+        precondition(qpackMaxTableCapacity >= 0 && qpackMaxTableCapacity <= 1 << 20,
+                     "H3Configuration.qpackMaxTableCapacity must be in 0...1 MiB")
+        precondition(qpackBlockedStreams >= 0 && qpackBlockedStreams <= 1 << 16,
+                     "H3Configuration.qpackBlockedStreams must be in 0...65536")
         self.maxFieldSectionSize = maxFieldSectionSize
         self.maxEncodedFieldSectionLength = maxEncodedFieldSectionLength
         self.enableConnectProtocol = enableConnectProtocol
@@ -68,15 +84,20 @@ public struct H3Configuration: Sendable, Hashable {
         self.maxUnreadBodySize = maxUnreadBodySize
         self.timeouts = timeouts
         self.abuseLimits = abuseLimits
+        self.qpackMaxTableCapacity = qpackMaxTableCapacity
+        self.qpackBlockedStreams = qpackBlockedStreams
     }
 
-    /// The SETTINGS this server sends: a QPACK dynamic table of capacity 0, no blocked
-    /// streams, the field section limit, and extended CONNECT when enabled.
+    /// Whether the connection keeps a QPACK dynamic table for the peer's encoder.
+    public var usesQPACKDynamicTable: Bool { qpackMaxTableCapacity > 0 }
+
+    /// The SETTINGS this server sends: the QPACK dynamic table capacity and blocked streams
+    /// (0 and 0 by default), the field section limit, and extended CONNECT when enabled.
     public var localSettings: H3Settings {
         H3Settings(
-            qpackMaxTableCapacity: 0,
+            qpackMaxTableCapacity: UInt64(qpackMaxTableCapacity),
             maxFieldSectionSize: UInt64(maxFieldSectionSize),
-            qpackBlockedStreams: 0,
+            qpackBlockedStreams: UInt64(usesQPACKDynamicTable ? qpackBlockedStreams : 0),
             enableConnectProtocol: enableConnectProtocol ? true : nil)
     }
 }
@@ -338,10 +359,10 @@ public struct H3Connection: Sendable {
         return bytes
     }
 
-    /// The first byte of our QPACK encoder stream. With a table capacity of 0 we never send an
-    /// encoder instruction, so the stream carries only its type.
+    /// The first byte of our QPACK encoder stream. Our encoder never inserts (static-table
+    /// responses), so the stream carries only its type.
     public static let qpackEncoderStreamPreface: [UInt8] = [0x02]
-    /// The first byte of our QPACK decoder stream. With static-only field sections there is
-    /// nothing to acknowledge, so it carries only its type.
+    /// The first byte of our QPACK decoder stream. With a dynamic table (#0106) Section
+    /// Acknowledgments, Stream Cancellations and Insert Count Increments follow it.
     public static let qpackDecoderStreamPreface: [UInt8] = [0x03]
 }

@@ -35,12 +35,19 @@ public struct QPACKError: Error, Equatable, Sendable {
         /// The decoded field section exceeds the configured maximum size (name + value + 32
         /// per field, RFC 9114 §4.2.2). The HTTP/3 layer may answer this with a 431 instead.
         case fieldSectionTooLarge
-        /// Set Dynamic Table Capacity asks for more than the capacity we advertised (0).
+        /// Set Dynamic Table Capacity asks for more than the capacity we advertised.
         case tableCapacityExceeded
         /// An Insert instruction adds an entry that cannot fit in the dynamic table.
         case insertExceedsCapacity
-        /// A Duplicate instruction references an entry that does not exist.
+        /// An encoder instruction or field line references a dynamic table entry that does not
+        /// exist, was evicted, or is at or above the section's Required Insert Count.
         case invalidDynamicIndex
+        /// The encoded Required Insert Count cannot be decoded (RFC 9204 §4.5.1.1), or it is
+        /// larger than one past the largest absolute index the field section references.
+        case invalidRequiredInsertCount
+        /// More streams would be blocked than the `SETTINGS_QPACK_BLOCKED_STREAMS` we
+        /// advertised (RFC 9204 §2.1.2).
+        case blockedStreamsExceeded
         /// A Section Acknowledgment for a stream with no unacknowledged field section that
         /// references the dynamic table (we never send one).
         case unexpectedSectionAcknowledgment

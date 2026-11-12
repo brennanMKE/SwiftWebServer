@@ -24,7 +24,12 @@ import Synchronization
 ///   body reader that feeds the request's `HTTPRequestBody` (``H3BodyChannel``), and, when
 ///   per-stream ``H3Timeouts`` are set, a watchdog;
 /// - connection-level decisions go through ``H3Connection`` in a `Mutex`, with no suspension
-///   inside the lock. Request streams share no other state (static-table QPACK).
+///   inside the lock. Request streams share no other state, unless a QPACK dynamic table is
+///   configured (``H3Configuration/qpackMaxTableCapacity``, #0106): then the table is one
+///   more `Mutex` (``H3QPACKDecoderContext``), a request whose field section needs inserts not
+///   yet received waits for them (bounded by ``H3Configuration/qpackBlockedStreams``), and our
+///   decoder stream carries Section Acknowledgments, Stream Cancellations and Insert Count
+///   Increments.
 ///
 /// ## Graceful shutdown (RFC 9114 §5.2)
 ///
@@ -157,6 +162,11 @@ where Transport.Stream: ResettableStream {
     let sendBudget: H3SendBudget?
     /// RFC 9218 priorities of the request streams (#0107).
     let priorities: H3Priorities
+    /// The QPACK dynamic table, when ``H3Configuration/qpackMaxTableCapacity`` is non-zero
+    /// (#0106); `nil` keeps request decoding static-table only.
+    let qpack: H3QPACKDecoderContext?
+    /// Set once our decoder stream's type byte was sent, so instructions may follow it.
+    let decoderStreamReady = Atomic<Bool>(false)
 
     init(
         transport: Transport, handler: Handler, context: ConnectionContext, configuration: H3Configuration,
@@ -173,6 +183,7 @@ where Transport.Stream: ResettableStream {
         credit = transport as? any StreamCreditGranting
         sendBudget = configuration.abuseLimits.maxConnectionSendBuffer.map { H3SendBudget(capacity: $0) }
         priorities = H3Priorities(maxEarly: configuration.maxConcurrentRequestStreams)
+        qpack = configuration.usesQPACKDynamicTable ? H3QPACKDecoderContext(configuration: configuration) : nil
         trackerID = tracker.connectionStarted()
     }
 
@@ -279,6 +290,11 @@ where Transport.Stream: ResettableStream {
                 let stream = try await transport.openUnidirectionalStream()
                 localStreams.withLock { $0.append(stream) }
                 try await stream.send(ByteBuffer(bytes: preface), endOfStream: false)
+            }
+            if qpack != nil {
+                // Instructions queued before the decoder stream existed go out now.
+                decoderStreamReady.store(true, ordering: .sequentiallyConsistent)
+                await flushQPACKDecoderStream()
             }
             return true
         } catch {
@@ -501,6 +517,10 @@ where Transport.Stream: ResettableStream {
     }
 
     func readQPACKStream(_ stream: Stream, buffer initial: ByteBuffer, critical: H3Connection.CriticalStream) async {
+        if critical == .qpackEncoder, let qpack {
+            await readQPACKEncoderStream(stream, buffer: initial, qpack: qpack)
+            return
+        }
         var buffer = initial
         var encoderReader = QPACKEncoderStreamReader()
         var decoderReader = QPACKDecoderStreamReader()
@@ -529,6 +549,52 @@ where Transport.Stream: ResettableStream {
             // A partial instruction (a few bytes at most) stays for the next receive.
             _ = buffer.discardReadBytes()
             guard await receiveCritical(stream, into: &buffer, critical: critical) else { return }
+        }
+    }
+
+    /// Reads the peer's encoder stream into the dynamic table (#0106): inserts wake blocked
+    /// request streams and are acknowledged on our decoder stream (Insert Count Increment).
+    func readQPACKEncoderStream(_ stream: Stream, buffer initial: ByteBuffer, qpack: H3QPACKDecoderContext) async {
+        var buffer = initial
+        while true {
+            let instructions: Int
+            do throws(QPACKError) {
+                let bytes = buffer
+                let (consumed, count, inserts) = try bytes.withUnsafeReadableBytes {
+                    (input) throws(QPACKError) -> (Int, Int, Int) in
+                    try qpack.consumeEncoderStream(input)
+                }
+                buffer.moveReaderIndex(forwardBy: consumed)
+                instructions = count
+                if inserts > 0 { tracker.qpackInserted(inserts) }
+            } catch {
+                await fail(.qpackFailure(code: error.code.rawValue), stream: nil)
+                return
+            }
+            guard await recordAbuse(.qpackInstructions, amount: instructions) else { return }
+            if instructions > 0 { await flushQPACKDecoderStream() }
+            // A partial instruction stays for the next receive. It is bounded: a string longer
+            // than any insert could be is an encoder stream error before its bytes arrive.
+            _ = buffer.discardReadBytes()
+            guard await receiveCritical(stream, into: &buffer, critical: .qpackEncoder) else { return }
+        }
+    }
+
+    /// Sends the queued QPACK decoder stream instructions, unless another task is already
+    /// sending (it sends these too) or our decoder stream is not open yet.
+    func flushQPACKDecoderStream() async {
+        // A cancelled task's send would fail and lose the bytes; a later flush sends them.
+        guard let qpack, !Task.isCancelled, decoderStreamReady.load(ordering: .sequentiallyConsistent) else { return }
+        guard let decoder = localStreams.withLock({ $0.count > 2 ? $0[2] : nil }) else { return }
+        guard qpack.beginFlush() else { return }
+        while let bytes = qpack.nextFlush() {
+            do {
+                try await decoder.send(ByteBuffer(bytes: bytes), endOfStream: false)
+            } catch {
+                // The connection is closing; nothing more can be sent.
+                _ = qpack.nextFlush(failed: true)
+                return
+            }
         }
     }
 
@@ -603,6 +669,8 @@ where Transport.Stream: ResettableStream {
             end = await process(stream, watch: nil)
         }
         await signal(end, on: stream)
+        // A Stream Cancellation queued by a request whose tasks were cancelled while blocked.
+        if qpack != nil { await flushQPACKDecoderStream() }
         await stream.close(.normal)
         requestStreamClosed(served: true)
     }
@@ -682,8 +750,19 @@ where Transport.Stream: ResettableStream {
     /// Reads the request head and serves the request, or fails the stream.
     func process(_ stream: Stream, watch: H3StreamWatch?) async -> RequestEnd {
         let storage = HTTPRequestStorage(bufferCapacity: 512, fieldCapacity: 16)
-        var reader = H3RequestReader(configuration: configuration, storage: storage) { [self] skipped in
+        var flush: (@Sendable () async -> Void)?
+        if qpack != nil {
+            flush = { [self] in await flushQPACKDecoderStream() }
+        }
+        let skippedFrames: @Sendable (Int) -> Bool = { [self] skipped in
             countAbuse(.unknownRequestFrames, amount: skipped)
+        }
+        var reader = H3RequestReader(
+            configuration: configuration, storage: storage, streamID: stream.streamID, qpack: qpack,
+            flushDecoderStream: flush, skippedFrames: skippedFrames)
+        if qpack != nil {
+            let tracker = self.tracker
+            reader.dynamicSectionDecoded = { tracker.qpackDynamicSectionDecoded() }
         }
         switch await reader.next(from: stream) {
         case .head(let request):
