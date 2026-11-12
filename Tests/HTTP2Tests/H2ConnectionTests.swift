@@ -296,8 +296,9 @@ struct H2ConnectionTests {
                 == .sent(length: 300, endStream: true))
         // The ordered lane is past its capacity: stream writers wait for the writer.
         #expect(!shared.outbound.hasSpace)
-        guard case .wait(let generation) = shared.sendHeaders(
-            streamID: HTTP2StreamID(1), status: .ok, headers: HTTPFields(), contentLength: nil, endStream: true,
+        _ = shared.handle(.headers(streamID: HTTP2StreamID(3), endStream: true, trailers: false), wakeups: &wakeups)
+        guard case .wait(let ticket) = shared.sendHeaders(
+            streamID: HTTP2StreamID(3), status: .ok, headers: HTTPFields(), contentLength: nil, endStream: true,
             wakeups: &wakeups)
         else {
             Issue.record("did not wait")
@@ -307,7 +308,9 @@ struct H2ConnectionTests {
             Issue.record("no batch")
             return
         }
-        #expect(shared.generation != generation)
+        // The batch freed queue space: the waiting writer gets its turn.
+        #expect(shared.granted == ticket)
+        #expect(shared.sendWaiters[ticket]?.woken == true)
         #expect(shared.outbound.batches == 1)
         let frames = H2FrameReader.frames(in: batch)
         #expect(frames.count == 6, "\(frames)")
