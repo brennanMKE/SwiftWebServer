@@ -93,6 +93,9 @@ public struct H3FrameParser: Sendable {
         case goaway(id: UInt64)
         /// A MAX_PUSH_ID frame.
         case maxPushID(UInt64)
+        /// A PRIORITY_UPDATE frame (RFC 9218 §7.2) for a request stream or (`push`) a push,
+        /// with its Priority Field Value. Control stream only.
+        case priorityUpdate(push: Bool, id: UInt64, field: PayloadLocation)
     }
 
     /// The result of ``parse(_:)``.
@@ -249,7 +252,7 @@ public struct H3FrameParser: Sendable {
             }
         case .request:
             switch type {
-            case .cancelPush, .settings, .goaway, .maxPushID:
+            case .cancelPush, .settings, .goaway, .maxPushID, .priorityUpdateRequest, .priorityUpdatePush:
                 throw .frameUnexpected
             case .pushPromise where configuration.role == .server:
                 throw .frameUnexpected
@@ -273,6 +276,11 @@ public struct H3FrameParser: Sendable {
         case .cancelPush, .goaway, .maxPushID:
             // Exactly one varint: 1 to 8 bytes.
             guard length >= 1, length <= 8 else { throw .frameError }
+            limit = Int(length)
+        case .priorityUpdateRequest, .priorityUpdatePush:
+            // An element ID varint, then a field value of bounded size.
+            guard length >= 1 else { throw .frameError }
+            guard length <= UInt64(Self.maxPriorityUpdateLength) else { throw .excessiveLoad }
             limit = Int(length)
         default:
             if let max = configuration.maxUnknownFrameLength, length > UInt64(max) { throw .excessiveLoad }
@@ -308,10 +316,16 @@ public struct H3FrameParser: Sendable {
             return .goaway(id: try Self.singleVarint(payload))
         case .maxPushID:
             return .maxPushID(try Self.singleVarint(payload))
+        case .priorityUpdateRequest, .priorityUpdatePush:
+            guard case .value(let id, let used) = QUICVarint.decode(payload) else { throw .frameError }
+            return .priorityUpdate(push: type == .priorityUpdatePush, id: id, field: location(used..<payload.count))
         default:
             preconditionFailure("only buffered frame types reach complete")
         }
     }
+
+    /// The longest PRIORITY_UPDATE payload accepted (a `priority` value is a few bytes).
+    public static let maxPriorityUpdateLength = 1024
 
     /// A payload that must be exactly one varint.
     @usableFromInline

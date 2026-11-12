@@ -155,6 +155,8 @@ where Transport.Stream: ResettableStream {
     let evicted = ShutdownSignal()
     /// ``H3AbuseLimits/maxConnectionSendBuffer``.
     let sendBudget: H3SendBudget?
+    /// RFC 9218 priorities of the request streams (#0107).
+    let priorities: H3Priorities
 
     init(
         transport: Transport, handler: Handler, context: ConnectionContext, configuration: H3Configuration,
@@ -170,6 +172,7 @@ where Transport.Stream: ResettableStream {
             abuse: H3AbuseMonitor(limits: configuration.abuseLimits)))
         credit = transport as? any StreamCreditGranting
         sendBudget = configuration.abuseLimits.maxConnectionSendBuffer.map { H3SendBudget(capacity: $0) }
+        priorities = H3Priorities(maxEarly: configuration.maxConcurrentRequestStreams)
         trackerID = tracker.connectionStarted()
     }
 
@@ -445,7 +448,14 @@ where Transport.Stream: ResettableStream {
                 let output: H3FrameParser.Output
                 do throws(HTTP3Error) {
                     let bytes = buffer
-                    output = try bytes.withUnsafeReadableBytes { (input) throws(HTTP3Error) in try parser.parse(input) }
+                    output = try bytes.withUnsafeReadableBytes { (input) throws(HTTP3Error) in
+                        let output = try parser.parse(input)
+                        // RFC 9218 §7.2 (#0107): the field value lives in this call's input.
+                        if case .priorityUpdate(false, let id, let location) = output.event, id % 4 == 0 {
+                            parser.withPayload(location, in: input) { priorities.update(id, field: $0) }
+                        }
+                        return output
+                    }
                 } catch {
                     await fail(.protocolViolation(error), stream: nil)
                     return
@@ -454,6 +464,22 @@ where Transport.Stream: ResettableStream {
                 if output.event != .needsMoreData { frames += 1 }
                 let frame: H3Connection.ControlFrame
                 switch output.event {
+                case .priorityUpdate(let push, let id, _):
+                    // Applied above. Not a client-initiated bidirectional stream, or a push
+                    // beyond the client's MAX_PUSH_ID (we never push): H3_ID_ERROR. Counted
+                    // with the other control frames toward the flood limit.
+                    let valid: Bool
+                    if push {
+                        let limit = state.withLock { $0.machine.maxPushID }
+                        valid = limit.map { id <= $0 } ?? false
+                    } else {
+                        valid = id % 4 == 0
+                    }
+                    if !valid {
+                        await fail(.protocolViolation(.idError), stream: nil)
+                        return
+                    }
+                    continue
                 case .settings(let settings): frame = .settings(settings)
                 case .goaway(let id): frame = .goaway(id: id)
                 case .maxPushID(let id): frame = .maxPushID(id)
@@ -859,6 +885,12 @@ where Transport.Stream: ResettableStream {
         var isHead = false
         var isConnect = false
         let response: HTTPResponse
+        // RFC 9218 (#0107): the `priority` request field, read before the handler ends the
+        // request's storage.
+        var requested = HTTPPriority()
+        if let request { requested.apply(from: request.headers) }
+        let priority = priorities.open(stream.streamID, requested: requested)
+        defer { priorities.close(stream.streamID) }
         if let request {
             isHead = request.method == .head
             isConnect = request.method == .connect
@@ -890,9 +922,9 @@ where Transport.Stream: ResettableStream {
         }
         guard !Task.isCancelled else { return .responseEnded(.cancelled) }
         if isConnect, case .tunnel(let tunnel) = response.body, (200..<300).contains(response.status.code) {
-            return await runTunnel(response, tunnel, on: stream, body: body, watch: watch)
+            return await runTunnel(response, tunnel, on: stream, body: body, watch: watch, priority: priority)
         }
-        let written = await write(response, isHead: isHead, on: stream, watch: watch)
+        let written = await write(response, isHead: isHead, on: stream, watch: watch, priority: priority)
         guard written == .completed else { return .responseEnded(written) }
         guard !Task.isCancelled else { return .responded(bodyDrained: true) }
         watch?.enterDrain()
@@ -908,9 +940,10 @@ where Transport.Stream: ResettableStream {
     /// the request stream (RFC 9220 §3); see ``HTTP3`` "Extended CONNECT".
     func runTunnel(
         _ response: HTTPResponse, _ tunnel: @Sendable (any ByteStreamTransport, TunnelContext) async -> Void,
-        on stream: Stream, body: H3BodyChannel, watch: H3StreamWatch?
+        on stream: Stream, body: H3BodyChannel, watch: H3StreamWatch?, priority: H3StreamPriority? = nil
     ) async -> StreamOutcome {
-        let sink = H3ResponseSink(stream: stream, budget: sendBudget, watch: watch)
+        priority?.apply(from: response.headers)
+        let sink = H3ResponseSink(stream: stream, budget: sendBudget, watch: watch, priority: priority)
         var encoder = H3ResponseHeadEncoder()
         var out = ByteBuffer(capacity: 256)
         encoder.encode(status: response.status, headers: response.headers, contentLength: nil, into: &out)
@@ -944,8 +977,12 @@ where Transport.Stream: ResettableStream {
 
     /// Writes `response` as HEADERS and DATA frames, then FIN, through the connection's send
     /// budget and the stream's send deadline (``H3ResponseSink``).
-    func write(_ response: HTTPResponse, isHead: Bool, on stream: Stream, watch: H3StreamWatch?) async -> RequestEnd {
-        let sink = H3ResponseSink(stream: stream, budget: sendBudget, watch: watch)
+    func write(
+        _ response: HTTPResponse, isHead: Bool, on stream: Stream, watch: H3StreamWatch?, priority: H3StreamPriority? = nil
+    ) async -> RequestEnd {
+        // A handler's `priority` response field reprioritizes the stream (RFC 9218 §5).
+        priority?.apply(from: response.headers)
+        let sink = H3ResponseSink(stream: stream, budget: sendBudget, watch: watch, priority: priority)
         var status = response.status
         var headers = response.headers
         var body = response.body
@@ -1029,11 +1066,13 @@ struct H3ResponseSink<Stream: ByteStreamTransport>: ByteStreamTransport {
     let stream: Stream
     let budget: H3SendBudget?
     let watch: H3StreamWatch?
+    /// Orders this stream's sends among others waiting for ``budget`` (#0107).
+    var priority: H3StreamPriority? = nil
 
     func send(_ bytes: ByteBuffer, endOfStream: Bool) async throws {
         watch?.armSend()
         defer { watch?.disarmSend() }
-        let held = try await budget?.acquire(bytes.readableBytes) ?? 0
+        let held = try await budget?.acquire(bytes.readableBytes, priority: priority) ?? 0
         defer { budget?.release(held) }
         try await stream.send(bytes, endOfStream: endOfStream)
     }

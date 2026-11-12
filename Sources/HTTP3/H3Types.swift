@@ -17,6 +17,10 @@ public struct H3FrameType: RawRepresentable, Hashable, Sendable, CustomStringCon
     public static let pushPromise = H3FrameType(rawValue: 0x05)
     public static let goaway = H3FrameType(rawValue: 0x07)
     public static let maxPushID = H3FrameType(rawValue: 0x0d)
+    /// PRIORITY_UPDATE for a request stream (RFC 9218 §7.2).
+    public static let priorityUpdateRequest = H3FrameType(rawValue: 0xF0700)
+    /// PRIORITY_UPDATE for a push stream (RFC 9218 §7.2).
+    public static let priorityUpdatePush = H3FrameType(rawValue: 0xF0701)
 
     /// A reserved (GREASE) frame type, 0x1f·N + 0x21 (RFC 9114 §7.2.8).
     @inlinable
@@ -45,6 +49,8 @@ public struct H3FrameType: RawRepresentable, Hashable, Sendable, CustomStringCon
         case .pushPromise: "PUSH_PROMISE"
         case .goaway: "GOAWAY"
         case .maxPushID: "MAX_PUSH_ID"
+        case .priorityUpdateRequest: "PRIORITY_UPDATE(request)"
+        case .priorityUpdatePush: "PRIORITY_UPDATE(push)"
         default: isReserved ? "reserved(0x\(String(rawValue, radix: 16)))" : "unknown(0x\(String(rawValue, radix: 16)))"
         }
     }
