@@ -6,6 +6,8 @@ public struct ReverseProxy: HTTPMiddleware {
     /// Mounts sorted longest path first, so the first match is the longest prefix.
     let mounts: [CompiledMount]
     let client: any UpstreamClient
+    /// Upgraded connections: WebSocket and Upgrade passthrough (#0123).
+    public var tunnel = ProxyTunnelConfiguration()
 
     public init(mounts: [ProxyMount], client: any UpstreamClient) {
         self.mounts = mounts
@@ -28,6 +30,8 @@ public struct ReverseProxy: HTTPMiddleware {
         guard let target = mount.config.upstreams.first else {
             return HTTPResponse(status: .badGateway)
         }
+        if let upgraded = try await proxyUpgradeIfRequested(request, decodedPath: decoded, mount: mount, target: target,
+                                                            clientHost: clientHost, context: context) { return upgraded }
         let upstreamRequest = makeUpstreamRequest(request, decodedPath: decoded, mount: mount,
                                                   target: target, clientHost: clientHost, context: context)
         let response: UpstreamResponse
