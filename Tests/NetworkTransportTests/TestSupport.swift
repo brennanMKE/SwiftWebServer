@@ -11,9 +11,11 @@ final class RawClient: Sendable {
     private let queue = DispatchQueue(label: "sws.test.rawclient")
     private let ready = Mutex<UnsafeContinuation<Void, any Error>?>(nil)
 
-    init(port: UInt16, host: String = "127.0.0.1") {
+    /// With `tls`, TLS over TCP (#0118); otherwise plain TCP.
+    init(port: UInt16, host: String = "127.0.0.1", tls: NWProtocolTLS.Options? = nil) {
         connection = NWConnection(
-            host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+            host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!,
+            using: tls.map { NWParameters(tls: $0) } ?? .tcp)
     }
 
     /// Starts the connection and waits for `.ready` (handlers installed first).
