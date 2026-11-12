@@ -292,13 +292,27 @@ struct HTTP2SharedState: Sendable {
     ) -> StreamStep {
         if let step = admit(ticket, streamID: streamID, needsWindow: false, wakeups: &wakeups) { return step }
         defer { grantNext(&wakeups) }
-        switch handle(.sendHeaders(streamID: streamID, endStream: endStream), wakeups: &wakeups) {
+        // A head larger than the peer's SETTINGS_MAX_HEADER_LIST_SIZE would be refused by it:
+        // send a bare 500 instead, and no body (#0055, like HTTP/3's #0102).
+        var tooLarge = false
+        if let limit = machine.peerMaxHeaderListSize {
+            tooLarge = HTTP2ResponseHeadEncoder.listSize(status: status, headers: headers, contentLength: contentLength)
+                > Int(limit)
+        }
+        let ends = endStream || tooLarge
+        switch handle(.sendHeaders(streamID: streamID, endStream: ends), wakeups: &wakeups) {
         case .send:
-            encoder.encode(
-                streamID: streamID, status: status, headers: headers, contentLength: contentLength,
-                endStream: endStream, maxFrameSize: machine.peerMaxFrameSize, into: &outbound.ordered)
+            if tooLarge {
+                encoder.encode(
+                    streamID: streamID, status: .internalServerError, headers: HTTPFields(), contentLength: nil,
+                    endStream: true, maxFrameSize: machine.peerMaxFrameSize, into: &outbound.ordered)
+            } else {
+                encoder.encode(
+                    streamID: streamID, status: status, headers: headers, contentLength: contentLength,
+                    endStream: endStream, maxFrameSize: machine.peerMaxFrameSize, into: &outbound.ordered)
+            }
             wakeWriter(&wakeups)
-            return .sent(length: 0, endStream: endStream)
+            return .sent(length: 0, endStream: ends)
         default:
             return .dropped
         }

@@ -359,6 +359,11 @@ public struct HTTP2Connection: Sendable {
         case .streamError(let error):
             if let error = requirePeerSettings() { return error }
             guard let id = error.streamID else { return fail(error) }
+            // RST_STREAM must not be sent on an idle stream (§6.4), so a stream error there
+            // (a PRIORITY frame that depends on itself, say) closes the connection instead.
+            if streams.isIdle(id) {
+                return fail(.connection(error.code, reason: "stream error on idle stream \(id): \(error.reason)"))
+            }
             return reset(id, error.code)
 
         case .connectionError(let error):

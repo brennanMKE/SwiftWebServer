@@ -30,6 +30,8 @@ protocol HTTP2ReceiveCredit: AnyObject, Sendable {
 /// - A DATA total that differs from `content-length` makes the body
 ///   ``HTTPRequestBodyError/malformed`` (the connection resets the stream with
 ///   `PROTOCOL_ERROR`), as does an invalid trailer section.
+/// - A body larger than ``maxSize`` fails with ``HTTPRequestBodyError/tooLarge`` (#0055): the
+///   handler's read throws it and the connection answers `413`.
 /// - A reset stream (either side) is ``TransportError/connectionReset``; a closed connection
 ///   ``TransportError/closed``. Bytes still buffered are discarded and their credit returned.
 /// - After the handler returned (``expire()``), reads throw ``HTTPRequestBodyError/expired``,
@@ -59,14 +61,20 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
 
     let streamID: HTTP2StreamID
     let declaredLength: Int?
+    /// The largest body accepted; more fails the body with ``HTTPRequestBodyError/tooLarge``.
+    let maxSize: Int
     let credit: any HTTP2ReceiveCredit
     private let state = Mutex(State())
 
-    init(streamID: HTTP2StreamID, declaredLength: Int?, credit: any HTTP2ReceiveCredit) {
+    init(streamID: HTTP2StreamID, declaredLength: Int?, maxSize: Int = .max, credit: any HTTP2ReceiveCredit) {
         self.streamID = streamID
         self.declaredLength = declaredLength
+        self.maxSize = maxSize
         self.credit = credit
     }
+
+    /// Whether the body failed because it grew past ``maxSize``.
+    var isTooLarge: Bool { state.withLock { ($0.failure as? HTTPRequestBodyError) == .tooLarge } }
 
     /// The request ID ``HTTPRequestBody`` passes back.
     var requestID: UInt64 { UInt64(streamID.rawValue) }
@@ -91,6 +99,12 @@ final class HTTP2BodyChannel: HTTPRequestBodySource {
             if let declaredLength, state.received > declaredLength {
                 discard = Self.fail(&state, HTTPRequestBodyError.malformed, waiter: &waiter) + count
                 return .malformed
+            }
+            if state.received > maxSize {
+                // The handler's read throws `tooLarge` (answered `413`); later DATA is credited
+                // and dropped.
+                discard = Self.fail(&state, HTTPRequestBodyError.tooLarge, waiter: &waiter) + count
+                return .accepted
             }
             bytes.withMemoryRebound(to: UInt8.self) { state.buffered.append(contentsOf: $0.span) }
             waiter = state.waiter

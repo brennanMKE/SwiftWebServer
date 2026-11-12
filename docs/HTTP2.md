@@ -152,7 +152,8 @@ Pure Swift target `HPACK` with no Foundation:
 | `SETTINGS_MAX_CONCURRENT_STREAMS` | 100 | Excess streams get `RST_STREAM(REFUSED_STREAM)` |
 | `SETTINGS_INITIAL_WINDOW_SIZE` | 65,535 | Connection window raised to 1 MiB via `WINDOW_UPDATE` after preface |
 | `SETTINGS_MAX_FRAME_SIZE` | 16,384 | |
-| `SETTINGS_MAX_HEADER_LIST_SIZE` | 16,384 | Also caps total HEADERS + CONTINUATION bytes |
+| `SETTINGS_MAX_HEADER_LIST_SIZE` | 16,384 | Larger request heads get `431` (or `RST_STREAM(PROTOCOL_ERROR)` when already malformed); blocks are decoded up to twice the limit (`headerBlockLimit`), beyond it `GOAWAY(ENHANCE_YOUR_CALM)` (encoded) or `GOAWAY(COMPRESSION_ERROR)` (decoded). A response head over the peer's limit becomes a bare `500` (#0055) |
+| `maxRequestBodySize` | 10 MiB | `413`: a larger `content-length` before the handler; an undeclared body when it grows past (#0055) |
 | `SETTINGS_HEADER_TABLE_SIZE` | 4,096 | |
 | `SETTINGS_ENABLE_PUSH` | omitted (0) | A server must never send 1 |
 | SETTINGS ACK timeout | 10 s | `GOAWAY(SETTINGS_TIMEOUT)` |

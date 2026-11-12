@@ -128,10 +128,21 @@ import Darwin
 /// frame. A WINDOW_UPDATE of 0 is a `PROTOCOL_ERROR`, and a window above 2³¹−1 a
 /// `FLOW_CONTROL_ERROR` (on the stream, or the connection).
 ///
+/// ## Limits (#0055)
+///
+/// - A HEADERS frame past SETTINGS_MAX_CONCURRENT_STREAMS gets `RST_STREAM(REFUSED_STREAM)`;
+///   its block is still decoded.
+/// - A request head over SETTINGS_MAX_HEADER_LIST_SIZE is answered `431` without the handler
+///   (`RST_STREAM(PROTOCOL_ERROR)` when a field before the limit was malformed). Blocks are
+///   decoded up to ``HTTP2Configuration/headerBlockLimit``; past it the connection closes.
+/// - A response head over the peer's SETTINGS_MAX_HEADER_LIST_SIZE becomes a bare `500`.
+/// - A request body over ``HTTP2Configuration/maxRequestBodySize`` is answered `413`.
+/// - A stream error on an idle stream (a PRIORITY frame that depends on itself) closes the
+///   connection, because RST_STREAM must not be sent on an idle stream (§6.4).
+///
 /// ## Not yet
 ///
-/// Extended CONNECT
-/// (#0067: `.tunnel` answers `501`).
+/// Extended CONNECT (#0067: `.tunnel` answers `501`).
 public struct HTTP2: ConnectionProtocol {
     public var configuration: HTTP2Configuration
 
@@ -456,8 +467,10 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     enum ReadStep {
         case proceed
         /// Serve a request on a new stream task; `body` feeds its request body, and `task`
-        /// cancels it.
-        case serve(HTTP2StreamID, HTTPRequest, HTTPRequestStorage, body: HTTP2BodyChannel?, task: HTTP2StreamTask)
+        /// cancels it. With a `rejection` status the handler is not called (#0055: `431`,
+        /// `413`) and there is no request.
+        case serve(HTTP2StreamID, HTTPRequest?, rejection: HTTPStatus?, HTTPRequestStorage, body: HTTP2BodyChannel?,
+                   task: HTTP2StreamTask)
         /// A connection error was answered (or the peer is gone): stop reading.
         case stop
     }
@@ -484,11 +497,13 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
 
         var parser = HTTP2FrameParser(configuration: .init(role: .server))
         var assembler = HeaderBlockAssembler(configuration: .init(
-            maxBlockSize: configuration.maxHeaderListSize, maxContinuationFrames: configuration.maxContinuationFrames))
+            maxBlockSize: configuration.headerBlockLimit, maxContinuationFrames: configuration.maxContinuationFrames))
         // Until our SETTINGS are acknowledged the peer may use the default 4,096-byte table.
+        // Lists up to the hard limit are decoded so an oversized head can be answered `431`;
+        // the advertised limit is enforced by the field sinks.
         var decoder = HPACKDecoder(
             maxTableSize: Swift.max(configuration.headerTableSize, Int(HTTP2Connection.defaultHeaderTableSize)),
-            maxHeaderListSize: configuration.maxHeaderListSize)
+            maxHeaderListSize: configuration.headerBlockLimit)
         var data: DataTarget?
 
         while true {
@@ -514,8 +529,10 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                 case .stop:
                     await discardInput(streams: &streams, buffer: &buffer)
                     return
-                case .serve(let id, let request, let storage, let body, let task):
-                    streams.addTask { await self.runStream(id, request: request, storage: storage, body: body, task: task) }
+                case .serve(let id, let request, let rejection, let storage, let body, let task):
+                    streams.addTask {
+                        await self.runStream(id, request: request, rejection: rejection, storage: storage, body: body, task: task)
+                    }
                 }
             }
             buffer.clear()
@@ -748,7 +765,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             case .dispatch(let id, _):
                 return try dispatch(id, block: block, fragment: fragment, assembler: assembler, decoder: &decoder)
             case .acceptTrailers(let id):
-                var sink = HTTP2TrailerFieldSink()
+                var sink = HTTP2TrailerFieldSink(maxListSize: configuration.maxHeaderListSize)
                 try assembler.decode(block, fragment: fragment, with: &decoder, into: &sink)
                 guard let body = state.withLock({ $0.bodies[id.rawValue] }) else { return .proceed }
                 if sink.failure != nil {
@@ -778,23 +795,35 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         assembler: HeaderBlockAssembler, decoder: inout HPACKDecoder
     ) throws(HTTP2Error) -> ReadStep {
         let storage = HTTPRequestStorage(bufferCapacity: Swift.max(block.size * 2, 256), fieldCapacity: 16)
-        var sink = HTTP2RequestFieldSink(storage: storage)
+        var sink = HTTP2RequestFieldSink(storage: storage, maxListSize: configuration.maxHeaderListSize)
         try assembler.decode(block, fragment: fragment, with: &decoder, into: &sink)
         // A stream that depends on itself (the deprecated PRIORITY flag, RFC 9113 §5.3.1) is a
         // stream PROTOCOL_ERROR; otherwise the priority fields are ignored.
         let selfDependent = block.priority?.dependency == id
-        guard !selfDependent, case .success(let head) = sink.head(endStream: block.endStream) else {
+        let task = HTTP2StreamTask()
+        let head: HTTP2RequestHead
+        switch sink.head(endStream: block.endStream) {
+        case .success(let valid) where !selfDependent:
+            head = valid
+        case .failure(.fieldSectionTooLarge) where !selfDependent:
+            // Over our SETTINGS_MAX_HEADER_LIST_SIZE with no malformed field before the limit:
+            // `431` without the handler (#0055).
+            return reject(id, .requestHeaderFieldsTooLarge, storage: storage, task: task)
+        default:
             // Malformed (RFC 9113 §8.1.1): a stream error. The stream was counted as served
             // when it was dispatched.
             handle(.sendReset(streamID: id, .protocolError))
             streamEnded(id)
             return .proceed
         }
-        let task = HTTP2StreamTask()
+        if let declared = head.contentLength, declared > configuration.maxRequestBodySize {
+            return reject(id, .contentTooLarge, storage: storage, task: task)
+        }
         var request = head.request
         var body: HTTP2BodyChannel?
         if !block.endStream {
-            let channel = HTTP2BodyChannel(streamID: id, declaredLength: head.contentLength, credit: self)
+            let channel = HTTP2BodyChannel(
+                streamID: id, declaredLength: head.contentLength, maxSize: configuration.maxRequestBodySize, credit: self)
             request.body = HTTPRequestBody(source: channel, request: channel.requestID, length: head.contentLength)
             body = channel
         }
@@ -803,7 +832,15 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             shared.tasks[id.rawValue] = task
             if let body { shared.bodies[id.rawValue] = body }
         }
-        return .serve(id, request, storage, body: body, task: task)
+        return .serve(id, request, rejection: nil, storage, body: body, task: task)
+    }
+
+    /// Answers `status` on a dispatched stream without calling the handler. DATA the peer
+    /// still sends has no body and is credited at once; the stream is reset with `NO_ERROR`
+    /// once the response ends (§8.1).
+    func reject(_ id: HTTP2StreamID, _ status: HTTPStatus, storage: HTTPRequestStorage, task: HTTP2StreamTask) -> ReadStep {
+        state.withLock { $0.tasks[id.rawValue] = task }
+        return .serve(id, nil, rejection: status, storage, body: nil, task: task)
     }
 
     // MARK: Streams
@@ -812,16 +849,16 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// zero once every stream ended, however it ended).
     var liveStreamTasks: Int { liveStreams.load(ordering: .relaxed) }
 
-    /// One stream's task: runs ``serve(_:request:storage:body:)`` as the only child of a group
-    /// that ``HTTP2StreamTask/cancel()`` cancels when the stream is reset (#0051).
+    /// One stream's task: runs ``serve(_:request:rejection:storage:body:)`` as the only child of
+    /// a group that ``HTTP2StreamTask/cancel()`` cancels when the stream is reset (#0051).
     func runStream(
-        _ id: HTTP2StreamID, request: HTTPRequest, storage: HTTPRequestStorage, body: HTTP2BodyChannel?,
-        task: HTTP2StreamTask
+        _ id: HTTP2StreamID, request: HTTPRequest?, rejection: HTTPStatus?, storage: HTTPRequestStorage,
+        body: HTTP2BodyChannel?, task: HTTP2StreamTask
     ) async {
         liveStreams.add(1, ordering: .relaxed)
         await withDiscardingTaskGroup { group in
             group.addTask {
-                await self.serve(id, request: request, storage: storage, body: body)
+                await self.serve(id, request: request, rejection: rejection, storage: storage, body: body)
                 task.finish()
             }
             await task.wait()
@@ -837,20 +874,34 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// `CancellationError`. A handler that ends because of it, or throws `CancellationError`, and
     /// a response cut short by it, reset the stream with `CANCEL`; the state machine drops the
     /// reset when the stream is already closed (the peer reset it, or the server did).
-    func serve(_ id: HTTP2StreamID, request: HTTPRequest, storage: HTTPRequestStorage, body: HTTP2BodyChannel?) async {
-        let isHead = request.method == .head
-        var requestContext = context.requestContext
-        if context.recordsRequestStartTime { requestContext.startTime = .now() }
+    ///
+    /// With a `rejection` (#0055) the handler is not called and the response is that status.
+    /// A body that grew past ``HTTP2Configuration/maxRequestBodySize`` makes a handler that
+    /// throws `HTTPRequestBodyError.tooLarge` answer `413` instead of `500`.
+    func serve(
+        _ id: HTTP2StreamID, request: HTTPRequest?, rejection: HTTPStatus?, storage: HTTPRequestStorage,
+        body: HTTP2BodyChannel?
+    ) async {
         var response: HTTPResponse?
         var cancelled = false
-        do {
-            response = try await handler.handle(request, context: requestContext)
-        } catch {
-            if Task.isCancelled || error is CancellationError {
-                cancelled = true
-            } else {
-                response = HTTPResponse(status: .internalServerError)
+        var isHead = false
+        if let request {
+            isHead = request.method == .head
+            var requestContext = context.requestContext
+            if context.recordsRequestStartTime { requestContext.startTime = .now() }
+            do {
+                response = try await handler.handle(request, context: requestContext)
+            } catch {
+                if Task.isCancelled || error is CancellationError {
+                    cancelled = true
+                } else if (error as? HTTPRequestBodyError) == .tooLarge || body?.isTooLarge == true {
+                    response = HTTPResponse(status: .contentTooLarge)
+                } else {
+                    response = HTTPResponse(status: .internalServerError)
+                }
             }
+        } else {
+            response = HTTPResponse(status: rejection ?? .internalServerError)
         }
         storage.endRequest()
         // Body bytes the handler did not read are discarded and credited.
@@ -901,7 +952,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             shared.sendHeaders(streamID: id, status: status, headers: headers, contentLength: declaredLength,
                                endStream: bodyless, ticket: ticket, wakeups: &wakeups)
         }
-        guard head != nil, !bodyless else { return }
+        // A head that ended the stream (bodyless, or replaced by a bare 500 because the peer's
+        // MAX_HEADER_LIST_SIZE refuses it) has no body.
+        guard let head, !head.endStream else { return }
         do {
             switch body {
             case .empty, .tunnel:

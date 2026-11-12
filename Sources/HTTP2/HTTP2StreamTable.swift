@@ -109,6 +109,13 @@ public struct HTTP2StreamTable: Sendable {
         return slots[index].stream
     }
 
+    /// Whether `id` is idle: never opened by a HEADERS frame (§5.1). RST_STREAM must not be
+    /// sent on it (§6.4).
+    public func isIdle(_ id: HTTP2StreamID) -> Bool {
+        guard !id.isConnection, find(id.rawValue) == nil else { return false }
+        return id.isServerInitiated || id > highestClientStreamID
+    }
+
     /// The number of streams in the table, live and recently closed.
     public var count: Int { activeCount + closedCount }
 
