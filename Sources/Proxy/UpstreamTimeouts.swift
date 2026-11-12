@@ -60,8 +60,8 @@ public struct UpstreamPolicy: Sendable, Hashable {
     public var retries: Int
     public var health: UpstreamHealthPolicy
     /// Overrides ``ProxyTunnelConfiguration/idleTimeout`` for this mount's upgraded
-    /// connections; `nil` keeps the proxy-wide value. Config sets it from an explicit
-    /// `timeouts.idle`.
+    /// connections; `nil` keeps the proxy-wide value and `.zero` turns the tunnel's idle limit
+    /// off. Config sets it from an explicit `timeouts.idle` (`0` or `null` there gives `.zero`).
     public var tunnelIdleTimeout: Duration?
     /// Connection limits, the wait queue and idle eviction (#0120).
     public var pool: UpstreamPoolPolicy

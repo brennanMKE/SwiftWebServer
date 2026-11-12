@@ -141,10 +141,11 @@ extension ReverseProxy {
 
         if head.status.code == 101 {
             var headers = ReverseProxyHeaders.stripHopByHop(head.headers)
-            // #0122: an explicitly configured `timeouts.idle` also bounds the tunnel.
+            // #0122: an explicitly configured `timeouts.idle` also bounds the tunnel; `.zero`
+            // turns the tunnel's idle limit off (#0128).
             let configuration = mount.config.policy.tunnelIdleTimeout.map { idle in
                 var c = tunnel
-                c.idleTimeout = idle
+                c.idleTimeout = idle == .zero ? nil : idle
                 return c
             } ?? tunnel
             let pending = connection.pending

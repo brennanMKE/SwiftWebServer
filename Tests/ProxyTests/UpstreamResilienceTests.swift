@@ -230,6 +230,35 @@ let okResponse = UpstreamResponse(status: .ok, headers: HTTPFields(), body: .emp
         await upstream.stop()
     }
 
+    /// #0128: with the idle and response limits off (config `0`/`null`), a slow-streaming
+    /// upstream whose gaps exceed what would otherwise time out finishes its body.
+    @Test(.timeLimit(.minutes(1))) func disabledIdleTimeoutLetsASlowStreamFinish() async throws {
+        let upstream = try await ScriptedUpstream { conn, _, _ in
+            do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+            await ScriptedUpstream.send(conn, "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+            for _ in 0..<3 {
+                do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+                await ScriptedUpstream.send(conn, "1\r\nx\r\n")
+            }
+            await ScriptedUpstream.send(conn, "0\r\n\r\n")
+        }
+        let client = UpstreamHTTP1Client()
+        // A 200ms idle limit would abort this stream (see idleTimeoutAbortsMidBody); nil is off.
+        let proxy = ReverseProxy(mounts: [mount([upstream.target]) {
+            $0.timeouts.idle = nil
+            $0.timeouts.response = nil
+            $0.tunnelIdleTimeout = .zero
+        }], client: client)
+        let response = try await send(proxy, "/slow")
+        #expect(response.status == .ok)
+        let writer = try #require(streamWriter(response))
+        let collector = Collector()
+        try await writer(collector)
+        #expect(collector.chunks.withLock { $0.flatMap { $0 } } == Array("xxx".utf8))
+        await client.shutdown()
+        await upstream.stop()
+    }
+
     @Test(.timeLimit(.minutes(1))) func totalTimeoutAbortsATricklingBody() async throws {
         let upstream = try await ScriptedUpstream { conn, _, _ in
             await ScriptedUpstream.send(conn, "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")

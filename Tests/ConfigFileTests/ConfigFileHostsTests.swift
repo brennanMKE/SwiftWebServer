@@ -108,6 +108,72 @@ import Testing
         #expect(error(json)?.key == key, "\(json): \(String(describing: error(json)))")
     }
 
+    /// #0129: `errorPages` files resolve per host (the site's root, then the top-level root), and
+    /// the top-level root need not exist when hosts serve everything.
+    @Test(.timeLimit(.minutes(1))) func errorPagesResolvePerHost() async throws {
+        let directory = try Directory()
+        try directory.write("a\n", to: "sites/a/index.html")
+        try directory.write("A missing\n", to: "sites/a/errors/404.html")
+        try directory.write("b\n", to: "sites/b/index.html")
+        try directory.write("B missing\n", to: "sites/b/errors/404.html")
+        let file = try parse("""
+            {"root": "does-not-exist", "errorPages": {"404": "errors/404.html"},
+             "hosts": [{"names": ["a.test"], "root": "sites/a"}, {"names": ["b.test"], "root": "sites/b"}]}
+            """, base: directory.path)
+        let handler = try file.settings.makeHandler()
+        #expect(try await Self.body(handler, "a.test", "/nope") == "404 A missing\n")
+        #expect(try await Self.body(handler, "b.test", "/nope") == "404 B missing\n")
+        #expect(try await Self.status(handler, "a.test", "/index.html") == 200)
+        // No site answers: the outer layer's generated page.
+        let unknown = try await Self.body(handler, "c.test", "/")
+        #expect(unknown.hasPrefix("421 <!DOCTYPE html>"), "\(unknown)")
+
+        // A page missing from a site's root comes from the top-level root.
+        try directory.write("shared 404\n", to: "Public/errors/404.html")
+        try directory.write("c\n", to: "sites/c/index.html")
+        let fallback = try parse("""
+            {"root": "Public", "errorPages": {"404": "errors/404.html"},
+             "hosts": [{"names": ["a.test"], "root": "sites/a"}, {"names": ["c.test"], "root": "sites/c"}]}
+            """, base: directory.path)
+        let fallbackHandler = try fallback.settings.makeHandler()
+        #expect(try await Self.body(fallbackHandler, "a.test", "/nope") == "404 A missing\n")
+        #expect(try await Self.body(fallbackHandler, "c.test", "/nope") == "404 shared 404\n")
+        #expect(try await Self.body(fallbackHandler, "d.test", "/").hasPrefix("421 <!DOCTYPE html>"))
+
+        // In neither root: the file fails, naming the page.
+        let missing = try parse("""
+            {"root": "does-not-exist", "errorPages": {"404": "errors/404.html"},
+             "hosts": [{"names": ["c.test"], "root": "sites/c"}]}
+            """, base: directory.path)
+        do {
+            _ = try missing.settings.makeHandler()
+            Issue.record("accepted a page in no root")
+        } catch {
+            #expect(error.key == "errorPages.404", "\(error)")
+            #expect(error.description.contains("hosts[0].root"), "\(error)")
+        }
+    }
+
+    /// Status code and body text, as `"404 <body>"`.
+    static func body(_ handler: some HTTPHandler, _ host: String, _ path: String) async throws -> String {
+        let storage = HTTPRequestStorage(bufferCapacity: 256, fieldCapacity: 2)
+        func add(_ text: String) -> ByteView {
+            let start = storage.buffer.writerIndex
+            storage.buffer.append(contentsOf: Array(text.utf8))
+            return ByteView(offset: start, length: text.utf8.count)
+        }
+        let pathView = add(path)
+        let name = add("host")
+        storage.appendField(nameView: name, hash: ASCII.fnv1aLowercased("host"), valueView: add(host))
+        let request = HTTPRequest(method: .get, path: pathView, headers: storage.fieldsView)
+        let response = try await handler.handle(request, context: RequestContext())
+        var text = ""
+        if case .bytes(let bytes) = response.body {
+            text = bytes.withUnsafeReadableBytes { String(decoding: $0, as: UTF8.self) }
+        }
+        return "\(response.status.code) \(text)"
+    }
+
     static func status(_ handler: some HTTPHandler, _ host: String, _ path: String) async throws -> Int {
         let storage = HTTPRequestStorage(bufferCapacity: 256, fieldCapacity: 2)
         func add(_ text: String) -> ByteView {

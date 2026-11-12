@@ -60,10 +60,12 @@ extension ServerSettings {
             // The server-level proxy is registered once, at the top of the chain
             // (`ProxyMountsLifecycle`); inside each site it only forwards.
             let shared = serverProxy.map(NestedReverseProxy.init)
-            if siteProxy == nil, shared == nil {
+            let sitePages = try siteErrorPages(root: root, offset: offset)
+            if siteProxy == nil, shared == nil, sitePages == nil {
                 sites.append(VirtualHost(host.names, isDefault: host.isDefault, handler: files))
             } else {
                 sites.append(VirtualHost(host.names, isDefault: host.isDefault, handler: MiddlewareBuilder.build {
+                    if let sitePages { sitePages }
                     if let siteProxy { siteProxy }
                     if let shared { shared }
                     ServerSettings.handler(files)
@@ -74,6 +76,28 @@ extension ServerSettings {
             return try VirtualHosts(sites)
         } catch {
             throw ConfigFileError(key: "hosts", "\"hosts\": \(error)")
+        }
+    }
+
+    /// A site's `errorPages` files (#0129): each is looked up in the site's root first, then in
+    /// the top-level ``root`` (which need not exist). `nil` unless `errorPages` names files.
+    func siteErrorPages(root: String, offset: Int) throws(ConfigFileError) -> ErrorPages? {
+        guard case .files(let map) = errorPages else { return nil }
+        let roots = [root, resolvedRoot]
+        do {
+            return try ErrorPages(roots: roots, pages: map)
+        } catch {
+            switch error {
+            case .pageUnavailable(let status, let code):
+                throw ConfigFileError(key: "errorPages.\(status)",
+                                      "\"errorPages.\(status)\": cannot read \(map[status] ?? "") under hosts[\(offset)].root \(root) or root \(resolvedRoot): \(String(cString: strerror(code)))")
+            case .pageOutsideRoot(let status):
+                throw ConfigFileError(key: "errorPages.\(status)",
+                                      "\"errorPages.\(status)\": \(map[status] ?? "") is outside the root of hosts[\(offset)]")
+            default:
+                // The site root itself was already opened by `StaticFiles`.
+                throw Self.describe(error, root: root, pages: map)
+            }
         }
     }
 }

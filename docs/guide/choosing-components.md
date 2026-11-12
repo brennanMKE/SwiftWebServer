@@ -122,10 +122,6 @@ func json(_ text: String, status: HTTPStatus = .ok) -> HTTPResponse {
     return HTTPResponse(status: status, headers: headers, body: .bytes(ByteBuffer(bytes: Array(text.utf8))))
 }
 
-/// `StaticFiles`, `Router` and `VirtualHosts` are both middlewares and handlers. Passing the
-/// last element of a chain through this tells the builder it is the terminal handler.
-func terminal(_ handler: some HTTPHandler) -> some HTTPHandler { handler }
-
 /// Runs `action` on SIGINT and SIGTERM. A plain (nonisolated) function, so the handler does
 /// not inherit `main()`'s main-actor isolation; it runs on a dispatch queue.
 func onShutdownSignal(_ action: @escaping @Sendable () -> Void) -> [any DispatchSourceSignal] {
@@ -170,7 +166,7 @@ struct MySite {
             Compression()
             echo
             router
-            terminal(files)
+            files               // the last element is the terminal handler
         }
 
         // SIGINT and SIGTERM: stop accepting, let open connections finish, then return.
@@ -193,10 +189,9 @@ Combined lines, and SIGINT drained and exited 0.
 
 Things to know when composing:
 
-- **The last element must be unambiguous.** `StaticFiles`, `Router` and `VirtualHosts`
-  conform to both `HTTPMiddleware` and `HTTPHandler`, so as the *last* element of a builder
-  block the compiler reports "ambiguous use of 'buildBlock'". Pass it through a function that
-  returns `some HTTPHandler` (`terminal(files)` above). In the middle of a chain they are
+- **The last element is the terminal handler.** `StaticFiles`, `Router` and `VirtualHosts`
+  conform to both `HTTPMiddleware` and `HTTPHandler`. Written last (`files` above) they are
+  the handler that answers what nothing before them did; in the middle of a chain they are
   middlewares (a `Router` miss falls through to the next element).
 - **Signal handlers must not be main-actor isolated.** A closure written inside an `@main`
   `main()` inherits the main actor; called from a dispatch source it traps
@@ -242,7 +237,7 @@ let server = Server(configuration: settings.serverConfiguration, listeners: [lis
 try await server.run()
 ```
 
-`makeHandler()` returns an opaque `some HTTPHandler`, so it needs no `terminal(_:)`. Its
+`makeHandler()` returns an opaque `some HTTPHandler`, which is a handler only. Its
 access log sits inside `api` here, so requests answered by `api` are not logged; put `AccessLog`
 in front yourself if you need them. This sketch has only the cleartext listener; the
 executable's `makeListeners` in `Sources/SwiftWebServer/ServerMain.swift` shows how it adds the
@@ -278,7 +273,7 @@ var h2 = HTTP2Configuration()
 h2.cleartext = false
 let server = Server(listeners: listeners, protocols: [HTTP2(configuration: h2), HTTP1()]) {
     altSvc
-    terminal(files)
+    files
 }
 altSvc.advertise(port: 8443)
 try await server.run()
@@ -312,9 +307,9 @@ let hosts = try VirtualHosts {
 }
 let server = Server(listeners: [listener], protocols: [HTTP1()]) {
     auth
-    terminal(hosts)
+    hosts
 }
 ```
 
 Each `VirtualHost` takes any handler, including a whole `MiddlewareBuilder` chain
-(`VirtualHost("a.test") { Compression(); terminal(filesA) }`).
+(`VirtualHost("a.test") { Compression(); filesA }`).

@@ -19,9 +19,9 @@ JSON file, or compose its components into your own Swift server.
 | Protocols | HTTP/1.1 (keep-alive, pipelining, chunked bodies, `100-continue`); HTTP/2 over TLS via ALPN (optional h2c); HTTP/3 over QUIC with `Alt-Svc` discovery; WebSockets over all three |
 | Static files | Index files, MIME types, strong ETags, conditional requests (`304`/`412`), single `Range` (`206`), `sendfile` for large files, an in-memory cache for small ones, traversal and dotfile protection |
 | Compression | Brotli, gzip, deflate; static files compressed once or served from `.br`/`.gz` sidecars |
-| Sites | Virtual hosts with wildcards; custom or generated error pages |
+| Sites | Virtual hosts with wildcards; custom (per-site) or generated error pages |
 | Security | TLS from a PKCS#12 file loaded in memory (no keychain); Basic (PBKDF2), HS256 JWT and bearer-token auth with failure limiting; HTTP/2 abuse limits |
-| Dynamic content | Reverse proxy to local apps over TCP or Unix sockets (pooling, timeouts, retries, health checks, WebSocket tunnelling); in-process `Router` and `WebSocketUpgrade` for Swift handlers |
+| Dynamic content | Reverse proxy to local apps over TCP or Unix sockets (pooling, timeouts that `0` turns off for streaming, retries, health checks, WebSocket tunnelling); in-process `Router` and `WebSocketUpgrade` for Swift handlers |
 | Operations | Access log (Common, Combined, JSON) and Prometheus metrics; connection limits and timeouts; graceful drain on SIGINT/SIGTERM; SIGHUP reloads the config and reopens the access log |
 
 ## Quick start
@@ -66,7 +66,7 @@ let server = Server(listeners: [try BSDSocketListener()], protocols: [HTTP1()]) 
     AccessLog(format: .combined, destination: .standardOutput)
     Compression()
     router              // a Router with your routes; misses fall through
-    terminal(files)     // StaticFiles
+    files               // StaticFiles, the terminal handler
 }
 try await server.run()
 ```

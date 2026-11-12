@@ -64,17 +64,40 @@ public struct ErrorPages: HTTPMiddleware {
     /// `text/html; charset=utf-8`. Statuses without a file get the generated page when `defaultPages` is true and
     /// keep their empty body otherwise.
     public init(root: String, pages: [Int: String], defaultPages: Bool = true) throws(InitError) {
-        guard let realRoot = PathResolver.realPath(Array(root.utf8)) else {
-            throw .rootUnavailable(errno: errno)
+        try self.init(roots: [root], pages: pages, defaultPages: defaultPages)
+    }
+
+    /// Pages from files looked up in several roots, first match wins (#0129): a virtual host's
+    /// own root, then the server's. A root that does not exist is skipped (all missing throws
+    /// ``InitError/rootUnavailable(errno:)``); a file found in a root must stay inside it. With
+    /// `requireAll` false, a status whose file is in no root keeps the generated page (or the
+    /// empty body) instead of throwing ``InitError/pageUnavailable(status:errno:)``.
+    public init(roots: [String], pages: [Int: String], defaultPages: Bool = true,
+                requireAll: Bool = true) throws(InitError) {
+        var realRoots: [[UInt8]] = []
+        var rootErrno: Int32 = ENOENT
+        for root in roots {
+            if let real = PathResolver.realPath(Array(root.utf8)) { realRoots.append(real) } else { rootErrno = errno }
         }
+        guard !realRoots.isEmpty else { throw .rootUnavailable(errno: rootErrno) }
         var custom: [Int: Page] = [:]
         for (code, relative) in pages {
             guard (400...599).contains(code) else { throw .invalidStatus(code) }
-            var path = realRoot
-            path.append(UInt8(ascii: "/"))
-            path.append(contentsOf: Array(relative.utf8))
-            guard let real = PathResolver.realPath(path) else {
-                throw .pageUnavailable(status: code, errno: errno)
+            var found: (path: [UInt8], root: [UInt8])?
+            var pageErrno: Int32 = ENOENT
+            for realRoot in realRoots {
+                var path = realRoot
+                path.append(UInt8(ascii: "/"))
+                path.append(contentsOf: Array(relative.utf8))
+                if let real = PathResolver.realPath(path) {
+                    found = (real, realRoot)
+                    break
+                }
+                pageErrno = errno
+            }
+            guard let (real, realRoot) = found else {
+                if requireAll { throw .pageUnavailable(status: code, errno: pageErrno) }
+                continue
             }
             guard real.count > realRoot.count + 1, real.starts(with: realRoot),
                   real[realRoot.count] == UInt8(ascii: "/") || realRoot == [UInt8(ascii: "/")] else {

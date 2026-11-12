@@ -7,9 +7,12 @@ public import Proxy
 extension ServerSettings {
     /// One mount of the `proxy` key: the ``ProxyMount`` fields plus settings stored for later.
     public struct ProxySettings: Sendable, Equatable {
-        /// Upstream timeouts (#0122). `nil` uses the ``UpstreamTimeouts`` default (no limit for
-        /// `total`).
+        /// Upstream timeouts (#0122). `nil` (key absent) uses the ``UpstreamTimeouts`` default (no
+        /// limit for `total`); ``off`` (`0` or `null` in the file, #0128) turns that limit off.
         public struct Timeouts: Sendable, Equatable {
+            /// An explicitly disabled limit.
+            public static let off = Duration.zero
+
             public var connect: Duration?
             public var response: Duration?
             public var idle: Duration?
@@ -48,10 +51,15 @@ extension ServerSettings {
         /// Timeouts, retries and health for the `ReverseProxy` component.
         public var policy: UpstreamPolicy {
             let defaults = UpstreamTimeouts()
-            let limits = UpstreamTimeouts(connect: timeouts.connect ?? defaults.connect,
-                                          response: timeouts.response ?? defaults.response,
-                                          idle: timeouts.idle ?? defaults.idle,
-                                          total: timeouts.total)
+            // Absent keeps the default; `.off` (0 or null) disables the limit (#0128).
+            func resolve(_ value: Duration?, _ fallback: Duration?) -> Duration? {
+                guard let value else { return fallback }
+                return value == Timeouts.off ? nil : value
+            }
+            let limits = UpstreamTimeouts(connect: resolve(timeouts.connect, defaults.connect),
+                                          response: resolve(timeouts.response, defaults.response),
+                                          idle: resolve(timeouts.idle, defaults.idle),
+                                          total: resolve(timeouts.total, defaults.total))
             return UpstreamPolicy(timeouts: limits, retries: retries, health: health,
                                   tunnelIdleTimeout: timeouts.idle, pool: pool)
         }
@@ -134,7 +142,9 @@ extension Parser {
                     let timeouts = try dictionary(item, field)
                     for timeoutName in timeouts.keys.sorted() {
                         let timeoutField = "\(field).\(timeoutName)"
+                        // `0` and `null` both turn the limit off (#0128); `seconds` caps values at a year.
                         let seconds = try seconds(timeouts[timeoutName]!, timeoutField)
+                            ?? ServerSettings.ProxySettings.Timeouts.off
                         switch timeoutName {
                         case "connect": mount.timeouts.connect = seconds
                         case "response": mount.timeouts.response = seconds
