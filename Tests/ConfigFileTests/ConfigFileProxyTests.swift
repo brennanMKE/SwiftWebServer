@@ -76,12 +76,14 @@ import Testing
         let policy = file.settings.proxyMounts[0].policy
         #expect(policy.timeouts == UpstreamTimeouts(connect: .seconds(1), response: .seconds(2), idle: .seconds(3), total: .seconds(4)))
         #expect(policy.retries == 2)
+        #expect(policy.tunnelIdleTimeout == .seconds(3))
         #expect(policy.health == UpstreamHealthPolicy(maxFailures: 5, cooldown: .seconds(6), checkPath: "/health", checkInterval: .seconds(7)))
         // Unset limits keep the defaults.
         let defaults = UpstreamTimeouts()
         let second = file.settings.proxyMounts[1].policy
         #expect(second.timeouts == UpstreamTimeouts(connect: defaults.connect, response: .seconds(9), idle: defaults.idle, total: nil))
         #expect(second.retries == 1)
+        #expect(second.tunnelIdleTimeout == nil)
         #expect(second.health == UpstreamHealthPolicy())
         expectError(#"{"proxy": [{"upstream": "http://h:1", "retries": -1}]}"#, key: "proxy[0].retries")
         expectError(#"{"proxy": [{"upstream": "http://h:1", "health": {"path": "health"}}]}"#, key: "proxy[0].health.path")

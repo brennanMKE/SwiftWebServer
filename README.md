@@ -173,7 +173,8 @@ Gateway Timeout` (both rendered by `errorPages`); a failure after the head abort
 response (close on HTTP/1.1, stream reset on HTTP/2 and HTTP/3). GET, HEAD, PUT, DELETE,
 OPTIONS and TRACE are retried on the next upstream after a connect failure; POST and PATCH
 never are. A client that goes away cancels the upstream request, and that connection is
-closed rather than pooled. **Work in progress:** WebSocket upgrades are not proxied (#0123).
+closed rather than pooled. WebSocket and Upgrade requests are tunnelled (#0123); an explicit
+`timeouts.idle` also closes an idle tunnel (default 300 seconds).
 
 ## Architecture
 

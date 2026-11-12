@@ -46,7 +46,8 @@ extension ServerSettings {
                                           response: timeouts.response ?? defaults.response,
                                           idle: timeouts.idle ?? defaults.idle,
                                           total: timeouts.total)
-            return UpstreamPolicy(timeouts: limits, retries: retries, health: health)
+            return UpstreamPolicy(timeouts: limits, retries: retries, health: health,
+                                  tunnelIdleTimeout: timeouts.idle)
         }
 
         /// The mount for the `ReverseProxy` component.

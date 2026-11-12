@@ -6,6 +6,8 @@ public struct ReverseProxy: HTTPMiddleware {
     /// Mounts sorted longest path first, so the first match is the longest prefix.
     let mounts: [CompiledMount]
     let client: any UpstreamClient
+    /// Upgraded connections: WebSocket and Upgrade passthrough (#0123).
+    public var tunnel = ProxyTunnelConfiguration()
 
     public init(mounts: [ProxyMount], client: any UpstreamClient) {
         self.mounts = mounts
@@ -24,8 +26,13 @@ public struct ReverseProxy: HTTPMiddleware {
         guard let match = match(path: decoded, host: clientHost) else {
             return try await next.handle(request, context: context)
         }
+        let mount = match.mount
+        // #0123: upgrades go to the next healthy upstream in round-robin order.
+        if let target = mount.balancer.peek().map({ mount.config.upstreams[$0] }),
+           let upgraded = try await proxyUpgradeIfRequested(request, decodedPath: decoded, mount: mount, target: target,
+                                                            clientHost: clientHost, context: context) { return upgraded }
         // #0122: upstream choice, timeouts, retries and health are in ReverseProxy+Forwarding.
-        return try await forward(request, decodedPath: decoded, mount: match.mount,
+        return try await forward(request, decodedPath: decoded, mount: mount,
                                  clientHost: clientHost, context: context)
     }
 

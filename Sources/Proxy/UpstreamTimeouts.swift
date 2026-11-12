@@ -59,12 +59,17 @@ public struct UpstreamPolicy: Sendable, Hashable {
     /// methods only. Each attempt goes to the next upstream in round-robin order.
     public var retries: Int
     public var health: UpstreamHealthPolicy
+    /// Overrides ``ProxyTunnelConfiguration/idleTimeout`` for this mount's upgraded
+    /// connections; `nil` keeps the proxy-wide value. Config sets it from an explicit
+    /// `timeouts.idle`.
+    public var tunnelIdleTimeout: Duration?
 
     public init(timeouts: UpstreamTimeouts = UpstreamTimeouts(), retries: Int = 1,
-                health: UpstreamHealthPolicy = UpstreamHealthPolicy()) {
+                health: UpstreamHealthPolicy = UpstreamHealthPolicy(), tunnelIdleTimeout: Duration? = nil) {
         self.timeouts = timeouts
         self.retries = max(0, retries)
         self.health = health
+        self.tunnelIdleTimeout = tunnelIdleTimeout
     }
 }
 

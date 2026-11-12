@@ -46,6 +46,19 @@ final class UpstreamBalancer: Sendable {
         }
     }
 
+    /// The upstream the next request would start with, without advancing the rotation (for
+    /// upgrade checks that usually do not send anything).
+    func peek(now: ContinuousClock.Instant = .now) -> Int? {
+        guard count > 1 else { return count == 1 ? 0 : nil }
+        return state.withLock { state in
+            let start = state.next % count
+            for offset in 0..<count where Self.isUp(state.health[(start + offset) % count], now: now) {
+                return (start + offset) % count
+            }
+            return start
+        }
+    }
+
     func isUp(_ index: Int, now: ContinuousClock.Instant = .now) -> Bool {
         state.withLock { Self.isUp($0.health[index], now: now) }
     }
