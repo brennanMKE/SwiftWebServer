@@ -8,6 +8,7 @@ import Synchronization
 /// | ``header`` | a request stream has not delivered its HEADERS, from the stream's arrival | RESET_STREAM `H3_REQUEST_REJECTED` |
 /// | ``idle`` | the connection has no open request stream | GOAWAY, then CONNECTION_CLOSE `H3_NO_ERROR` |
 /// | ``body`` | the handler waits for request body bytes; restarts on each chunk | `408` (or RESET_STREAM `H3_REQUEST_CANCELLED` once the response started) |
+/// | ``send`` | one response send waits (for the connection's send budget, or for the peer to read: a slow reader, #0104) | RESET_STREAM `H3_REQUEST_CANCELLED` |
 /// | ``unreadBody`` | the response is complete and the rest of the request body is read and discarded | STOP_SENDING `H3_NO_ERROR` |
 /// | ``drain`` | after the final GOAWAY, requests below its ID finish | CONNECTION_CLOSE `H3_NO_ERROR` |
 /// | ``goawayGrace`` | between a first GOAWAY with the largest stream ID and the final one (RFC 9114 §5.2) | the final GOAWAY |
@@ -22,6 +23,7 @@ public struct H3Timeouts: Sendable, Hashable {
     public var idle: Duration?
     public var body: Duration?
     public var unreadBody: Duration?
+    public var send: Duration?
     /// `nil`: in-flight requests run until the server's drain deadline cancels the connection.
     public var drain: Duration?
     /// `nil`: one GOAWAY with the next unprocessed stream ID.
@@ -32,6 +34,7 @@ public struct H3Timeouts: Sendable, Hashable {
     public static let defaultIdle = Duration.seconds(30)
     public static let defaultBody = Duration.seconds(30)
     public static let defaultUnreadBody = Duration.seconds(2)
+    public static let defaultSend = Duration.seconds(30)
     public static let defaultCloseLinger = Duration.seconds(1)
 
     public init(
@@ -39,17 +42,19 @@ public struct H3Timeouts: Sendable, Hashable {
         idle: Duration? = H3Timeouts.defaultIdle,
         body: Duration? = H3Timeouts.defaultBody,
         unreadBody: Duration? = H3Timeouts.defaultUnreadBody,
+        send: Duration? = H3Timeouts.defaultSend,
         drain: Duration? = nil,
         goawayGrace: Duration? = nil,
         closeLinger: Duration? = H3Timeouts.defaultCloseLinger
     ) {
-        for value in [header, idle, body, unreadBody, drain, goawayGrace, closeLinger] {
+        for value in [header, idle, body, unreadBody, send, drain, goawayGrace, closeLinger] {
             if let value { precondition(value > .zero, "H3Timeouts values must be positive") }
         }
         self.header = header
         self.idle = idle
         self.body = body
         self.unreadBody = unreadBody
+        self.send = send
         self.drain = drain
         self.goawayGrace = goawayGrace
         self.closeLinger = closeLinger
@@ -57,11 +62,11 @@ public struct H3Timeouts: Sendable, Hashable {
 
     /// No limits at all.
     public static let disabled = H3Timeouts(
-        header: nil, idle: nil, body: nil, unreadBody: nil, drain: nil, goawayGrace: nil, closeLinger: nil)
+        header: nil, idle: nil, body: nil, unreadBody: nil, send: nil, drain: nil, goawayGrace: nil, closeLinger: nil)
 
     /// The shortest per-stream limit, or `nil` when none is set (no watch is needed).
     var streamTick: Duration? {
-        [header, body, unreadBody].compactMap { $0 }.min()
+        [header, body, unreadBody, send].compactMap { $0 }.min()
     }
 }
 
@@ -79,6 +84,8 @@ final class H3StreamWatch: Sendable {
         case head
         case body
         case drain
+        /// One response send waited longer than ``H3Timeouts/send`` (any phase).
+        case send
     }
 
     struct State {
@@ -87,6 +94,8 @@ final class H3StreamWatch: Sendable {
         var fixed: ContinuousClock.Instant?
         /// The body deadline while the handler waits for body bytes.
         var body: ContinuousClock.Instant?
+        /// The deadline of the response send in progress.
+        var send: ContinuousClock.Instant?
         var finished = false
         var responseStarted = false
     }
@@ -146,6 +155,19 @@ final class H3StreamWatch: Sendable {
         }
     }
 
+    /// A response send starts waiting.
+    func armSend() {
+        guard let limit = timeouts.send else { return }
+        let deadline = ContinuousClock.now.advanced(by: limit)
+        state.withLock { $0.send = deadline }
+    }
+
+    /// The response send in progress completed or failed.
+    func disarmSend() {
+        guard timeouts.send != nil else { return }
+        state.withLock { $0.send = nil }
+    }
+
     /// The response's first bytes are about to be sent.
     func markResponseStarted() {
         state.withLock { $0.responseStarted = true }
@@ -168,7 +190,12 @@ final class H3StreamWatch: Sendable {
             enum Look { case finished, fired(Phase), wait(ContinuousClock.Instant?) }
             let look = state.withLock { state -> Look in
                 if state.finished { return .finished }
-                let deadline = state.phase == .body ? state.body : state.fixed
+                if let send = state.send, send <= now {
+                    state.finished = true
+                    return .fired(.send)
+                }
+                var deadline = state.phase == .body ? state.body : state.fixed
+                if let send = state.send, deadline.map({ send < $0 }) ?? true { deadline = send }
                 if let deadline, deadline <= now {
                     state.finished = true
                     return .fired(state.phase)

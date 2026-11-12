@@ -37,13 +37,19 @@ struct H3RequestReader {
     var section: [UInt8] = []
     /// The request's trailers, once its trailing HEADERS frame decoded.
     var trailers: HTTPFields?
+    /// Called with the number of reserved or unknown frames skipped since the last call;
+    /// returns `false` when that is too many for the connection (`H3_EXCESSIVE_LOAD`, #0104).
+    let skippedFrames: (@Sendable (Int) -> Bool)?
+    var reportedSkippedFrames = 0
 
-    init(configuration: H3Configuration, storage: HTTPRequestStorage) {
+    init(configuration: H3Configuration, storage: HTTPRequestStorage, skippedFrames: (@Sendable (Int) -> Bool)? = nil) {
         self.storage = storage
         self.receiveSize = configuration.receiveSize
+        self.skippedFrames = skippedFrames
         parser = H3FrameParser(configuration: .init(
             streamKind: .request, role: .server,
-            maxFieldSectionLength: configuration.maxEncodedFieldSectionLength))
+            maxFieldSectionLength: configuration.maxEncodedFieldSectionLength,
+            maxUnknownFrameLength: configuration.abuseLimits.maxUnknownFrameLength))
         decoder = QPACKDecoder(maxFieldSectionSize: configuration.maxFieldSectionSize)
         buffer = ByteBuffer(capacity: configuration.receiveSize)
     }
@@ -66,6 +72,14 @@ struct H3RequestReader {
                 } catch {
                     machine.markFailed()
                     return .connectionError(error.rawValue)
+                }
+                if parser.skippedFrameCount != reportedSkippedFrames {
+                    let skipped = parser.skippedFrameCount - reportedSkippedFrames
+                    reportedSkippedFrames = parser.skippedFrameCount
+                    if let skippedFrames, !skippedFrames(skipped) {
+                        machine.markFailed()
+                        return .connectionError(HTTP3Error.excessiveLoad.rawValue)
+                    }
                 }
                 switch step {
                 case .needsMoreData:

@@ -45,17 +45,22 @@ public struct H3FrameParser: Sendable {
         public var maxFieldSectionLength: Int
         /// The largest SETTINGS payload accepted. Larger is `H3_EXCESSIVE_LOAD`.
         public var maxSettingsLength: Int
+        /// The largest reserved or unknown frame accepted (it is skipped, never buffered).
+        /// Larger is `H3_EXCESSIVE_LOAD` (#0104). `nil`: any length.
+        public var maxUnknownFrameLength: Int?
 
         public init(
             streamKind: StreamKind = .request,
             role: Role = .server,
             maxFieldSectionLength: Int = 64 * 1024,
-            maxSettingsLength: Int = 4 * 1024
+            maxSettingsLength: Int = 4 * 1024,
+            maxUnknownFrameLength: Int? = nil
         ) {
             self.streamKind = streamKind
             self.role = role
             self.maxFieldSectionLength = maxFieldSectionLength
             self.maxSettingsLength = maxSettingsLength
+            self.maxUnknownFrameLength = maxUnknownFrameLength
         }
     }
 
@@ -117,6 +122,9 @@ public struct H3FrameParser: Sendable {
     @usableFromInline var varint = VarintParser()
     @usableFromInline var buffer: [UInt8] = []
     @usableFromInline var sawSettings = false
+    /// Reserved and unknown frames skipped so far (counted when their header is read), for the
+    /// abuse limits (#0104).
+    public internal(set) var skippedFrameCount = 0
 
     public init(configuration: Configuration = Configuration()) {
         self.configuration = configuration
@@ -267,6 +275,8 @@ public struct H3FrameParser: Sendable {
             guard length >= 1, length <= 8 else { throw .frameError }
             limit = Int(length)
         default:
+            if let max = configuration.maxUnknownFrameLength, length > UInt64(max) { throw .excessiveLoad }
+            skippedFrameCount += 1
             state = length == 0 ? .frameType : .skipping(remaining: length)
             return
         }
