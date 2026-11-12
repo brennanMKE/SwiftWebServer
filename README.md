@@ -63,7 +63,7 @@ let server = Server(listeners: [try BSDSocketListener()], protocols: [HTTP1()]) 
     AccessLog(format: .combined, destination: .standardOutput)
     Compression()
     router              // a Router with your routes; misses fall through
-    terminal(files)     // StaticFiles
+    files               // StaticFiles, the terminal handler
 }
 try await server.run()
 ```

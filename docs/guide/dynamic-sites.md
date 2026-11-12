@@ -33,11 +33,11 @@ let router = try Router {
 }
 let server = Server(listeners: [listener], protocols: [HTTP1()]) {
     router              // misses fall through to the files
-    terminal(files)
+    files
 }
 ```
 
-A complete, runnable version (with `json(_:)`, `terminal(_:)` and signal handling) is
+A complete, runnable version (with `json(_:)` and signal handling) is
 [`Examples/custom-server`](../../Examples/custom-server/README.md), walked through in
 [Choosing components](choosing-components.md#a-custom-server-package).
 
@@ -87,7 +87,7 @@ let chat = WebSocketUpgrade(path: "/ws",
 let server = Server(listeners: listeners, protocols: [HTTP2(configuration: h2), HTTP1()]) {
     chat
     router
-    terminal(files)
+    files
 }
 ```
 
@@ -285,7 +285,7 @@ let laya = try Router {
     }
     GET("/laya/health") { _, _ in json(#"{"ok": true}"#) }
 }
-// Server(…) { laya; terminal(files) } as in Examples/custom-server.
+// Server(…) { laya; files } as in Examples/custom-server.
 ```
 
 Until LayaKit answers, use the reverse-proxy setup above: the HTTP contract is the same, so a

@@ -44,10 +44,13 @@ let server = Server(configuration: config, listeners: [listener], protocols: [HT
 | `H()` alone | `H` itself |
 
 - Types that are both a middleware and a handler (`StaticFiles`, `Router`, `VirtualHosts`)
-  are ambiguous as the *last* element of a block ("ambiguous use of 'buildBlock'"). Pass the
-  last one through a function returning `some HTTPHandler`, e.g.
-  `func terminal(_ h: some HTTPHandler) -> some HTTPHandler { h }`, as `ConfigFile` does with
-  `EitherHandler` (docs/guide/choosing-components.md). The examples below elide this.
+  are the terminal handler when they are the *last* element of a block, and middlewares
+  anywhere else (a miss falls through to `next`). The builder has overloads for them that
+  outrank both the middleware and the handler forms (#0126), so they are written as is:
+  `AccessLog(); router; StaticFiles(root: …)` builds
+  `CompiledChain<MiddlewareChain<AccessLog, MiddlewareChain<Router, StaticFiles>>>`. Under
+  `if` they give an `OptionalMiddleware` (`404` when absent and last), under `if`/`else` an
+  `EitherHandler`, both of which are then also middleware and handler.
 - Order is onion order: the first middleware sees the request first and the response last.
 - A handler anywhere but last, or a branch mixing a middleware and a handler, does not compile.
 - Up to 10 elements per block; an `if true { … }` groups more. Middlewares in front of a handler
