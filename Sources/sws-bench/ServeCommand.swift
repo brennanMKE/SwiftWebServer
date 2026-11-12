@@ -1,3 +1,4 @@
+import AccessLog
 import Dispatch
 import Foundation
 import HTTP1
@@ -24,6 +25,7 @@ enum ServeCommand {
         usage: sws-bench serve [--config FILE] [--host HOST] [--port PORT] [--transport nw|bsd]
                                [--max-connections N] [--drain-timeout SECONDS] [--body-size N]
                                [--max-body-size N] [--root DIR]
+                               [--access-log PATH|-] [--access-log-format F] [--metrics]
 
           --config FILE        JSON object with any of "host", "port", "transport",
                                "maxConnections", "drainTimeout" (seconds); flags override it
@@ -37,6 +39,10 @@ enum ServeCommand {
           --max-body-size N    largest request body accepted; larger gets 413 (default 10485760)
           --root DIR           serve the files under DIR with StaticFiles (#0084) instead of
                                the built-in handler
+          --access-log PATH    append an access log line per request to PATH (O_APPEND);
+                               `-` writes to stdout (#0090)
+          --access-log-format F  common (default), combined or json
+          --metrics            serve request metrics at GET /metrics (Prometheus text)
 
         Serves HTTP/1.1 (keep-alive, pipelining). POST echoes the request body, PUT answers
         with the body's length, anything else gets 200 text/plain. With --root, every request
@@ -56,6 +62,10 @@ enum ServeCommand {
         var bodySize: Int?
         var maxBodySize = HTTP1Configuration.defaultMaxBodySize
         var root: String?
+        /// `-` for stdout.
+        var accessLog: String?
+        var accessLogFormat = AccessLogFormat.common
+        var metrics = false
     }
 
     struct ConfigError: Error, CustomStringConvertible {
@@ -64,7 +74,7 @@ enum ServeCommand {
 
     static func run(_ argv: [String]) async throws -> Int32 {
         if argv.contains("--h3") { return try await H3ServeCommand.run(argv.filter { $0 != "--h3" }) }
-        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "transport", "max-connections", "drain-timeout", "body-size", "max-body-size", "root"])
+        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "transport", "max-connections", "drain-timeout", "body-size", "max-body-size", "root", "access-log", "access-log-format"])
         if args.flag("help") == true { print(usage); return 0 }
         let configPath = args.string("config")
         let host = args.string("host")
@@ -75,6 +85,9 @@ enum ServeCommand {
         let bodySize = try args.int("body-size")
         let maxBodySize = try args.int("max-body-size")
         let root = args.string("root")
+        let accessLog = args.string("access-log")
+        let accessLogFormat = args.string("access-log-format")
+        let metrics = args.flag("metrics") ?? false
         try args.checkAllConsumed()
 
         var settings = Settings()
@@ -110,6 +123,18 @@ enum ServeCommand {
             settings.maxBodySize = maxBodySize
         }
         if let root { settings.root = root }
+        if let accessLog { settings.accessLog = accessLog }
+        if let accessLogFormat {
+            switch accessLogFormat {
+            case "common": settings.accessLogFormat = .common
+            case "combined": settings.accessLogFormat = .combined
+            case "json": settings.accessLogFormat = .json
+            default:
+                printError("sws-bench serve: invalid access log format \(accessLogFormat) (common, combined or json)")
+                return 2
+            }
+        }
+        settings.metrics = metrics
         return await serve(settings)
     }
 
@@ -178,14 +203,44 @@ enum ServeCommand {
                 printError("sws-bench serve: cannot serve root \(root): \(error)")
                 return 1
             }
-            let server = Server(configuration: configuration, listeners: [listener], protocols: protocols,
-                                handler: files)
-            return await run(server, settings)
+            return await serve(settings, configuration: configuration, listener: listener, protocols: protocols,
+                               handler: files)
         }
-        let server = Server(configuration: configuration, listeners: [listener], protocols: protocols,
-                            handler: ServeHandler(hello: HelloHandler(bodySize: settings.bodySize),
+        return await serve(settings, configuration: configuration, listener: listener, protocols: protocols,
+                           handler: ServeHandler(hello: HelloHandler(bodySize: settings.bodySize),
                                                  maxBodySize: settings.maxBodySize))
-        return await run(server, settings)
+    }
+
+    /// Serves `handler`, behind the access log and the metrics endpoint when asked for. Each
+    /// combination is its own chain type, so what is not asked for is not in the chain (#0090).
+    static func serve<L: TransportListener, H: HTTPHandler>(
+        _ settings: Settings, configuration: ServerConfiguration, listener: L, protocols: [any ConnectionProtocol],
+        handler: H
+    ) async -> Int32 {
+        let metrics = settings.metrics ? AccessLogMetrics() : nil
+        var log: AccessLog?
+        if let path = settings.accessLog {
+            log = AccessLog(format: settings.accessLogFormat,
+                            destination: path == "-" ? .standardOutput : .file(path: path), metrics: metrics)
+        } else if let metrics {
+            log = AccessLog(metrics: metrics)
+        }
+        switch (log, metrics) {
+        case (let log?, let metrics?):
+            return await run(Server(configuration: configuration, listeners: [listener], protocols: protocols) {
+                MetricsEndpoint(metrics: metrics)
+                log
+                handler
+            }, settings)
+        case (let log?, nil):
+            return await run(Server(configuration: configuration, listeners: [listener], protocols: protocols) {
+                log
+                handler
+            }, settings)
+        default:
+            return await run(Server(configuration: configuration, listeners: [listener], protocols: protocols,
+                                    handler: handler), settings)
+        }
     }
 
     /// Runs `server` until SIGINT or SIGTERM has drained it.

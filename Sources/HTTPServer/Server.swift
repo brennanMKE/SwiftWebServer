@@ -54,6 +54,9 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
     let components: [any ServerComponent]
     /// The chain reads ``RequestContext/startTime``, so the runners stamp each request.
     let recordsRequestStartTime: Bool
+    /// Elements with per-connection state (an access log): the `components:` that are
+    /// observers, then those found in the chain.
+    let connectionObservers: ConnectionObservers
 
     /// Triggers when draining starts; handed to every connection.
     let shutdownSignal = ShutdownSignal()
@@ -102,6 +105,9 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         self.handler = handler
         self.components = components + MiddlewareChainInspector.serverComponents(in: handler)
         self.recordsRequestStartTime = MiddlewareChainInspector.needsRequestStartTime(handler)
+        self.connectionObservers = ConnectionObservers(
+            components.compactMap { $0 as? any ConnectionObserver }
+                + MiddlewareChainInspector.connectionObservers(in: handler))
     }
 
     /// - Parameters:
@@ -417,10 +423,12 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
     }
 
     private func serveConnection(_ transport: Listener.Transport) async {
-        let context = ConnectionContext(info: transport.info, shutdown: shutdownSignal,
+        var context = ConnectionContext(info: transport.info, shutdown: shutdownSignal,
                                         recordsRequestStartTime: recordsRequestStartTime)
+        if !connectionObservers.isEmpty { connectionObservers.connectionWillStart(&context) }
         await protocols.serve(transport, handler: handler, context: context)
         await transport.close(.normal)
+        if !connectionObservers.isEmpty { connectionObservers.connectionDidEnd(context) }
     }
 
     /// A listener or component failed while running: remember the first error, then shut down.

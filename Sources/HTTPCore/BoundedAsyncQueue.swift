@@ -40,6 +40,13 @@ public final class BoundedAsyncQueue<Element: Sendable>: Sendable, AsyncSequence
         case fail(any Error)
     }
 
+    /// What `trySend` does after leaving the critical section.
+    enum TrySendOutcome {
+        case accepted
+        case handOff(CheckedContinuation<Element?, Never>)
+        case rejected
+    }
+
     /// What `next` does after leaving the critical section.
     enum NextAction {
         case deliver(Element, resuming: CheckedContinuation<Void, any Error>?)
@@ -148,6 +155,31 @@ public final class BoundedAsyncQueue<Element: Sendable>: Sendable, AsyncSequence
                 return state.producers.remove(at: index)
             }
             producer?.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    /// Enqueues `element` without suspending if there is room (or a waiting consumer), and
+    /// returns `true`. Returns `false`, dropping nothing from the queue, when it is full or
+    /// finished: the caller decides what to do with `element` (an access log drops and counts
+    /// it rather than block the request path, #0090).
+    public func trySend(_ element: Element) -> Bool {
+        let outcome: TrySendOutcome = state.withLock { state in
+            if state.finished { return .rejected }
+            if let consumer = state.consumer {
+                assert(state.count == 0)
+                state.consumer = nil
+                return .handOff(consumer.continuation)
+            }
+            guard state.count < state.ring.count else { return .rejected }
+            state.push(element)
+            return .accepted
+        }
+        switch outcome {
+        case .accepted: return true
+        case .handOff(let consumer):
+            consumer.resume(returning: element)
+            return true
+        case .rejected: return false
         }
     }
 
