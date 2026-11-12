@@ -8,6 +8,7 @@ dependencies beyond the package.
 |---|---|
 | `M0-baseline.md` | Legacy server load baseline (`scripts/bench-baseline.sh`), with oha and Caddy for scale |
 | `M3-accept.md` | New-connection throughput, Network.framework against BSD sockets (#0113): `sws-bench accept` and `scripts/bench-accept.sh` |
+| `M5-tls.md` | HTTPS keep-alive throughput (`sws-bench serve --tls`) against cleartext over NW and BSD (#0087, #0088) |
 | `compare-servers*.md` | `scripts/bench-compare.sh` runs against nginx, Apache, Caddy, lighttpd, h2o and the legacy server; `-staticfiles` is the run with StaticFiles (#0084) serving from disk |
 | `M<N>-<name>.md` | One file per milestone: what changed, results, comparison with the previous record |
 
