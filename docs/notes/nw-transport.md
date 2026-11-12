@@ -150,6 +150,43 @@ Reading the numbers:
   process, a connect failure before `.ready`, listener close and accept cancellation, and a
   `/usr/bin/curl` exchange.
 
+# TLS over TCP (#0087, #0088)
+
+`TCPListener(configuration:tls:)` with a `TLSConfiguration` layers `NWProtocolTLS` over TCP.
+TLS stays on Network.framework even though cleartext defaults to BSD sockets (ROADMAP §2).
+
+- **Identity** is a `TLSIdentity` (PKCS#12, `kSecImportToMemoryOnly`), set with
+  `sec_protocol_options_set_local_identity`. Minimum TLS 1.2; NW negotiates TLS 1.3 whenever
+  the client offers it. ALPN tokens come from `TLSConfiguration.alpn`, which the caller builds
+  from `ProtocolRegistry.alpnTokens`. Client authentication (a verify block plus
+  `sec_protocol_options_set_peer_authentication_required`) is off unless configured.
+- **Hand-over after the handshake.** An accepted connection reaches `.ready` only once the
+  TLS handshake is done, so `connections` yields it with `ConnectionInfo.isSecure`,
+  `negotiatedALPN` (`sec_protocol_metadata_get_negotiated_protocol`) and `tlsVersion` already
+  set. The handshake happens while the connection holds a pending-queue slot.
+- **Handshake timeout.** A client that connects and never finishes the handshake would hold
+  that slot forever, so each TLS connection gets a timer on the listener queue
+  (`TLSConfiguration.handshakeTimeout`, default 10 s) that `forceCancel`s it if it is still
+  preparing.
+- **Failures** are logged (`os.Logger`, subsystem `SwiftWebServer`, category `TLS`), counted
+  in `failedHandshakeCount`, and dropped; nothing is handed over.
+- **No identity reload.** NW copies the listener's parameters when the listener is created and
+  has no public server-side hook to pick an identity per handshake, so a new identity needs a
+  new listener. Not done here.
+
+Observed:
+
+1. A cleartext request on the TLS port fails the handshake at once (`.failed`, not
+   `.waiting`); the client sees the connection end.
+2. A client offering only an ALPN token the server does not list gets a
+   `no_application_protocol` alert: NW fails the handshake rather than continuing without ALPN.
+   A client offering no ALPN at all completes the handshake with `negotiatedALPN == nil`.
+3. With client authentication required and a client without a certificate, a TLS 1.3 client
+   reaches `.ready` before the server rejects it; the refusal shows up as the connection
+   ending on the client's first receive.
+4. curl and `URLSession` negotiate TLS 1.3 (`AEAD-CHACHA20-POLY1305-SHA256` for curl).
+5. Keep-alive throughput is 36% below cleartext over NW (`docs/benchmarks/M5-tls.md`).
+
 # Network.framework QUIC transport (#0098)
 
 `QUICListener` (`NWListener` + `newConnectionGroupHandler`), `QUICConnection` (one

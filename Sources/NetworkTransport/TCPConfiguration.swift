@@ -47,8 +47,8 @@ public struct TCPConfiguration: Sendable, Hashable {
     }
 
     /// Network.framework parameters for plain TCP with these options. `localEndpoint` becomes
-    /// `requiredLocalEndpoint` (the listener's bind address).
-    func makeParameters(localEndpoint: NWEndpoint? = nil) -> NWParameters {
+    /// `requiredLocalEndpoint` (the listener's bind address). `tls` layers TLS over TCP (#0087).
+    func makeParameters(localEndpoint: NWEndpoint? = nil, tls: NWProtocolTLS.Options? = nil) -> NWParameters {
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = noDelay
         if let keepAlive {
@@ -60,7 +60,7 @@ public struct TCPConfiguration: Sendable, Hashable {
         if let connectionTimeout {
             tcp.connectionTimeout = connectionTimeout
         }
-        let parameters = NWParameters(tls: nil, tcp: tcp)
+        let parameters = NWParameters(tls: tls, tcp: tcp)
         parameters.allowLocalEndpointReuse = allowLocalEndpointReuse
         parameters.includePeerToPeer = false
         if let localEndpoint {

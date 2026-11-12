@@ -18,15 +18,21 @@ public struct ServerConfiguration: Sendable, Hashable {
     /// How long a graceful shutdown waits for open connections before cancelling them.
     /// `nil` waits indefinitely.
     public var drainTimeout: Duration?
+    /// How long a cleartext connection may take to send enough bytes for the protocol registry
+    /// to pick a protocol, when more than one protocol is registered (#0088). `nil` waits
+    /// indefinitely. Defaults to the HTTP/1.1 header timeout.
+    public var sniffTimeout: Duration?
 
     public init(
         maxConnections: Int = 1024,
         connectionLimitPolicy: ConnectionLimitPolicy = .backpressure,
-        drainTimeout: Duration? = .seconds(10)
+        drainTimeout: Duration? = .seconds(10),
+        sniffTimeout: Duration? = .seconds(10)
     ) {
         self.maxConnections = maxConnections
         self.connectionLimitPolicy = connectionLimitPolicy
         self.drainTimeout = drainTimeout
+        self.sniffTimeout = sniffTimeout
     }
 
     /// Throws ``ServerError/invalidConfiguration(_:)`` when a value is out of range.
@@ -36,6 +42,9 @@ public struct ServerConfiguration: Sendable, Hashable {
         }
         if let drainTimeout, drainTimeout < .zero {
             throw .invalidConfiguration("drainTimeout must not be negative")
+        }
+        if let sniffTimeout, sniffTimeout <= .zero {
+            throw .invalidConfiguration("sniffTimeout must be positive")
         }
     }
 }

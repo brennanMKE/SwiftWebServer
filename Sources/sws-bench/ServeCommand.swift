@@ -25,6 +25,7 @@ enum ServeCommand {
         usage: sws-bench serve [--config FILE] [--host HOST] [--port PORT] [--transport nw|bsd]
                                [--max-connections N] [--drain-timeout SECONDS] [--body-size N]
                                [--max-body-size N] [--root DIR]
+                               [--tls [--identity FILE] [--password PW]]
                                [--access-log PATH|-] [--access-log-format F] [--metrics]
 
           --config FILE        JSON object with any of "host", "port", "transport",
@@ -39,6 +40,11 @@ enum ServeCommand {
           --max-body-size N    largest request body accepted; larger gets 413 (default 10485760)
           --root DIR           serve the files under DIR with StaticFiles (#0084) instead of
                                the built-in handler
+          --tls                serve HTTPS: TLS 1.2+ (1.3 preferred) on a Network.framework
+                               listener, ALPN http/1.1 (#0087, #0088); implies --transport nw
+          --identity FILE      PKCS#12 server identity for --tls, loaded in memory only
+                               (default .test-identity/server.p12, scripts/make-test-identity.sh)
+          --password PW        its password (default the test identity's)
           --access-log PATH    append an access log line per request to PATH (O_APPEND);
                                `-` writes to stdout (#0090)
           --access-log-format F  common (default), combined or json
@@ -62,6 +68,9 @@ enum ServeCommand {
         var bodySize: Int?
         var maxBodySize = HTTP1Configuration.defaultMaxBodySize
         var root: String?
+        var tls = false
+        var identityPath = ".test-identity/server.p12"
+        var identityPassword = "sws-test-password"
         /// `-` for stdout.
         var accessLog: String?
         var accessLogFormat = AccessLogFormat.common
@@ -74,7 +83,7 @@ enum ServeCommand {
 
     static func run(_ argv: [String]) async throws -> Int32 {
         if argv.contains("--h3") { return try await H3ServeCommand.run(argv.filter { $0 != "--h3" }) }
-        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "transport", "max-connections", "drain-timeout", "body-size", "max-body-size", "root", "access-log", "access-log-format"])
+        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "transport", "max-connections", "drain-timeout", "body-size", "max-body-size", "root", "access-log", "access-log-format", "identity", "password"])
         if args.flag("help") == true { print(usage); return 0 }
         let configPath = args.string("config")
         let host = args.string("host")
@@ -85,6 +94,9 @@ enum ServeCommand {
         let bodySize = try args.int("body-size")
         let maxBodySize = try args.int("max-body-size")
         let root = args.string("root")
+        let tls = args.flag("tls") ?? false
+        let identity = args.string("identity")
+        let password = args.string("password")
         let accessLog = args.string("access-log")
         let accessLogFormat = args.string("access-log-format")
         let metrics = args.flag("metrics") ?? false
@@ -123,6 +135,13 @@ enum ServeCommand {
             settings.maxBodySize = maxBodySize
         }
         if let root { settings.root = root }
+        settings.tls = settings.tls || tls
+        if let identity { settings.identityPath = identity }
+        if let password { settings.identityPassword = password }
+        if (identity != nil || password != nil) && !settings.tls {
+            printError("sws-bench serve: --identity and --password need --tls")
+            return 2
+        }
         if let accessLog { settings.accessLog = accessLog }
         if let accessLogFormat {
             switch accessLogFormat {
@@ -179,6 +198,20 @@ enum ServeCommand {
             // Cleartext TCP: POSIX sockets by default, Network.framework on request (#0113).
             // TLS and QUIC listeners stay on Network.framework.
             let tcp = TCPConfiguration(allowLocalEndpointReuse: false)
+            if settings.tls {
+                let tls: TLSConfiguration
+                do {
+                    // The listener offers the ALPN tokens of the registered protocols (#0088).
+                    tls = try TLSConfiguration(
+                        pkcs12Path: settings.identityPath, password: settings.identityPassword,
+                        alpn: ProtocolRegistry(protocols(settings)).alpnTokens)
+                } catch {
+                    printError("sws-bench serve: cannot load TLS identity \(settings.identityPath): \(error)")
+                    return 1
+                }
+                let listener = try TCPListener(configuration: .init(host: settings.host, port: settings.port, tcp: tcp), tls: tls)
+                return await serve(settings, configuration: configuration, listener: listener)
+            }
             switch settings.transport {
             case .bsd:
                 let listener = try BSDSocketListener(configuration: .init(host: settings.host, port: settings.port, tcp: tcp))
@@ -193,8 +226,12 @@ enum ServeCommand {
         }
     }
 
+    static func protocols(_ settings: Settings) -> [any ConnectionProtocol] {
+        [HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))]
+    }
+
     static func serve<L: TransportListener>(_ settings: Settings, configuration: ServerConfiguration, listener: L) async -> Int32 {
-        let protocols = [HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))]
+        let protocols = protocols(settings)
         if let root = settings.root {
             let files: StaticFiles
             do {

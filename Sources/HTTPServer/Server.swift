@@ -101,7 +101,7 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
     ) {
         self.configuration = configuration
         self.listeners = listeners
-        self.protocols = ProtocolRegistry(protocols)
+        self.protocols = ProtocolRegistry(protocols, sniffTimeout: configuration.sniffTimeout)
         self.handler = handler
         self.components = components + MiddlewareChainInspector.serverComponents(in: handler)
         self.recordsRequestStartTime = MiddlewareChainInspector.needsRequestStartTime(handler)

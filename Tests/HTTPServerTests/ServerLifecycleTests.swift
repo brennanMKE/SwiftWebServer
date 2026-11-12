@@ -148,7 +148,9 @@ import Testing
 /// Once-per-connection protocol selection (#0079, ROADMAP §5.2).
 @Suite struct ProtocolRegistryTests {
     struct Fake<Tag>: ConnectionProtocol {
-        static var alpnTokens: [String] { Tag.self == A.self ? ["a/1"] : ["b/1", "b/2"] }
+        static var alpnTokens: [String] {
+            Tag.self == A.self ? ["a/1"] : Tag.self == H1.self ? ["http/1.1"] : ["b/1", "b/2"]
+        }
         static func matchesCleartextPreface(_ bytes: borrowing ByteBuffer) -> SniffResult {
             let prefix: [UInt8] = Tag.self == A.self ? Array("AAAA".utf8) : Array("BB".utf8)
             let have = bytes.withReadableSpan { span in (0..<span.count).map { span[$0] } }
@@ -160,6 +162,7 @@ import Testing
     }
     enum A {}
     enum B {}
+    enum H1 {}
 
     let registry = ProtocolRegistry([Fake<A>(), Fake<B>()])
 
@@ -185,6 +188,35 @@ import Testing
         #expect(registry.select(alpn: nil, preface: ByteBuffer("BB")) == .selected(index: 1))
         #expect(registry.select(alpn: nil, preface: ByteBuffer("AB")) == .unsupported)
         #expect(registry.select(alpn: nil, preface: ByteBuffer("C")) == .unsupported)
+    }
+
+    /// #0088: what a TLS listener offers is every registered token, in registration order.
+    @Test(.timeLimit(.minutes(1)))
+    func alpnTokensFollowRegistrationOrder() {
+        #expect(registry.alpnTokens == ["a/1", "b/1", "b/2"])
+        #expect(ProtocolRegistry([Fake<B>(), Fake<A>(), Fake<B>()]).alpnTokens == ["b/1", "b/2", "a/1"])
+        #expect(ProtocolRegistry([]).alpnTokens.isEmpty)
+    }
+
+    /// #0088: on TLS, an absent or unknown ALPN token falls back to the `http/1.1` protocol
+    /// without sniffing; cleartext keeps sniffing.
+    @Test(.timeLimit(.minutes(1)))
+    func secureConnectionsFallBackToHTTP11() {
+        let withH1 = ProtocolRegistry([Fake<A>(), Fake<H1>()])
+        #expect(withH1.select(alpn: nil, secure: true, preface: ByteBuffer()) == .selected(index: 1))
+        #expect(withH1.select(alpn: "h2", secure: true, preface: ByteBuffer()) == .selected(index: 1))
+        #expect(withH1.select(alpn: "a/1", secure: true, preface: ByteBuffer()) == .selected(index: 0))
+        #expect(withH1.select(alpn: nil, secure: false, preface: ByteBuffer()) == .needMoreBytes)
+        #expect(withH1.select(alpn: "h2", secure: false, preface: ByteBuffer()) == .unsupported)
+        // Without an http/1.1 protocol a secure connection with no token is sniffed.
+        #expect(registry.select(alpn: nil, secure: true, preface: ByteBuffer()) == .needMoreBytes)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func sniffTimeoutComesFromTheConfiguration() {
+        #expect(ProtocolRegistry([]).sniffTimeout == .seconds(10))
+        #expect(throws: ServerError.self) { try ServerConfiguration(sniffTimeout: .zero).validate() }
+        #expect(throws: Never.self) { try ServerConfiguration(sniffTimeout: nil).validate() }
     }
 
     @Test(.timeLimit(.minutes(1)))
