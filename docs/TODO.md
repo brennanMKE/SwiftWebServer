@@ -26,8 +26,8 @@
 
 ## 🔒 Authentication
 
-* [ ] Add AuthenticationMiddleware
-* [ ] HMAC validation for JWT tokens
+* [x] Add AuthenticationMiddleware (#0093: `Authenticator`)
+* [x] HMAC validation for JWT tokens (#0093: `JWTVerifier`, HS256)
 * [ ] Add PasskeyMiddleware placeholder
 
 ## 🌍 Virtual Hosting
