@@ -12,6 +12,7 @@ let usage = """
       h1conn   ns and allocations per request of the HTTP/1.1 connection loop
       accept   new-connection rate, per-phase latency and allocations per connection
       router   Router match microbenchmarks (same as `micro --filter Router`)
+      hash-password  print an auth credential line (PBKDF2) for a password read from stdin
 
     Run `sws-bench <command> --help` for options. With no command, runs `micro`.
     """
@@ -35,6 +36,8 @@ do {
         status = try await AcceptBench.run(rest)
     case "router":
         status = try MicroCommand.run(["--filter", "Router"] + rest)
+    case "hash-password":
+        status = try HashPasswordCommand.run(rest)
     case "help", "--help", "-h":
         print(usage)
         status = 0
