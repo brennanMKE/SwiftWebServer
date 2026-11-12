@@ -84,6 +84,10 @@ public struct HTTP3: MultiplexedConnectionProtocol {
     public func run<T: MultiplexedTransport, H: HTTPHandler>(
         _ t: T, handler: H, context: ConnectionContext
     ) async where T.Stream: ResettableStream {
+        // Every HTTP/3 connection negotiated `h3`; say so even where the transport could not
+        // read it back, so the chain can tell HTTP/3 requests apart (``AltSvc``, #0103).
+        var context = context
+        if context.info.negotiatedALPN == nil { context.info.negotiatedALPN = "h3" }
         let driver = H3ConnectionDriver(
             transport: t, handler: handler, context: context, configuration: configuration, tracker: tracker)
         await driver.run()

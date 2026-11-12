@@ -2,12 +2,19 @@ import ConfigFile
 import Dispatch
 import Foundation
 import HTTP1
+#if HTTP3
+import HTTP3
+#endif
 import HTTPCore
 import HTTPServer
 import NetworkTransport
 
 /// The shipped server (#0086): `Server` + HTTP/1.1 + `ErrorPages` + `StaticFiles`
 /// (with conditional requests), configured by `http-config.json` and the command line.
+///
+/// Listeners (#0089): cleartext HTTP/1.1 always; HTTPS when the config has `tls`; HTTP/3 over
+/// QUIC when it also has `http3` (by default on the TLS port number, UDP). All run under one
+/// `Server`: one connection limit, one drain, and SIGTERM sends HTTP/3 GOAWAY too.
 ///
 /// Exit status: 0 after a clean shutdown (SIGINT or SIGTERM drains open connections), 1 on a
 /// configuration or startup error such as a bad config value or a port in use (#0004), with
@@ -27,8 +34,10 @@ enum ServerMain {
           --host HOST     numeric address to bind (overrides "host"; default 127.0.0.1)
           --port PORT     port to bind (overrides "port"; default 8080; 0 picks a free one)
 
-        Relative paths in the config file resolve against the file's directory. Prints
-        "listening HOST:PORT" on stdout once bound. SIGINT/SIGTERM shut down gracefully.
+        Relative paths in the config file resolve against the file's directory. HTTPS and
+        HTTP/3 are configured with the "tls" and "http3" keys. Prints "listening HOST:PORT"
+        on stdout once bound (then "listening HOST:PORT (https)" and "(h3)" lines for the
+        other listeners). SIGINT/SIGTERM shut down gracefully.
         """
 
     static func main() async {
@@ -125,6 +134,7 @@ enum ServerMain {
         }
         do {
             let settings = try settings(options, environment: environment)
+            try settings.validate()
             let handler = try settings.makeHandler()
             let configuration = settings.serverConfiguration
             do {
@@ -132,25 +142,86 @@ enum ServerMain {
             } catch {
                 throw ConfigFileError("\(error)")
             }
+            let listeners = try makeListeners(settings, environment: environment)
             printError("\(name): serving \(settings.resolvedRoot)")
-            // Cleartext TCP: POSIX sockets by default, Network.framework on request (#0113).
-            let tcp = TCPConfiguration(allowLocalEndpointReuse: false)
-            switch settings.transport {
-            case .bsd:
-                let listener = try BSDSocketListener(configuration: .init(host: settings.host, port: settings.port, tcp: tcp))
-                return await serve(settings, listener: listener, handler: handler)
-            case .nw:
-                let listener = try TCPListener(configuration: .init(host: settings.host, port: settings.port, tcp: tcp))
-                return await serve(settings, listener: listener, handler: handler)
+            #if HTTP3
+            if let http3 = settings.http3 {
+                // #0103: HTTPS responses advertise HTTP/3. Registered only with HTTP/3, so the
+                // chain has no Alt-Svc step otherwise; rendered once the UDP port is bound.
+                let altSvc = AltSvc(maxAge: http3.altSvcMaxAge)
+                let chain = MiddlewareBuilder.build {
+                    altSvc
+                    handler
+                }
+                return await serve(settings, listeners: listeners, handler: chain) { addresses, names in
+                    if let index = names.firstIndex(of: "h3") { altSvc.advertise(port: addresses[index].port) }
+                }
             }
+            #endif
+            return await serve(settings, listeners: listeners, handler: handler)
         } catch {
             printError("\(name): \(error)")
             return 1
         }
     }
 
-    static func serve<L: TransportListener, H: HTTPHandler>(_ settings: ServerSettings, listener: L, handler: H) async -> Int32 {
-        let server = Server(configuration: settings.serverConfiguration, listeners: [listener],
+    /// Cleartext first, then TLS, then QUIC: the server binds them in this order, so the QUIC
+    /// listener can take the TLS listener's port number when that was 0. The TLS listener
+    /// offers the protocol registry's ALPN tokens (#0088).
+    static func makeListeners(_ settings: ServerSettings, environment: [String: String]) throws -> [ServerListener] {
+        // POSIX sockets by default, Network.framework on request (#0113).
+        let tcp = TCPConfiguration(allowLocalEndpointReuse: false)
+        let host = settings.host
+        var listeners: [ServerListener] = []
+        switch settings.transport {
+        case .bsd:
+            listeners.append(.byteStream(try BSDSocketListener(configuration: .init(host: host, port: settings.port, tcp: tcp)), name: "http"))
+        case .nw:
+            listeners.append(.byteStream(try TCPListener(configuration: .init(host: host, port: settings.port, tcp: tcp)), name: "http"))
+        }
+        guard let tls = settings.tls, let path = settings.resolvedIdentityPath,
+              let password = try settings.tlsPassword(environment: environment) else { return listeners }
+
+        // In memory only (kSecImportToMemoryOnly): no keychain access (AGENTS.md).
+        let identity: TLSIdentity
+        do {
+            identity = try TLSIdentity(pkcs12Path: path, password: password)
+        } catch {
+            throw ConfigFileError(key: "tls.identity", "cannot load TLS identity \(path): \(describe(identity: error))")
+        }
+        listeners.append(.byteStream(name: "https") { bind in
+            try TCPListener(configuration: .init(host: host, port: tls.port, tcp: tcp),
+                            tls: TLSConfiguration(identity: identity, alpn: bind.alpnTokens))
+        })
+
+        if let http3 = settings.http3 {
+            #if HTTP3
+            let tlsIndex = listeners.count - 1
+            // After GOAWAY and the last response, wait for the client to close (curl does at
+            // once) for up to the drain timeout instead of the default 1 s: CONNECTION_CLOSE
+            // discards response bytes Network.framework still buffers for a slow reader.
+            var configuration = H3Configuration()
+            configuration.timeouts.closeLinger = max(.seconds(1), settings.drainTimeout ?? .seconds(30))
+            listeners.append(.multiplexed(name: "h3", protocol: HTTP3(configuration: configuration)) { bind in
+                let port = http3.port ?? bind.boundAddresses[tlsIndex].port
+                return try QUICListener(configuration: .init(host: host, port: port, quic: QUICConfiguration(alpn: bind.alpnTokens)),
+                                        identity: identity)
+            })
+            #else
+            _ = http3
+            throw ConfigFileError(key: "http3", "\"http3\": this build has no HTTP/3 (package trait HTTP3 is off)")
+            #endif
+        }
+        return listeners
+    }
+
+    /// Runs the server until a signal stops it. `onBound` runs once every listener is bound,
+    /// before the `listening` lines are printed, with the addresses and listener names.
+    static func serve<H: HTTPHandler>(
+        _ settings: ServerSettings, listeners: [ServerListener], handler: H,
+        onBound: @escaping @Sendable ([TransportAddress], [String]) -> Void = { _, _ in }
+    ) async -> Int32 {
+        let server = Server(configuration: settings.serverConfiguration, listeners: listeners,
                             protocols: [HTTP1(configuration: settings.http1Configuration)],
                             handler: handler)
 
@@ -176,8 +247,12 @@ enum ServerMain {
             try await withThrowingDiscardingTaskGroup { group in
                 group.addTask {
                     let addresses = try await server.waitUntilRunning()
-                    for address in addresses {
-                        FileHandle.standardOutput.write(Data("listening \(address)\n".utf8))
+                    let names = server.listenerStatistics.map(\.name)
+                    onBound(addresses, names)
+                    for (index, address) in addresses.enumerated() {
+                        // The cleartext line stays "listening HOST:PORT" (scripts parse it).
+                        let suffix = index == 0 || index >= names.count ? "" : " (\(names[index]))"
+                        FileHandle.standardOutput.write(Data("listening \(address)\(suffix)\n".utf8))
                     }
                 }
                 group.addTask { try await server.run() }
@@ -185,11 +260,31 @@ enum ServerMain {
         } catch is CancellationError where server.lifecycleState == .stopped {
             // Stopped before it was running; waitUntilRunning reports that as cancellation.
         } catch {
-            printError("\(name): cannot serve on \(settings.host):\(settings.port): \(describe(error))")
+            printError("\(name): cannot serve on \(settings.host):\(ports(settings)): \(describe(error))")
             return 1
         }
         printError("\(name): stopped")
         return 0
+    }
+
+    /// The configured ports, for error messages: `8080`, or `8080, https 8443, h3 8443`.
+    static func ports(_ settings: ServerSettings) -> String {
+        var text = "\(settings.port)"
+        if let tls = settings.tls {
+            text += ", https \(tls.port)"
+            if let http3 = settings.http3 { text += ", h3 \(http3.port.map(String.init) ?? "\(tls.port)")" }
+        }
+        return text
+    }
+
+    static func describe(identity error: any Error) -> String {
+        switch error as? TLSIdentityError {
+        case .fileUnreadable?: "the file cannot be read"
+        case .importFailed(let status)? where status == -25293: "wrong password (errSecAuthFailed)"
+        case .importFailed(let status)?: "PKCS#12 import failed (OSStatus \(status))"
+        case .noIdentity?: "the file holds no identity"
+        case nil: "\(error)"
+        }
     }
 
     /// A transport error with its POSIX meaning (`failed(code: 48)` reads "address already in use").

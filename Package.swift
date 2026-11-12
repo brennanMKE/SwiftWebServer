@@ -40,7 +40,7 @@ let libraries: [Library] = [
     Library("HPACK", dependencies: ["HeaderCompression", "HTTPCore"]),
     Library("QPACK", dependencies: ["HeaderCompression", "HTTPCore"]),
     // Optional protocols
-    Library("HTTP2", dependencies: ["HPACK", "HTTPCore"]),
+    Library("HTTP2", dependencies: ["HPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "HTTPServer", "HTTP1", "NetworkTransport"]),
     Library("HTTP3", dependencies: ["QPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "NetworkTransport"]),
     Library("WebSockets", dependencies: ["HTTPCore"]),
     // Optional components
@@ -80,7 +80,8 @@ for library in libraries {
 targets += [
     .executableTarget(
         name: "SwiftWebServer",
-        dependencies: ["ConfigFile", "HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport"],
+        dependencies: ["ConfigFile", "HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport",
+                       .target(name: "HTTP3", condition: .when(traits: ["HTTP3"]))],
         swiftSettings: modernSwiftSettings),
     .executableTarget(
         name: "SWSBench",
@@ -93,7 +94,7 @@ targets += [
         swiftSettings: modernSwiftSettings),
     .testTarget(
         name: "IntegrationTests",
-        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HTTPTestSupport"],
+        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HTTPTestSupport", "HTTP3"],
         swiftSettings: modernSwiftSettings),
 ]
 
