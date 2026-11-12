@@ -45,11 +45,18 @@ import Darwin
 /// (``HTTP2Settings``), applied (HEADER_TABLE_SIZE to the HPACK encoder, INITIAL_WINDOW_SIZE
 /// to the send windows, MAX_FRAME_SIZE to outgoing frames) and acknowledged.
 ///
+/// ## Requests (#0047)
+///
+/// A request head is validated as ``HTTP2RequestFieldSink`` describes (pseudo-headers through
+/// the shared `PseudoHeaderValidator`, connection-specific fields, `te`, `content-length`,
+/// `host` against `:authority`); a malformed one is `RST_STREAM(PROTOCOL_ERROR)` on its stream
+/// and the connection carries on. Cookie crumbs reach the handler joined with `"; "`.
+///
 /// ## Not yet
 ///
 /// Request bodies (#0048: DATA is discarded and its connection credit returned at once; the
 /// handler sees an empty body, and a stream still sending when its response ends is reset
-/// with `NO_ERROR`), request trailers, cookie joining and `content-length` checks (#0047),
+/// with `NO_ERROR`), request trailers and the `content-length` check against DATA (#0048),
 /// per-stream cancellation on RST_STREAM (#0051), the PING round-trip on shutdown and idle
 /// timeouts (#0052), stream receive windows (#0053), fair window waiting (#0054), extended
 /// CONNECT (#0067: `.tunnel` answers `501`).
@@ -425,9 +432,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             let storage = HTTPRequestStorage(bufferCapacity: Swift.max(block.size * 2, 256), fieldCapacity: 16)
             var sink = HTTP2RequestFieldSink(storage: storage)
             try assembler.decode(block, fragment: fragment, with: &decoder, into: &sink)
-            switch sink.request() {
-            case .success(let request):
-                return .serve(id, request, storage)
+            switch sink.head(endStream: block.endStream) {
+            case .success(let head):
+                return .serve(id, head.request, storage)
             case .failure:
                 // Malformed (RFC 9113 §8.1.1): a stream error. The stream was counted as
                 // served when it was dispatched.
