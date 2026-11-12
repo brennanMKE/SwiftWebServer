@@ -20,6 +20,10 @@ public import HTTPCore
 ///   mtime in whole seconds; file content is never hashed (#0025).
 /// - One `Range: bytes=` range answers `206` with `Content-Range`, an unsatisfiable one `416`;
 ///   several ranges are ignored (`200`). `If-Range` with a different validator disables Range.
+/// - Conditional requests follow RFC 9110 §13.2.2 (``ConditionalRequest``, #0085): `If-Match`,
+///   `If-Unmodified-Since`, `If-None-Match`, `If-Modified-Since`, then `If-Range`. A `304`
+///   carries `ETag`, `Last-Modified` and `Cache-Control` and no body; a failed `If-Match` or
+///   `If-Unmodified-Since` answers `412`. Dates compare in whole seconds (#0017).
 ///
 /// ## Hot path
 ///
@@ -56,7 +60,7 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
                 : nil
             defaultMIMEType = Array(configuration.defaultMIMEType.utf8)
             customMIMETypes = configuration.mimeTypes.map { (Array($0.key.utf8).map(ASCII.lowercased), Array($0.value.utf8)) }
-            cacheControl = configuration.cacheControl.map { Array($0.utf8) }
+            cacheControl = configuration.effectiveCacheControl.map { Array($0.utf8) }
             smallFileLimit = configuration.smallFileLimit
         }
     }
@@ -106,9 +110,17 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
         case .response(let response): return response
         case .notFound: return nil
         }
+        if ConditionalRequest.hasPreconditions(request.headers) {
+            switch ConditionalRequest.evaluate(method: request.method, fields: request.headers,
+                                               etag: entry.etag, lastModified: entry.lastModifiedSeconds) {
+            case .proceed: break
+            case .notModified: return entry.notModified
+            case .preconditionFailed: return Self.preconditionFailed
+            }
+        }
         guard isGet, let range = request.headers.firstValue(for: .range) else { return entry.response }
-        if let ifRange = request.headers.firstValue(for: .ifRange),
-           !request.withSpan(of: ifRange, { entry.matchesIfRange($0) }) {
+        if !ConditionalRequest.ifRangeAllowsRange(fields: request.headers, etag: entry.etag,
+                                                  lastModified: entry.lastModifiedSeconds) {
             return entry.response
         }
         switch request.withSpan(of: range, { RangeRequest.parse($0, size: entry.size) }) {
@@ -218,4 +230,5 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
     static let notFound = HTTPResponse(status: .notFound)
     static let forbidden = HTTPResponse(status: .forbidden)
     static let badRequest = HTTPResponse(status: .badRequest)
+    static let preconditionFailed = HTTPResponse(status: .preconditionFailed)
 }

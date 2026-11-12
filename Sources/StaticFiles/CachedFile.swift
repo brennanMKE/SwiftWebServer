@@ -20,10 +20,16 @@ final class CachedFile: Sendable {
     let identity: FileIdentity
     let content: Content
     let response: HTTPResponse
-    /// The rendered `ETag` value, quotes included, for `If-Range`.
+    /// The `304` for this version: `ETag`, `Last-Modified` and `Cache-Control` (the fields a
+    /// `200` would carry that RFC 9110 §15.4.5 requires), no body and no `Content-Length`.
+    /// The connection adds `Date`.
+    let notModified: HTTPResponse
+    /// The rendered `ETag` value, quotes included.
     let etag: [UInt8]
-    /// The rendered `Last-Modified` value, for `If-Range`.
+    /// The rendered `Last-Modified` value.
     let lastModified: [UInt8]
+    /// The modification time in whole seconds, the instant `Last-Modified` names (#0017).
+    var lastModifiedSeconds: Int64 { IMFFixdate.clamp(identity.mtimeSeconds) }
 
     var size: Int64 { identity.size }
 
@@ -79,6 +85,13 @@ final class CachedFile: Sendable {
         if let cacheControl {
             cacheControl.withUnsafeBufferPointer { headers.append(.cacheControl, value: $0.span) }
         }
+        var validators = HTTPFields(minimumCapacity: 3, arenaCapacity: 128 + (cacheControl?.count ?? 0))
+        etag.withUnsafeBufferPointer { validators.append(.etag, value: $0.span) }
+        lastModified.withUnsafeBufferPointer { validators.append(.lastModified, value: $0.span) }
+        if let cacheControl {
+            cacheControl.withUnsafeBufferPointer { validators.append(.cacheControl, value: $0.span) }
+        }
+        notModified = HTTPResponse(status: .notModified, headers: validators)
         switch content {
         case .memory(let bytes):
             response = HTTPResponse(status: .ok, headers: headers, body: .bytes(bytes))
@@ -119,17 +132,6 @@ final class CachedFile: Sendable {
         value.append(decimal: size)
         value.withReadableSpan { headers.append(.contentRange, value: $0) }
         return HTTPResponse(status: .rangeNotSatisfiable, headers: headers)
-    }
-
-    /// True when an `If-Range` value names this version: the exact strong ETag, or the exact
-    /// `Last-Modified` date (RFC 9110 §13.1.5).
-    func matchesIfRange(_ value: Span<UInt8>) -> Bool {
-        func equals(_ bytes: [UInt8]) -> Bool {
-            guard value.count == bytes.count else { return false }
-            for i in 0..<bytes.count where value[i] != bytes[i] { return false }
-            return true
-        }
-        return equals(etag) || equals(lastModified)
     }
 
     /// Reads up to `size` bytes from the start of `fd` with `pread`; returns the count read,
