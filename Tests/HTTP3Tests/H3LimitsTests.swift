@@ -293,6 +293,8 @@ struct H3FailureTableTests {
         (.rejectedOverConcurrencyLimit, .resetStream(code: 0x10b)),
         (.headerTimeout, .resetStream(code: 0x10b)),
         (.bodyTimeout, .resetStream(code: 0x10c)),
+        (.requestCancelled, .resetStream(code: 0x10c)),
+        (.sendTimeout, .resetStream(code: 0x10c)),
         (.responseFailed, .resetSending(code: 0x102)),
         (.unreadBodyAbandoned, .stopSending(code: 0x100)),
         (.unknownStreamType, .stopSending(code: 0x103)),
@@ -300,6 +302,8 @@ struct H3FailureTableTests {
         (.protocolViolation(.idError), .closeConnection(code: 0x108)),
         (.qpackFailure(code: 0x200), .closeConnection(code: 0x200)),
         (.localStreamFailure, .closeConnection(code: 0x102)),
+        (.excessiveLoad(.abortedRequests), .closeConnection(code: 0x107)),
+        (.excessiveLoad(.qpackInstructions), .closeConnection(code: 0x107)),
         (.gracefulShutdown, .closeConnection(code: 0x100)),
         (.idleTimeout, .closeConnection(code: 0x100)),
         (.drainTimeout, .closeConnection(code: 0x100)),
@@ -310,7 +314,7 @@ struct H3FailureTableTests {
             #expect(failure.signal == signal, "\(failure)")
             let isConnection: Bool
             switch failure {
-            case .protocolViolation, .qpackFailure, .localStreamFailure, .gracefulShutdown, .idleTimeout, .drainTimeout:
+            case .protocolViolation, .qpackFailure, .localStreamFailure, .excessiveLoad, .gracefulShutdown, .idleTimeout, .drainTimeout:
                 isConnection = true
             default:
                 isConnection = false

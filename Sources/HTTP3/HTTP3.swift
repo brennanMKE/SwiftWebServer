@@ -45,15 +45,38 @@ import Synchronization
 /// (`413`), how much unread body is drained, and ``H3Timeouts``. A response head larger than
 /// the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` is replaced by a bare `500`.
 ///
+/// ## Cancellation (#0104)
+///
+/// A peer RESET_STREAM or STOP_SENDING on a request stream cancels that request's tasks: the
+/// body reader sees it on its next receive, a response send fails with it, and, for transports
+/// that are `PeerAbortObserving`, a watcher notices it while the handler is still computing.
+/// The handler then sees `CancellationError` (or `TransportError.connectionReset` from a body
+/// read). A request whose handler is cancelled or throws `CancellationError`, or that the peer
+/// abandoned, is reset with `H3_REQUEST_CANCELLED`; a response body that fails after its head
+/// was sent is reset with `H3_INTERNAL_ERROR`.
+///
+/// ## Abuse limits (#0104)
+///
+/// ``H3AbuseLimits`` (in ``H3Configuration/abuseLimits``) bounds rapid stream reset, ignored
+/// unidirectional streams, QPACK instruction floods, control-frame and unknown-frame floods and
+/// oversized unknown frames (each `H3_EXCESSIVE_LOAD`), the response bytes stalled in sends
+/// across a connection (with ``H3Timeouts/send`` resetting a slow reader's streams), and the
+/// number of idle connections per ``HTTP3`` value (the longest-idle one is shut down
+/// gracefully). ``tracker`` counts live connections, request streams, handlers and body
+/// channels.
+///
 /// ## Not yet
 ///
-/// Trailers in responses, `.tunnel` / extended CONNECT (#0111; answered `501`), and abuse
-/// limits such as rapid reset (#0104).
+/// Trailers in responses and `.tunnel` / extended CONNECT (#0111; answered `501`).
 public struct HTTP3: MultiplexedConnectionProtocol {
     public var configuration: H3Configuration
+    /// Shared by every connection this value runs: the idle-connection limit and the debug
+    /// counters.
+    public let tracker: H3ConnectionTracker
 
-    public init(configuration: H3Configuration = H3Configuration()) {
+    public init(configuration: H3Configuration = H3Configuration(), tracker: H3ConnectionTracker = H3ConnectionTracker()) {
         self.configuration = configuration
+        self.tracker = tracker
     }
 
     public static var alpnTokens: [String] { ["h3"] }
@@ -61,7 +84,12 @@ public struct HTTP3: MultiplexedConnectionProtocol {
     public func run<T: MultiplexedTransport, H: HTTPHandler>(
         _ t: T, handler: H, context: ConnectionContext
     ) async where T.Stream: ResettableStream {
-        let driver = H3ConnectionDriver(transport: t, handler: handler, context: context, configuration: configuration)
+        // Every HTTP/3 connection negotiated `h3`; say so even where the transport could not
+        // read it back, so the chain can tell HTTP/3 requests apart (``AltSvc``, #0103).
+        var context = context
+        if context.info.negotiatedALPN == nil { context.info.negotiatedALPN = "h3" }
+        let driver = H3ConnectionDriver(
+            transport: t, handler: handler, context: context, configuration: configuration, tracker: tracker)
         await driver.run()
     }
 }
@@ -75,6 +103,7 @@ where Transport.Stream: ResettableStream {
         var machine: H3Connection
         /// Since when the connection has had no open request stream; `nil` while one is open.
         var idleSince: ContinuousClock.Instant?
+        var abuse: H3AbuseMonitor
     }
 
     /// What starts a graceful shutdown.
@@ -97,17 +126,34 @@ where Transport.Stream: ResettableStream {
     let drained = ShutdownSignal()
     /// The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` (unlimited until its SETTINGS arrive).
     let peerMaxFieldSectionSize = Atomic<UInt64>(.max)
+    let tracker: H3ConnectionTracker
+    /// This connection's ID in ``tracker``.
+    let trackerID: UInt64
+    /// Triggered when there are too many idle connections and this one was idle longest.
+    let evicted = ShutdownSignal()
+    /// ``H3AbuseLimits/maxConnectionSendBuffer``.
+    let sendBudget: H3SendBudget?
 
-    init(transport: Transport, handler: Handler, context: ConnectionContext, configuration: H3Configuration) {
+    init(
+        transport: Transport, handler: Handler, context: ConnectionContext, configuration: H3Configuration,
+        tracker: H3ConnectionTracker = H3ConnectionTracker()
+    ) {
         self.transport = transport
         self.handler = handler
         self.context = context
         self.configuration = configuration
-        state = Mutex(Shared(machine: H3Connection(configuration: configuration), idleSince: .now))
+        self.tracker = tracker
+        state = Mutex(Shared(
+            machine: H3Connection(configuration: configuration), idleSince: .now,
+            abuse: H3AbuseMonitor(limits: configuration.abuseLimits)))
         credit = transport as? any StreamCreditGranting
+        sendBudget = configuration.abuseLimits.maxConnectionSendBuffer.map { H3SendBudget(capacity: $0) }
+        trackerID = tracker.connectionStarted()
     }
 
     func run() async {
+        defer { tracker.connectionEnded(trackerID, sendBufferHighWater: sendBudget?.highWater ?? 0) }
+        tracker.becameIdle(trackerID, evict: evicted, limit: configuration.abuseLimits.maxIdleConnections)
         let initialCredit = state.withLock { $0.machine.initialStreamCredit }
         credit?.raiseMaxStreams(bidirectional: initialCredit, unidirectional: nil)
         await withDiscardingTaskGroup { group in
@@ -138,6 +184,22 @@ where Transport.Stream: ResettableStream {
     }
 
     var isClosing: Bool { state.withLock { $0.machine.isClosing } }
+
+    /// Counts `amount` events of `kind` against ``H3AbuseLimits``; returns `false` when that
+    /// went over the limit.
+    func countAbuse(_ kind: H3AbuseKind, amount: Int = 1) -> Bool {
+        let now = ContinuousClock.now
+        return state.withLock { $0.abuse.record(kind, amount: amount, now: now) }
+    }
+
+    /// ``countAbuse(_:amount:)``, closing the connection with `H3_EXCESSIVE_LOAD` when over the
+    /// limit. Returns `false` then.
+    @discardableResult
+    func recordAbuse(_ kind: H3AbuseKind, amount: Int = 1) async -> Bool {
+        guard !countAbuse(kind, amount: amount) else { return true }
+        await fail(.excessiveLoad(kind), stream: nil)
+        return false
+    }
 
     /// Signals `failure` as ``H3Failure/signal`` says: on `stream` for a stream error, on the
     /// connection for a connection error.
@@ -215,6 +277,11 @@ where Transport.Stream: ResettableStream {
             }
             if let idle {
                 group.addTask { await self.waitForIdle(idle) ? .idle : nil }
+            }
+            let evicted = self.evicted
+            group.addTask {
+                await evicted.wait()
+                return evicted.isTriggered ? .idle : nil
             }
             let first = await group.next() ?? nil
             group.cancelAll()
@@ -322,6 +389,7 @@ where Transport.Stream: ResettableStream {
             await readQPACKStream(stream, buffer: buffer, critical: .qpackDecoder)
         case .ignoreStream:
             await fail(.unknownStreamType, stream: stream)
+            await recordAbuse(.ignoredUniStreams)
         case .none, .serveRequest, .rejectRequest, .closeConnection, .grantStreamCredit, .sendGoaway, .drained:
             return
         }
@@ -346,8 +414,11 @@ where Transport.Stream: ResettableStream {
 
     func readControlStream(_ stream: Stream, buffer initial: ByteBuffer) async {
         var buffer = initial
-        var parser = H3FrameParser(configuration: .init(streamKind: .control, role: .server))
+        var parser = H3FrameParser(configuration: .init(
+            streamKind: .control, role: .server, maxUnknownFrameLength: configuration.abuseLimits.maxUnknownFrameLength))
+        var counted = 0
         while true {
+            var frames = 0
             while buffer.readableBytes > 0 {
                 let output: H3FrameParser.Output
                 do throws(HTTP3Error) {
@@ -358,6 +429,7 @@ where Transport.Stream: ResettableStream {
                     return
                 }
                 buffer.moveReaderIndex(forwardBy: output.consumed)
+                if output.event != .needsMoreData { frames += 1 }
                 let frame: H3Connection.ControlFrame
                 switch output.event {
                 case .settings(let settings): frame = .settings(settings)
@@ -371,6 +443,10 @@ where Transport.Stream: ResettableStream {
                     peerMaxFieldSectionSize.store(limit, ordering: .relaxed)
                 }
             }
+            // Every frame counts toward the control-frame flood limit, skipped ones included.
+            frames += parser.skippedFrameCount - counted
+            counted = parser.skippedFrameCount
+            guard await recordAbuse(.controlFrames, amount: frames) else { return }
             buffer.clear()
             guard await receiveCritical(stream, into: &buffer, critical: .control) else { return }
         }
@@ -381,6 +457,7 @@ where Transport.Stream: ResettableStream {
         var encoderReader = QPACKEncoderStreamReader()
         var decoderReader = QPACKDecoderStreamReader()
         while true {
+            var instructions = 0
             do throws(QPACKError) {
                 while buffer.readableBytes > 0 {
                     let bytes = buffer
@@ -393,12 +470,14 @@ where Transport.Stream: ResettableStream {
                         return consumed
                     }
                     if consumed == 0 { break }
+                    instructions += 1
                     buffer.moveReaderIndex(forwardBy: consumed)
                 }
             } catch {
                 await fail(.qpackFailure(code: error.code.rawValue), stream: nil)
                 return
             }
+            guard await recordAbuse(.qpackInstructions, amount: instructions) else { return }
             // A partial instruction (a few bytes at most) stays for the next receive.
             _ = buffer.discardReadBytes()
             guard await receiveCritical(stream, into: &buffer, critical: critical) else { return }
@@ -407,9 +486,29 @@ where Transport.Stream: ResettableStream {
 
     // MARK: Request streams
 
+    /// How a request stream's processing ended, which decides what is still to be signalled.
+    enum RequestEnd: Sendable {
+        /// The response is complete (or a rejection was answered).
+        case completed
+        /// A failure was already signalled (``fail(_:stream:)``).
+        case signalled
+        /// The peer reset the stream or sent STOP_SENDING before the response was complete.
+        case peerAborted
+        /// The request's tasks were cancelled, or the handler threw `CancellationError`.
+        case cancelled
+    }
+
+    /// What a watched request stream's two tasks report.
+    enum Watched: Sendable {
+        case processed(RequestEnd)
+        case fired(H3StreamWatch.Phase?)
+    }
+
     /// Admits the request stream (or rejects it), serves it under its ``H3StreamWatch``, and
     /// reports it closed so stream credit and the drain can follow.
     func serveRequest(_ stream: Stream) async {
+        tracker.requestStreamStarted()
+        defer { tracker.requestStreamEnded() }
         switch await admit(stream.streamID) {
         case .serveRequest:
             break
@@ -424,35 +523,67 @@ where Transport.Stream: ResettableStream {
             return
         }
 
+        let end: RequestEnd
         if let watch = H3StreamWatch.make(configuration.timeouts) {
-            let fired = await withTaskGroup(of: H3StreamWatch.Phase?.self) { group in
+            let (processed, fired) = await withTaskGroup(of: Watched.self) { group in
                 group.addTask {
-                    await self.process(stream, watch: watch)
+                    let end = await self.process(stream, watch: watch)
                     watch.finish()
-                    return nil
+                    return .processed(end)
                 }
-                group.addTask { await watch.run() }
+                group.addTask { .fired(await watch.run()) }
+                var processed = RequestEnd.cancelled
                 var fired: H3StreamWatch.Phase?
-                for await phase in group {
-                    if let phase { fired = phase }
+                for await outcome in group {
+                    switch outcome {
+                    case .processed(let end): processed = end
+                    case .fired(let phase): if let phase { fired = phase }
+                    }
                     // Either the stream finished (stop the watchdog) or a deadline passed
                     // (stop the stream's tasks).
                     group.cancelAll()
                 }
-                return fired
+                return (processed, fired)
             }
-            if let fired { await timedOut(fired, stream: stream, watch: watch) }
+            if let fired {
+                await timedOut(fired, stream: stream, watch: watch)
+                end = .signalled
+            } else {
+                end = processed
+            }
         } else {
-            await process(stream, watch: nil)
+            end = await process(stream, watch: nil)
         }
+        await signal(end, on: stream)
         await stream.close(.normal)
         requestStreamClosed(served: true)
+    }
+
+    /// Resets a request that the peer abandoned or whose handler was cancelled with
+    /// `H3_REQUEST_CANCELLED`; a peer abort also counts toward the rapid-reset limit.
+    func signal(_ end: RequestEnd, on stream: Stream) async {
+        switch end {
+        case .completed, .signalled:
+            return
+        case .peerAborted:
+            // While the connection is being torn down, its streams fail too: not an abuse.
+            guard !Task.isCancelled, !isClosing else { return }
+            await fail(.requestCancelled, stream: stream)
+            await recordAbuse(.abortedRequests)
+        case .cancelled:
+            // The whole connection is going away: CONNECTION_CLOSE ends the stream anyway.
+            guard !Task.isCancelled, !isClosing else { return }
+            await fail(.requestCancelled, stream: stream)
+        }
     }
 
     func admit(_ streamID: UInt64) async -> H3Connection.Action {
         let action = state.withLock { shared in
             let action = shared.machine.handle(.requestStream(streamID: streamID))
-            if action == .serveRequest { shared.idleSince = nil }
+            if action == .serveRequest {
+                if shared.idleSince != nil { tracker.becameBusy(trackerID) }
+                shared.idleSince = nil
+            }
             return action
         }
         if case .closeConnection(let code) = action {
@@ -464,7 +595,11 @@ where Transport.Stream: ResettableStream {
     func requestStreamClosed(served: Bool) {
         let action = state.withLock { shared in
             let action = shared.machine.handle(.requestStreamClosed(served: served))
-            if shared.machine.activeRequestStreams == 0 && shared.idleSince == nil { shared.idleSince = .now }
+            if shared.machine.activeRequestStreams == 0 && shared.idleSince == nil {
+                shared.idleSince = .now
+                // Under the lock, so the tracker sees idle and busy in the connection's order.
+                tracker.becameIdle(trackerID, evict: evicted, limit: configuration.abuseLimits.maxIdleConnections)
+            }
             return action
         }
         switch action {
@@ -486,22 +621,26 @@ where Transport.Stream: ResettableStream {
             if watch.responseStarted {
                 await fail(.bodyTimeout, stream: stream)
             } else {
-                await write(HTTPResponse(status: .requestTimeout), isHead: false, on: stream, watch: nil)
+                _ = await write(HTTPResponse(status: .requestTimeout), isHead: false, on: stream, watch: nil)
                 await fail(.unreadBodyAbandoned, stream: stream)
             }
         case .drain:
             await fail(.unreadBodyAbandoned, stream: stream)
+        case .send:
+            await fail(.sendTimeout, stream: stream)
         }
     }
 
     /// Reads the request head and serves the request, or fails the stream.
-    func process(_ stream: Stream, watch: H3StreamWatch?) async {
+    func process(_ stream: Stream, watch: H3StreamWatch?) async -> RequestEnd {
         let storage = HTTPRequestStorage(bufferCapacity: 512, fieldCapacity: 16)
-        var reader = H3RequestReader(configuration: configuration, storage: storage)
+        var reader = H3RequestReader(configuration: configuration, storage: storage) { [self] skipped in
+            countAbuse(.unknownRequestFrames, amount: skipped)
+        }
         switch await reader.next(from: stream) {
         case .head(let request):
             watch?.enterBody()
-            await serve(request, rejection: nil, on: stream, reader: reader, watch: watch)
+            return await serve(request, rejection: nil, on: stream, reader: reader, watch: watch)
         case .headError(let error):
             switch error {
             case .malformed:
@@ -510,18 +649,27 @@ where Transport.Stream: ResettableStream {
                 await fail(.unservableFieldSection, stream: stream)
             case .fieldSectionTooLarge:
                 watch?.enterBody()
-                await serve(nil, rejection: .requestHeaderFieldsTooLarge, on: stream, reader: reader, watch: watch)
+                return await serve(nil, rejection: .requestHeaderFieldsTooLarge, on: stream, reader: reader, watch: watch)
             case .qpack(let qpack):
                 await fail(.qpackFailure(code: qpack.code.rawValue), stream: nil)
             }
+            return .signalled
         case .streamError(let error):
             await fail(H3Failure(streamError: error), stream: stream)
+            // Opening a stream and ending it without a request costs as much as a reset.
+            await recordAbuse(.abortedRequests)
+            return .signalled
         case .connectionError(let code):
             await fail(H3Failure(connectionErrorCode: code), stream: nil)
-        case .data, .end, .peerReset, .failed:
+            return .signalled
+        case .peerReset:
+            return .peerAborted
+        case .failed:
+            return .cancelled
+        case .data, .end:
             // DATA before HEADERS is a connection error, and `end` without HEADERS is a stream
-            // error, so neither arrives here; a reset or failed stream has nobody to answer.
-            return
+            // error, so neither arrives here.
+            return .signalled
         }
     }
 
@@ -532,12 +680,19 @@ where Transport.Stream: ResettableStream {
         /// The response was written; `bodyDrained` is false when the unread request body hit
         /// ``H3Configuration/maxUnreadBodySize``.
         case responded(bodyDrained: Bool)
+        /// The response was not completed.
+        case responseEnded(RequestEnd)
+        /// The peer reset the stream or sent STOP_SENDING (``PeerAbortObserving``).
+        case peerAborted
+        /// The abort watcher was stopped.
+        case watcherStopped
     }
 
-    /// Runs the handler for `head` (or answers `rejection` without it) next to the body reader,
-    /// and handles the first of: peer reset, malformed body, end of both.
-    func serve(_ head: HTTPRequest?, rejection: HTTPStatus?, on stream: Stream, reader: H3RequestReader, watch: H3StreamWatch?) async {
-        let channel = H3BodyChannel(capacity: configuration.bodyQueueCapacity, streamID: stream.streamID, watch: watch)
+    /// Runs the handler for `head` (or answers `rejection` without it) next to the body reader
+    /// and, when the stream can report it, a peer-abort watcher; handles the first of: peer
+    /// abort, malformed body, end of both.
+    func serve(_ head: HTTPRequest?, rejection: HTTPStatus?, on stream: Stream, reader: H3RequestReader, watch: H3StreamWatch?) async -> RequestEnd {
+        let channel = H3BodyChannel(capacity: configuration.bodyQueueCapacity, streamID: stream.streamID, watch: watch, tracker: tracker)
         let declared = reader.machine.contentLength
         var rejection = rejection
         if rejection == nil, let declared, declared > UInt64(configuration.maxRequestBodySize) {
@@ -550,7 +705,8 @@ where Transport.Stream: ResettableStream {
             return request
         }
         let status = rejection ?? .internalServerError
-        let abandonBody = await withTaskGroup(of: StreamOutcome.self) { group -> Bool in
+        let observer = stream as? any PeerAbortObserving
+        let (end, abandonBody) = await withTaskGroup(of: StreamOutcome.self) { group -> (RequestEnd, Bool) in
             group.addTask {
                 var reader = reader
                 return await self.pumpBody(from: stream, reader: &reader, into: channel)
@@ -558,38 +714,72 @@ where Transport.Stream: ResettableStream {
             group.addTask {
                 await self.respond(to: request, rejection: status, storage: reader.storage, on: stream, body: channel, watch: watch)
             }
+            if let observer {
+                group.addTask {
+                    await observer.waitForPeerAbort()
+                    return Task.isCancelled ? .watcherStopped : .peerAborted
+                }
+            }
             var abandonBody = false
+            var responded = false
+            var signalled = false
+            var aborted = false
+            var cancelled = false
             for await outcome in group {
                 switch outcome {
                 case .bodyRead(let end):
                     switch end {
-                    case .end:
+                    case .end, .head, .headError, .data:
                         continue
-                    case .peerReset, .failed:
+                    case .peerReset:
+                        aborted = true
+                        group.cancelAll()
+                    case .failed:
+                        cancelled = true
                         group.cancelAll()
                     case .streamError(let error):
                         group.cancelAll()
                         await fail(H3Failure(streamError: error), stream: stream)
+                        signalled = true
                     case .connectionError(let code):
                         group.cancelAll()
                         await fail(H3Failure(connectionErrorCode: code), stream: nil)
-                    case .head, .headError, .data:
-                        continue
+                        signalled = true
                     }
                 case .bodyTooLarge:
                     // The handler's read fails with `tooLarge` and it answers `413`; the rest of
                     // the body is not read.
                     abandonBody = true
                 case .responded(let bodyDrained):
-                    if !bodyDrained {
-                        abandonBody = true
-                        group.cancelAll()
+                    responded = true
+                    if !bodyDrained { abandonBody = true }
+                    // The body reader is done (or abandoned); this also stops the watcher.
+                    group.cancelAll()
+                case .responseEnded(let end):
+                    switch end {
+                    case .peerAborted: aborted = true
+                    case .signalled: signalled = true
+                    case .cancelled, .completed: cancelled = true
                     }
+                    group.cancelAll()
+                case .peerAborted:
+                    aborted = true
+                    group.cancelAll()
+                case .watcherStopped:
+                    continue
                 }
             }
-            return abandonBody
+            let end: RequestEnd = responded ? .completed
+                : signalled ? .signalled
+                : aborted ? .peerAborted
+                : cancelled ? .cancelled : .completed
+            return (end, abandonBody)
         }
-        if abandonBody { await fail(.unreadBodyAbandoned, stream: stream) }
+        if abandonBody && end == .completed {
+            await fail(.unreadBodyAbandoned, stream: stream)
+            return .signalled
+        }
+        return end
     }
 
     /// Feeds DATA payload to `channel` until FIN or an error, and reports how the body ended.
@@ -646,28 +836,33 @@ where Transport.Stream: ResettableStream {
             isHead = request.method == .head
             var requestContext = context.requestContext
             if context.recordsRequestStartTime { requestContext.startTime = .now() }
+            tracker.handlerStarted()
             do {
                 response = try await handler.handle(request, context: requestContext)
+                tracker.handlerEnded()
                 storage.endRequest()
                 body.expire()
             } catch {
+                tracker.handlerEnded()
                 storage.endRequest()
                 body.expire()
-                // Cancelled (peer reset, timeout), or the body turned out malformed: `serve`
-                // resets the stream, so nothing is written here.
-                guard !Task.isCancelled else { return .responded(bodyDrained: true) }
+                // Cancelled (peer abort, timeout, connection closing) or the handler gave up by
+                // itself: `serve` resets the stream with H3_REQUEST_CANCELLED.
+                if Task.isCancelled || error is CancellationError { return .responseEnded(.cancelled) }
                 if body.isTooLarge {
                     response = HTTPResponse(status: .contentTooLarge)
                 } else {
-                    guard !body.failed else { return .responded(bodyDrained: true) }
+                    // A malformed, truncated or reset body: the body reader's outcome decides.
+                    guard !body.failed else { return .responseEnded(.cancelled) }
                     response = HTTPResponse(status: .internalServerError)
                 }
             }
         } else {
             response = HTTPResponse(status: rejection)
         }
-        guard !Task.isCancelled else { return .responded(bodyDrained: true) }
-        await write(response, isHead: isHead, on: stream, watch: watch)
+        guard !Task.isCancelled else { return .responseEnded(.cancelled) }
+        let written = await write(response, isHead: isHead, on: stream, watch: watch)
+        guard written == .completed else { return .responseEnded(written) }
         guard !Task.isCancelled else { return .responded(bodyDrained: true) }
         watch?.enterDrain()
         var discarded = 0
@@ -678,8 +873,10 @@ where Transport.Stream: ResettableStream {
         return .responded(bodyDrained: true)
     }
 
-    /// Writes `response` as HEADERS and DATA frames, then FIN.
-    func write(_ response: HTTPResponse, isHead: Bool, on stream: Stream, watch: H3StreamWatch?) async {
+    /// Writes `response` as HEADERS and DATA frames, then FIN, through the connection's send
+    /// budget and the stream's send deadline (``H3ResponseSink``).
+    func write(_ response: HTTPResponse, isHead: Bool, on stream: Stream, watch: H3StreamWatch?) async -> RequestEnd {
+        let sink = H3ResponseSink(stream: stream, budget: sendBudget, watch: watch)
         var status = response.status
         var headers = response.headers
         var body = response.body
@@ -711,45 +908,80 @@ where Transport.Stream: ResettableStream {
         do {
             switch body {
             case .empty, .tunnel:
-                try await stream.send(out, endOfStream: true)
+                try await sink.send(out, endOfStream: true)
 
             case .bytes(let bytes):
                 if hasContent && bytes.readableBytes > 0 {
-                    var sink = ByteBufferSink(buffer: out)
-                    try H3FrameEncoder.encodeDataHeader(length: UInt64(bytes.readableBytes), into: &sink)
-                    out = sink.buffer
+                    var frame = ByteBufferSink(buffer: out)
+                    try H3FrameEncoder.encodeDataHeader(length: UInt64(bytes.readableBytes), into: &frame)
+                    out = frame.buffer
                     out.append(bytes)
                 }
-                try await stream.send(out, endOfStream: true)
+                try await sink.send(out, endOfStream: true)
 
             case .file(let region):
                 guard hasContent && region.length > 0 else {
-                    try await stream.send(out, endOfStream: true)
-                    return
+                    try await sink.send(out, endOfStream: true)
+                    return .completed
                 }
-                var sink = ByteBufferSink(buffer: out)
-                try H3FrameEncoder.encodeDataHeader(length: UInt64(region.length), into: &sink)
+                var frame = ByteBufferSink(buffer: out)
+                try H3FrameEncoder.encodeDataHeader(length: UInt64(region.length), into: &frame)
                 headSent = true
-                try await stream.send(sink.buffer, endOfStream: false)
-                // The transport reads the region in bounded chunks (`sendFileByReading`).
-                try await stream.sendFile(region)
-                try await stream.send(ByteBuffer(), endOfStream: true)
+                try await sink.send(frame.buffer, endOfStream: false)
+                // Read in bounded chunks, each through the send budget.
+                try await sink.sendFile(region)
+                try await sink.send(ByteBuffer(), endOfStream: true)
 
             case .stream(_, let writer):
                 headSent = true
-                try await stream.send(out, endOfStream: false)
+                try await sink.send(out, endOfStream: false)
                 if hasContent {
-                    try await writer(H3DataWriter(stream: stream))
+                    try await writer(H3DataWriter(stream: sink))
                 }
-                try await stream.send(ByteBuffer(), endOfStream: true)
+                try await sink.send(ByteBuffer(), endOfStream: true)
             }
+            return .completed
         } catch {
-            // A peer reset or STOP_SENDING, cancellation, or a failing body writer or file.
-            if headSent && !Task.isCancelled {
-                await fail(.responseFailed, stream: stream)
-            }
+            if Task.isCancelled || error is CancellationError { return .cancelled }
+            // The peer reset the stream or sent STOP_SENDING.
+            if let error = error as? TransportError, error == .connectionReset { return .peerAborted }
+            // A failing body writer or file, or the stream closed under us.
+            guard headSent else { return .cancelled }
+            await fail(.responseFailed, stream: stream)
+            return .signalled
         }
     }
+}
+
+/// The send side of a request stream for the response: every send waits for its share of the
+/// connection's ``H3SendBudget`` and runs under the stream's ``H3Timeouts/send`` deadline, so a
+/// client that does not read holds a bounded number of bytes, for a bounded time (#0104).
+struct H3ResponseSink<Stream: ByteStreamTransport>: ByteStreamTransport {
+    let stream: Stream
+    let budget: H3SendBudget?
+    let watch: H3StreamWatch?
+
+    func send(_ bytes: ByteBuffer, endOfStream: Bool) async throws {
+        watch?.armSend()
+        defer { watch?.disarmSend() }
+        let held = try await budget?.acquire(bytes.readableBytes) ?? 0
+        defer { budget?.release(held) }
+        try await stream.send(bytes, endOfStream: endOfStream)
+    }
+
+    func sendFile(_ region: FileRegion) async throws {
+        try await sendFileByReading(region, chunkSize: FileRegion.defaultChunkSize)
+    }
+
+    func receive(into buffer: inout ByteBuffer, maxLength: Int) async throws -> Int {
+        try await stream.receive(into: &buffer, maxLength: maxLength)
+    }
+
+    func close(_ reason: CloseReason) async {
+        await stream.close(reason)
+    }
+
+    var info: ConnectionInfo { stream.info }
 }
 
 /// The ``HTTPBodyWriter`` for `.stream` responses: each write is one DATA frame, sent with

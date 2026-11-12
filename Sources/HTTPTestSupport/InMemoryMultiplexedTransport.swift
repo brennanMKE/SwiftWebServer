@@ -279,6 +279,14 @@ extension InMemoryMultiplexedTransport.Stream: ResettableStream {}
 /// stream-credit API HTTP/3 uses (#0102).
 extension InMemoryMultiplexedTransport: StreamCreditGranting {}
 
+/// A peer RESET_STREAM or STOP_SENDING (``Stream/injectPeerReset(applicationError:)`` and
+/// friends included), or the connection ending, ends ``Stream/waitForPeerAbort()`` (#0104).
+extension InMemoryMultiplexedTransport.Stream: PeerAbortObserving {
+    public func waitForPeerAbort() async {
+        await codes.aborted[side.index].wait()
+    }
+}
+
 extension InMemoryMultiplexedTransport {
     /// One endpoint of a QUIC-like stream: a ``ByteStreamTransport`` with an RFC 9000 stream ID.
     public final class Stream: ByteStreamTransport, StreamIdentified, Sendable {
@@ -305,7 +313,10 @@ extension InMemoryMultiplexedTransport {
             }
 
             let value = Mutex(Value())
-
+            /// Triggered for a side when its peer resets the direction it reads or sends
+            /// STOP_SENDING on the direction it writes, or the connection ends
+            /// (``Stream/waitForPeerAbort()``).
+            let aborted = [ShutdownSignal(), ShutdownSignal()]
         }
 
         init(streamID: UInt64, side: Side, endpoint: InMemoryTransport, codes: Codes,
@@ -343,6 +354,7 @@ extension InMemoryMultiplexedTransport {
                         codes.stopSending[side.index] = 0
                     }
                 }
+                if canSend && outputOpen || canReceive && inputOpen { codes.aborted[side.peer.index].trigger() }
             }
             await endpoint.close(reason)
         }
@@ -389,6 +401,7 @@ extension InMemoryMultiplexedTransport {
         ) async {
             codes.value.withLock { if $0.reset[from.index] == nil { $0.reset[from.index] = code } }
             pipe.state.withLock { $0.reset = true }
+            codes.aborted[from.peer.index].trigger()
             await pipe.drainAsync()
         }
 
@@ -405,11 +418,13 @@ extension InMemoryMultiplexedTransport {
                 $0.readerClosed = true
                 $0.reset = true
             }
+            codes.aborted[from.peer.index].trigger()
             await pipe.drainAsync()
         }
 
         /// Connection termination: both directions fail.
         func resetBothDirections() async {
+            codes.aborted[side.index].trigger()
             for pipe in [endpoint.outbound, endpoint.inbound] {
                 pipe.state.withLock {
                     $0.reset = true

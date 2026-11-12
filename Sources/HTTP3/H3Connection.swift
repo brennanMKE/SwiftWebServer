@@ -32,8 +32,10 @@ public struct H3Configuration: Sendable, Hashable {
     /// handler left the body unread). Past it, or past ``H3Timeouts/unreadBody``, the server
     /// sends STOP_SENDING `H3_NO_ERROR`.
     public var maxUnreadBodySize: Int
-    /// Header, idle, body, unread-body and drain limits.
+    /// Header, idle, body, unread-body, send and drain limits.
     public var timeouts: H3Timeouts
+    /// Rapid reset, stream, frame and QPACK floods, slow readers and idle connections (#0104).
+    public var abuseLimits: H3AbuseLimits
 
     public static let defaultMaxConcurrentRequestStreams = 100
     public static let defaultMaxRequestBodySize = 10 * 1024 * 1024
@@ -48,7 +50,8 @@ public struct H3Configuration: Sendable, Hashable {
         maxConcurrentRequestStreams: Int = H3Configuration.defaultMaxConcurrentRequestStreams,
         maxRequestBodySize: Int = H3Configuration.defaultMaxRequestBodySize,
         maxUnreadBodySize: Int = H3Configuration.defaultMaxUnreadBodySize,
-        timeouts: H3Timeouts = H3Timeouts()
+        timeouts: H3Timeouts = H3Timeouts(),
+        abuseLimits: H3AbuseLimits = H3AbuseLimits()
     ) {
         precondition(maxFieldSectionSize > 0 && maxEncodedFieldSectionLength > 0,
                      "H3Configuration field section limits must be positive")
@@ -64,6 +67,7 @@ public struct H3Configuration: Sendable, Hashable {
         self.maxRequestBodySize = maxRequestBodySize
         self.maxUnreadBodySize = maxUnreadBodySize
         self.timeouts = timeouts
+        self.abuseLimits = abuseLimits
     }
 
     /// The SETTINGS this server sends: a QPACK dynamic table of capacity 0, no blocked

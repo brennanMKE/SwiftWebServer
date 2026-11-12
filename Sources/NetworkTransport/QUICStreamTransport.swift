@@ -257,6 +257,31 @@ public final class QUICStreamTransport: ByteStreamTransport, StreamIdentified {
 /// stream-reset capability HTTP/3 uses for stream errors (#0101).
 extension QUICStreamTransport: ResettableStream {}
 
+/// A peer RESET_STREAM or STOP_SENDING moves the stream `NWConnection` to `.failed(ECONNRESET)`
+/// even when no receive or send is pending (observed on macOS 27, #0104), so
+/// ``waitForPeerAbort()`` returns on the stream failing or ending, or on a receive or send
+/// failing with ``TransportError/connectionReset``.
+extension QUICStreamTransport: PeerAbortObserving {
+    public func waitForPeerAbort() async {
+        let id = core.state.withLock { state -> UInt64 in
+            defer { state.nextAbortWaiterID &+= 1 }
+            return state.nextAbortWaiterID
+        }
+        await withTaskCancellationHandler {
+            await withUnsafeContinuation { (continuation: UnsafeContinuation<Void, Never>) in
+                let now = core.state.withLock { state -> Bool in
+                    if state.peerAborted || state.failure != nil || state.didCancel || Task.isCancelled { return true }
+                    state.abortWaiters[id] = continuation
+                    return false
+                }
+                if now { continuation.resume() }
+            }
+        } onCancel: {
+            core.state.withLock { $0.abortWaiters.removeValue(forKey: id) }?.resume()
+        }
+    }
+}
+
 // MARK: - Core
 
 extension QUICStreamTransport {
@@ -295,6 +320,19 @@ extension QUICStreamTransport {
             var sentResetCode: UInt64?
             var receivedResetCode: UInt64?
             var receivedStopSendingCode: UInt64?
+            /// Set once the peer reset the stream or sent STOP_SENDING (a receive or send failed
+            /// with a reset, or the stream failed); ``waitForPeerAbort()`` waiters are resumed.
+            var peerAborted = false
+            var abortWaiters: [UInt64: UnsafeContinuation<Void, Never>] = [:]
+            var nextAbortWaiterID: UInt64 = 0
+
+            /// Marks the peer abort and takes the waiters to resume after the lock.
+            mutating func takeAbortWaiters() -> [UnsafeContinuation<Void, Never>] {
+                peerAborted = true
+                guard !abortWaiters.isEmpty else { return [] }
+                defer { abortWaiters = [:] }
+                return Array(abortWaiters.values)
+            }
 
             var terminalError: TransportError? {
                 if closedLocally { return .closed }
@@ -338,12 +376,17 @@ extension QUICStreamTransport {
         }
 
         func completeReceive(data: Data?, isComplete: Bool, error: NWError?, peerCode: UInt64?) {
+            var aborted: [UnsafeContinuation<Void, Never>] = []
+            defer { for waiter in aborted { waiter.resume() } }
             let resumed: (UnsafeContinuation<ReceiveOutcome, Never>, ReceiveOutcome)? = state.withLock { state in
                 guard let receiver = state.receiver else { return nil }   // cancelled or closed
                 state.receiver = nil
                 let mapped = error.map { state.closedLocally ? TransportError.closed : TransportError(quic: $0) }
-                if mapped == .connectionReset, state.receivedResetCode == nil, let peerCode, peerCode != state.sentResetCode {
-                    state.receivedResetCode = peerCode
+                if mapped == .connectionReset {
+                    aborted = state.takeAbortWaiters()
+                    if state.receivedResetCode == nil, let peerCode, peerCode != state.sentResetCode {
+                        state.receivedResetCode = peerCode
+                    }
                 }
                 let count = data?.count ?? 0
                 switch state.receive.handle(.received(byteCount: count, isComplete: isComplete, error: mapped)) {
@@ -382,12 +425,17 @@ extension QUICStreamTransport {
         }
 
         func completeSend(error: NWError?, peerCode: UInt64?) {
+            var aborted: [UnsafeContinuation<Void, Never>] = []
+            defer { for waiter in aborted { waiter.resume() } }
             let resumed: (UnsafeContinuation<Void, any Error>, TransportError?)? = state.withLock { state in
                 guard let sender = state.sender else { return nil }
                 state.sender = nil
                 let mapped = error.map { state.closedLocally ? TransportError.closed : TransportError(quic: $0) }
-                if mapped == .connectionReset, state.receivedStopSendingCode == nil, let peerCode, peerCode != state.sentResetCode {
-                    state.receivedStopSendingCode = peerCode
+                if mapped == .connectionReset {
+                    aborted = state.takeAbortWaiters()
+                    if state.receivedStopSendingCode == nil, let peerCode, peerCode != state.sentResetCode {
+                        state.receivedStopSendingCode = peerCode
+                    }
                 }
                 return (sender, mapped)
             }
@@ -485,8 +533,9 @@ extension QUICStreamTransport {
                 if state.failure == nil { state.failure = error }
                 let error = state.closedLocally ? TransportError.closed : error
                 defer { state.readyWaiter = nil; state.receiver = nil; state.sender = nil }
-                return (error, state.readyWaiter, state.receiver, state.sender)
+                return (error, state.readyWaiter, state.receiver, state.sender, state.takeAbortWaiters())
             }
+            for waiter in taken.4 { waiter.resume() }
             taken.1?.resume(throwing: taken.0)
             taken.2?.resume(returning: .failure(taken.0))
             taken.3?.resume(throwing: taken.0)
@@ -497,9 +546,12 @@ extension QUICStreamTransport {
                 state.didCancel = true
                 let report = !state.finishedReported
                 state.finishedReported = true
+                let aborted = state.abortWaiters.values
+                state.abortWaiters = [:]
                 defer { state.readyWaiter = nil; state.receiver = nil; state.sender = nil; state.cancelWaiters = [] }
-                return (state.readyWaiter, state.receiver, state.sender, state.cancelWaiters, report, state.streamID)
+                return (state.readyWaiter, state.receiver, state.sender, state.cancelWaiters, report, state.streamID, Array(aborted))
             }
+            for waiter in taken.6 { waiter.resume() }
             taken.0?.resume(throwing: TransportError.closed)
             taken.1?.resume(returning: .failure(.closed))
             taken.2?.resume(throwing: TransportError.closed)

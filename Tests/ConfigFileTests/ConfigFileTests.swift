@@ -192,12 +192,109 @@ import Testing
         #expect(file.warnings.contains { $0.contains("unknown key \"caching.etag\"") })
     }
 
-    /// TLS (#0087/#0088) and AccessLog (#0090) are not wired here yet; their keys are kept.
+    /// AccessLog (#0090) is not wired here yet; its key is kept.
     @Test func reservedKeysPassThroughWithAWarning() throws {
-        let file = try parse(#"{"tls": {"certificate": "c.pem"}, "accessLog": true}"#)
-        #expect(file.reserved["tls"]?.json == #"{"certificate":"c.pem"}"#)
+        let file = try parse(#"{"accessLog": true}"#)
         #expect(file.reserved["accessLog"]?.json == "true")
-        #expect(file.warnings.count == 2)
+        #expect(file.warnings.count == 1)
+    }
+
+    // MARK: TLS and HTTP/3 (#0089)
+
+    @Test func tlsAndHTTP3AreOffByDefault() throws {
+        let settings = try parse("{}").settings
+        #expect(settings.tls == nil)
+        #expect(settings.http3 == nil)
+        #expect(try settings.tlsPassword(environment: [:]) == nil)
+        try settings.validate()
+    }
+
+    @Test func tlsKeysApply() throws {
+        var defaults = ServerSettings()
+        defaults.baseDirectory = "/etc/sws"
+        let file = try parse(#"{"tls": {"identity": "id/server.p12", "password": "pw", "port": 0, "colour": 1}}"#, defaults: defaults)
+        let tls = try #require(file.settings.tls)
+        #expect(tls == ServerSettings.TLSSettings(identity: "id/server.p12", password: .literal("pw"), port: 0))
+        #expect(file.settings.resolvedIdentityPath == "/etc/sws/id/server.p12")
+        #expect(try file.settings.tlsPassword(environment: [:]) == "pw")
+        #expect(file.settings.http3 == nil)
+        #expect(file.warnings.count == 1)
+        #expect(file.warnings.first?.contains("unknown key \"tls.colour\"") == true)
+
+        let fromEnvironment = try parse(#"{"tls": {"identity": "/a.p12", "passwordEnv": "PW"}}"#).settings
+        #expect(fromEnvironment.tls?.port == 8443)
+        #expect(fromEnvironment.resolvedIdentityPath == "/a.p12")
+        #expect(try fromEnvironment.tlsPassword(environment: ["PW": "secret"]) == "secret")
+        #expect(throws: ConfigFileError.self) { try fromEnvironment.tlsPassword(environment: [:]) }
+
+        #expect(try parse(#"{"tls": {"enabled": false}}"#).settings.tls == nil)
+        #expect(try parse(#"{"tls": false}"#).settings.tls == nil)
+        #expect(try parse(#"{"tls": null}"#).settings.tls == nil)
+    }
+
+    @Test func http3KeysApply() throws {
+        let tls = #""tls": {"identity": "a.p12", "password": "p"}"#
+        #expect(try parse("{\(tls), \"http3\": true}").settings.http3 == ServerSettings.HTTP3Settings())
+        #expect(try parse("{\(tls), \"http3\": false}").settings.http3 == nil)
+        #expect(try parse("{\(tls), \"http3\": {\"enabled\": false}}").settings.http3 == nil)
+        let http3 = try #require(try parse("{\(tls), \"http3\": {\"port\": 9443, \"altSvcMaxAge\": 60}}").settings.http3)
+        #expect(http3.port == 9443)
+        #expect(http3.altSvcMaxAge == 60)
+        #expect(try parse("{\(tls), \"http3\": {\"port\": null}}").settings.http3?.port == nil)
+        #expect(ServerSettings.HTTP3Settings().altSvcMaxAge == 86_400)
+    }
+
+    @Test(arguments: [
+        (#"{"http3": true}"#, "http3"),
+        (#"{"tls": {"identity": "a", "password": "b"}, "http3": 1}"#, "http3"),
+        (#"{"tls": {"identity": "a", "password": "b"}, "http3": {"port": -1}}"#, "http3.port"),
+        (#"{"tls": {"identity": "a", "password": "b"}, "http3": {"altSvcMaxAge": "1d"}}"#, "http3.altSvcMaxAge"),
+        (#"{"tls": {"identity": "a", "password": "b"}, "http3": {"enabled": "yes"}}"#, "http3.enabled"),
+        (#"{"tls": {"identity": "a", "password": "b"}, "http3": true, "tls2": 1}"#, nil),
+        (#"{"tls": true}"#, "tls"),
+        (#"{"tls": "server.p12"}"#, "tls"),
+        (#"{"tls": {"password": "b"}}"#, "tls.identity"),
+        (#"{"tls": {"identity": ""}}"#, "tls.identity"),
+        (#"{"tls": {"identity": "a"}}"#, "tls.password"),
+        (#"{"tls": {"identity": "a", "password": 1}}"#, "tls.password"),
+        (#"{"tls": {"identity": "a", "passwordEnv": ""}}"#, "tls.passwordEnv"),
+        (#"{"tls": {"identity": "a", "password": "b", "passwordEnv": "C"}}"#, "tls"),
+        (#"{"tls": {"identity": "a", "password": "b", "port": 65536}}"#, "tls.port"),
+    ] as [(String, String?)])
+    func tlsAndHTTP3ErrorsNameTheKey(json: String, key: String?) {
+        let failure = error(json)
+        #expect(failure?.key == key, "\(json): \(failure?.description ?? "no error")")
+        if let key { #expect(failure?.description.contains("\"\(key)\"") == true, "\(failure?.description ?? "")") }
+    }
+
+    /// Whole-settings checks run after command-line overrides.
+    @Test func validateChecksHTTP3NeedsTLSAndDistinctTCPPorts() throws {
+        var settings = ServerSettings()
+        settings.http3 = ServerSettings.HTTP3Settings()
+        #expect(throws: ConfigFileError(key: "http3", "\"http3\" needs \"tls\": HTTP/3 uses the TLS identity")) { try settings.validate() }
+        settings.tls = ServerSettings.TLSSettings(identity: "a", password: .literal("b"), port: 8080)
+        #expect { try settings.validate() } throws: { ($0 as? ConfigFileError)?.key == "tls.port" }
+        settings.port = 0
+        settings.tls?.port = 0
+        try settings.validate()   // two port-0 listeners get different ports
+        settings.port = 8080
+        settings.tls?.port = 8443
+        try settings.validate()
+    }
+
+    /// `Root/http-config.tls.json`: HTTPS on 8443 and HTTP/3 on the same port number, with the
+    /// identity from `scripts/make-test-identity.sh`.
+    @Test func shippedTLSExampleConfigParses() throws {
+        let path = Self.packageRoot.appending(path: "Root/http-config.tls.json").path
+        let file = try ConfigFile.load(path: path)
+        #expect(file.warnings.isEmpty, "\(file.warnings)")
+        let tls = try #require(file.settings.tls)
+        #expect(tls.port == 8443)
+        #expect(tls.password == .literal("sws-test-password"))
+        #expect(file.settings.resolvedIdentityPath == Self.packageRoot.appending(path: "Root/../.test-identity/server.p12").path)
+        #expect(file.settings.http3 == ServerSettings.HTTP3Settings(port: nil, altSvcMaxAge: 86_400))
+        try file.settings.validate()
+        _ = try file.settings.makeHandler()
     }
 
     // MARK: Errors name the key

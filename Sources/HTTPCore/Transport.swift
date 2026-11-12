@@ -100,6 +100,20 @@ public protocol ResettableStream: Sendable {
     func stopSending(applicationError: UInt64) async
 }
 
+/// A stream that reports the peer abandoning it (RESET_STREAM or STOP_SENDING) even while no
+/// receive or send is in progress, for example while an HTTP/3 handler is still computing its
+/// response after the request body ended (#0104). Without it, a peer abort is only noticed by
+/// the next receive or send.
+///
+/// Conformers: `QUICStreamTransport` (NetworkTransport, where the abort arrives as the stream
+/// failing) and `InMemoryMultiplexedTransport.Stream` (HTTPTestSupport).
+public protocol PeerAbortObserving: Sendable {
+    /// Returns once the peer reset the stream or sent STOP_SENDING, or the stream or its
+    /// connection failed. Returns early, without either, when the calling task is cancelled
+    /// (check `Task.isCancelled` afterwards).
+    func waitForPeerAbort() async
+}
+
 /// A multiplexed connection whose stream credit (QUIC MAX_STREAMS, RFC 9000 §4.6) the
 /// protocol can raise, so that the number of streams the peer can have open at once follows
 /// the protocol's own concurrency limit. HTTP/3 grants one more request stream each time a
