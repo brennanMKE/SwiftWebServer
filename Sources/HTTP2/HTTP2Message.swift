@@ -2,33 +2,78 @@ public import HPACK
 public import HTTPCore
 import HeaderCompression
 
-// Request heads in, response heads out: the minimal mapping between HPACK header blocks and
-// `HTTPRequest`/`HTTPResponse` that the connection core (#0044) needs. #0047 completes request
-// validation (cookie joining, `content-length` against DATA) and #0049 the response path.
+// Request heads in, response heads out: the mapping between HPACK header blocks and
+// `HTTPRequest`/`HTTPResponse` (RFC 9113 §8.1–§8.3, #0047 and #0049).
+
+/// Why a request head is malformed (RFC 9113 §8.1.1). Every case is a stream
+/// `PROTOCOL_ERROR`, never a connection error.
+enum HTTP2MalformedRequest: Error, Hashable, Sendable {
+    /// A field or pseudo-header rule of ``PseudoHeaderValidator``.
+    case field(PseudoHeaderValidator.Violation)
+    /// `content-length` is not a decimal number, or two values differ.
+    case invalidContentLength
+    /// `content-length` is above zero but the HEADERS frame ended the stream (§8.1.1: the
+    /// value must equal the DATA total, which is zero).
+    case contentLengthWithoutBody
+    /// `host` names a different authority than `:authority` (§8.3.1).
+    case hostMismatch
+}
+
+/// A validated request head and what the body checks need.
+struct HTTP2RequestHead {
+    var request: HTTPRequest
+    /// The declared `content-length`, which the DATA total must equal (#0048).
+    var contentLength: Int?
+}
 
 /// Copies decoded request fields into an ``HTTPRequestStorage`` and validates them in order
-/// with ``PseudoHeaderValidator`` (RFC 9113 §8.3.1).
+/// (RFC 9113 §8.1.1, §8.2, §8.3.1):
+///
+/// - ``PseudoHeaderValidator`` (shared with HTTP/3): exactly one `:method`, `:scheme` and
+///   `:path` (non-empty, `*` only for OPTIONS), `:authority` or `host`, pseudo-headers first,
+///   no unknown or response pseudo-headers, lowercase token names, values without CR, LF, NUL
+///   or surrounding whitespace, no connection-specific fields, `te` only as `trailers`;
+/// - `content-length` must be a decimal number, repeated only with the same value, and zero
+///   when HEADERS ends the stream; the DATA total is checked against it as the body arrives;
+/// - `host`, when sent with `:authority`, must name the same authority;
+/// - `cookie` crumbs (§8.2.3) are joined with `"; "` into one field for the handler.
+///
+/// The first violation is kept; later fields are still decoded (HPACK must stay in step) but
+/// not stored.
 struct HTTP2RequestFieldSink: HPACKFieldSink {
     let storage: HTTPRequestStorage
     var validator = PseudoHeaderValidator(kind: .request)
-    var violation: PseudoHeaderValidator.Violation?
+    var failure: HTTP2MalformedRequest?
     var scheme = ByteView.empty
     var authority = ByteView.empty
     var path = ByteView.empty
+    var host: ByteView?
+    var contentLength: Int?
+    /// The first `cookie` field's name and value; later crumbs in ``moreCookies``.
+    var cookieName: ByteView?
+    var firstCookie = ByteView.empty
+    var moreCookies: [ByteView] = []
 
     init(storage: HTTPRequestStorage) {
         self.storage = storage
     }
 
     mutating func field(name: Span<UInt8>, value: Span<UInt8>, representation: HPACKRepresentation) {
-        // Every field is still decoded (HPACK state must advance), but after the first
-        // violation nothing more is kept.
-        guard violation == nil else { return }
-        if let result = validator.handle(name: name, value: value) {
-            violation = result
+        guard failure == nil else { return }
+        if let violation = validator.handle(name: name, value: value) {
+            failure = .field(violation)
             return
         }
         let id = HTTPFieldName.lookup(name)
+        if id == .contentLength {
+            guard let parsed = ASCII.parseDecimal(value), parsed <= UInt64(Int.max),
+                  contentLength == nil || contentLength == Int(parsed)
+            else {
+                failure = .invalidContentLength
+                return
+            }
+            contentLength = Int(parsed)
+        }
         let nameView = storage.buffer.appendSpan(name)
         let valueView = storage.buffer.appendSpan(value)
         switch id {
@@ -36,14 +81,32 @@ struct HTTP2RequestFieldSink: HPACKFieldSink {
         case .pseudoAuthority: authority = valueView
         case .pseudoPath: path = valueView
         case .pseudoMethod, .pseudoProtocol: break
-        default: storage.fields.append(id, nameView: nameView, valueView: valueView)
+        case .cookie:
+            // Joined in `head(endStream:)` once every crumb is known.
+            if cookieName == nil {
+                cookieName = nameView
+                firstCookie = valueView
+            } else {
+                moreCookies.append(valueView)
+            }
+        case .host:
+            host = valueView
+            storage.fields.append(id, nameView: nameView, valueView: valueView)
+        default:
+            storage.fields.append(id, nameView: nameView, valueView: valueView)
         }
     }
 
-    /// The request, or the violation that makes it malformed (a stream `PROTOCOL_ERROR`).
-    func request() -> Result<HTTPRequest, PseudoHeaderValidator.Violation> {
-        if let violation = violation ?? validator.finish() { return .failure(violation) }
-        guard let method = validator.method else { return .failure(.missingPseudoHeader(.pseudoMethod)) }
+    /// The request, or why it is malformed. `endStream` is the HEADERS frame's END_STREAM.
+    mutating func head(endStream: Bool) -> Result<HTTP2RequestHead, HTTP2MalformedRequest> {
+        if let failure { return .failure(failure) }
+        if let violation = validator.finish() { return .failure(.field(violation)) }
+        guard let method = validator.method else { return .failure(.field(.missingPseudoHeader(.pseudoMethod))) }
+        if endStream, let contentLength, contentLength > 0 { return .failure(.contentLengthWithoutBody) }
+        if let host, validator.hasSeen(.pseudoAuthority), !sameAuthority(host, authority) {
+            return .failure(.hostMismatch)
+        }
+        if let cookieName { joinCookies(name: cookieName) }
         var path = self.path
         var query = ByteView.empty
         let question = storage.buffer.withSpan(of: path) { span -> Int? in
@@ -54,9 +117,60 @@ struct HTTP2RequestFieldSink: HPACKFieldSink {
             query = path.subview((question + 1)..<path.length)
             path = path.subview(0..<question)
         }
-        return .success(HTTPRequest(
+        let request = HTTPRequest(
             method: method, scheme: scheme, authority: authority, path: path, query: query,
-            headers: storage.fieldsView))
+            headers: storage.fieldsView)
+        return .success(HTTP2RequestHead(request: request, contentLength: contentLength))
+    }
+
+    /// Adds one `cookie` field whose value is every crumb joined with `"; "` (§8.2.3).
+    private mutating func joinCookies(name: ByteView) {
+        guard !moreCookies.isEmpty else {
+            storage.fields.append(.cookie, nameView: name, valueView: firstCookie)
+            return
+        }
+        let buffer = storage.buffer
+        let start = buffer.writerIndex
+        storage.buffer.append(firstCookie, from: buffer)
+        for crumb in moreCookies {
+            storage.buffer.append("; ")
+            storage.buffer.append(crumb, from: buffer)
+        }
+        let joined = ByteView(offset: start, length: storage.buffer.writerIndex - start)
+        storage.fields.append(.cookie, nameView: name, valueView: joined)
+    }
+
+    /// Case-insensitive comparison of two authorities in the storage buffer.
+    private func sameAuthority(_ a: ByteView, _ b: ByteView) -> Bool {
+        guard a.length == b.length else { return false }
+        let buffer = storage.buffer
+        return buffer.withSpan(of: a) { a in
+            buffer.withSpan(of: b) { b in
+                for i in a.indices where ASCII.lowercased(a[i]) != ASCII.lowercased(b[i]) { return false }
+                return true
+            }
+        }
+    }
+}
+
+/// Collects a request's trailer section (RFC 9113 §8.1): regular, well-formed fields only.
+/// A pseudo-header or an invalid field makes the request malformed.
+struct HTTP2TrailerFieldSink: HPACKFieldSink {
+    var validator = PseudoHeaderValidator(kind: .request)
+    var failure: HTTP2MalformedRequest?
+    var fields = HTTPFields()
+
+    mutating func field(name: Span<UInt8>, value: Span<UInt8>, representation: HPACKRepresentation) {
+        guard failure == nil else { return }
+        if !name.isEmpty && name[0] == UInt8(ascii: ":") {
+            failure = .field(.pseudoHeaderAfterRegularField)
+            return
+        }
+        if let violation = validator.handle(name: name, value: value) {
+            failure = .field(violation)
+            return
+        }
+        fields.append(name: name, value: value)
     }
 }
 

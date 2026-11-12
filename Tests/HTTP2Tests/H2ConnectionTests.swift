@@ -149,8 +149,10 @@ struct H2ConnectionTests {
         }
     }
 
-    /// DATA is discarded (request bodies are #0048), but its connection credit comes back,
-    /// and a stream still sending when its response ends is reset with NO_ERROR.
+    /// A body the handler does not read is discarded, but its connection credit comes back
+    /// (in one or two WINDOW_UPDATEs, depending on whether the DATA arrived before or after the
+    /// handler returned), and a stream still sending when its response ends is reset with
+    /// NO_ERROR.
     @Test func requestDataIsCreditedAndUnfinishedStreamsReset() async throws {
         let config = HTTP2Configuration(connectionWindowSize: 65_535)
         try await withH2Connection(configuration: config) { client in
@@ -162,9 +164,14 @@ struct H2ConnectionTests {
             let response = try await client.response(on: 1)
             #expect(String(decoding: response.body, as: UTF8.self) == "hello /post")
             let frames = try await client.frames(until: { if case .rstStream = $0 { return true }; return false })
-            let all = response.others + frames
-            #expect(all.contains(.windowUpdate(stream: 0, 40_000)), "\(all)")
+            var all = response.others + frames
             #expect(all.last == .rstStream(stream: 1, .noError), "\(all)")
+            func credited() -> Int {
+                all.reduce(0) { if case .windowUpdate(0, let i) = $1 { return $0 + Int(i) }; return $0 }
+            }
+            // Every byte is credited; the last WINDOW_UPDATE may wait for more pending credit.
+            while credited() < 32_000, let frame = try await client.nextFrame(timeout: .seconds(2)) { all.append(frame) }
+            #expect(credited() == 40_000 || credited() == 32_000, "\(all)")
         }
     }
 
@@ -395,30 +402,7 @@ struct H2ConnectionTests {
         }
     }
 
-    // MARK: Shutdown
-
-    @Test func shutdownSendsGoawayAndClosesAfterTheLastStream() async throws {
-        let shutdown = ShutdownSignal()
-        let gate = Gate()
-        let handler = ClosureHandler { _ in
-            await gate.wait()
-            return HTTPResponse(body: .bytes(ByteBuffer("done")))
-        }
-        try await withH2Connection(handler: handler, shutdown: shutdown) { client in
-            try await client.handshake()
-            try await client.send(F.headers(1, block: client.requests.get("/")))
-            try await Task.sleep(for: .milliseconds(20))
-            shutdown.trigger()
-            #expect(try await client.frames(until: \.isGoaway).last == .goaway(last: 1, .noError, debug: ""))
-            // A stream above the last one is not served.
-            try await client.send(F.headers(3, block: client.requests.get("/late")))
-            gate.open()
-            let response = try await client.response(on: 1)
-            #expect(String(decoding: response.body, as: UTF8.self) == "done")
-            let rest = try await client.framesUntilClosed()
-            #expect(!rest.contains { if case .headers = $0 { return true }; return false }, "\(rest)")
-        }
-    }
+    // Graceful shutdown: H2GoawayTests (#0052).
 }
 
 /// A one-shot gate handlers can wait on.

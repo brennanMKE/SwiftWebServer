@@ -67,16 +67,27 @@ struct HTTP2OutboundQueue: Sendable {
     }
 }
 
-/// Continuations to resume once the lock is released (ROADMAP §5.4: never inside the lock).
+/// Continuations to resume once the lock is released (ROADMAP §5.4: never inside the lock),
+/// and request bodies to end there (ending one resumes its reader and returns credit).
 struct HTTP2Wakeups: Sendable {
     var writer: CheckedContinuation<Void, Never>?
     var waiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+    /// Bodies of streams that were reset.
+    var resetBodies: [HTTP2BodyChannel] = []
+    /// PING waiters and whether their ACK arrived.
+    var pings: [(CheckedContinuation<Bool, Never>, Bool)] = []
+    /// Handler tasks of streams that were reset.
+    var cancelledTasks: [HTTP2StreamTask] = []
 
     init() {}
 
     func resume() {
         writer?.resume()
         for waiter in waiters.values { waiter.resume() }
+        for (waiter, acknowledged) in pings { waiter.resume(returning: acknowledged) }
+        // The body fails first, so a handler reading it sees why rather than a cancellation.
+        for body in resetBodies { body.fail(TransportError.connectionReset) }
+        for task in cancelledTasks { task.cancel() }
     }
 }
 
@@ -102,14 +113,30 @@ struct HTTP2SharedState: Sendable {
     var nextWaiterID: UInt64 = 0
     /// Streams whose handler task is running.
     var activeStreams = 0
-    /// The graceful GOAWAY was sent: close once the last stream finishes.
+    /// The final graceful GOAWAY was sent: close once the last stream finishes.
     var draining = false
+    /// Since when no stream task has run, when ``HTTP2Configuration/idleTimeout`` is set
+    /// (``tracksIdleTime``); `nil` while one runs.
+    var idleSince: ContinuousClock.Instant?
+    let tracksIdleTime: Bool
+    /// Request bodies of streams whose handler runs and whose peer may still send DATA
+    /// (#0048). The reader adds and completes them; a reset or the end of the handler removes
+    /// them.
+    var bodies: [UInt32: HTTP2BodyChannel] = [:]
+    /// The handler task of every dispatched stream, until it ends (#0051): a reset cancels it.
+    var tasks: [UInt32: HTTP2StreamTask] = [:]
+    /// Tasks waiting for the ACK of our PING, by opaque data (#0050).
+    var pingWaiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
+    /// The opaque data of the last PING sent.
+    var lastPingData: UInt64 = 0x5357_5300_0000_0000
 
     init(configuration: HTTP2Configuration) {
         machine = HTTP2Connection(configuration: configuration.connection)
         encoder = HTTP2ResponseHeadEncoder(tableCapacity: configuration.responseHeaderTableSize)
         outbound = HTTP2OutboundQueue(
             capacity: configuration.outboundQueueSize, maxControlFrames: configuration.maxQueuedControlFrames)
+        tracksIdleTime = configuration.idleTimeout != nil
+        if tracksIdleTime { idleSince = .now }
     }
 
     /// Whether frames can still be enqueued.
@@ -122,14 +149,28 @@ struct HTTP2SharedState: Sendable {
     /// settings and dispatches streams; stream writers learn whether to send).
     mutating func handle(_ event: HTTP2Connection.Event, wakeups: inout HTTP2Wakeups) -> HTTP2Connection.Action {
         let action = machine.handle(event)
+        if case .rstStream(let id, _) = event {
+            // The peer reset the stream: its body ends (what is buffered is credited) and its
+            // handler is cancelled.
+            if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
+            if let task = tasks[id.rawValue] { wakeups.cancelledTasks.append(task) }
+        }
         switch action {
-        case .none, .applyLocalSettings, .send, .sendData, .waitForWindow, .drop:
+        case .none, .applyLocalSettings, .send, .sendData, .waitForWindow, .drop, .acceptTrailers:
             break
+
+        case .acceptData(let increment):
+            if let increment {
+                HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: increment, into: &outbound.priority)
+                if let flood = countControlFrame(wakeups: &wakeups) { return flood }
+                wakeWriter(&wakeups)
+            }
 
         case .dispatch:
             // Counted in the same critical section as the decision, so a graceful shutdown
             // never closes under a stream it already promised to serve (GOAWAY last-stream-ID).
             activeStreams += 1
+            idleSince = nil
 
         case .sendPreface(let settings, let increment):
             HTTP2FrameEncoder.encodeSettings(settings, into: &outbound.ordered)
@@ -153,12 +194,29 @@ struct HTTP2SharedState: Sendable {
             if let flood = countControlFrame(wakeups: &wakeups) { return flood }
             wakeWriter(&wakeups)
 
-        case .sendWindowUpdate(let increment):
-            HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: increment, into: &outbound.priority)
+        case .sendPing(let data):
+            // Our own PING: ahead of DATA, so the round trip does not include queued responses.
+            HTTP2FrameEncoder.encodePing(opaqueData: data, ack: false, into: &outbound.priority)
+            wakeWriter(&wakeups)
+
+        case .pingAcknowledged(let data):
+            if let waiter = pingWaiters.removeValue(forKey: data) { wakeups.pings.append((waiter, true)) }
+
+        case .sendWindowUpdate(let connectionIncrement, let id, let streamIncrement):
+            // Neither has an ordering constraint with other frames: the priority lane.
+            if let connectionIncrement {
+                HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: connectionIncrement, into: &outbound.priority)
+            }
+            if let streamIncrement {
+                HTTP2FrameEncoder.encodeWindowUpdate(streamID: id, increment: streamIncrement, into: &outbound.priority)
+            }
             if let flood = countControlFrame(wakeups: &wakeups) { return flood }
             wakeWriter(&wakeups)
 
         case .resetStream(let id, let code, let increment):
+            // The stream is over: its body ends and its handler, if still running, is cancelled.
+            if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
+            if let task = tasks[id.rawValue] { wakeups.cancelledTasks.append(task) }
             HTTP2FrameEncoder.encodeRSTStream(streamID: id, code, into: &outbound.ordered)
             if let increment {
                 HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: increment, into: &outbound.priority)
@@ -174,13 +232,15 @@ struct HTTP2SharedState: Sendable {
             HTTP2FrameEncoder.encodeGoaway(lastStreamID: last, error: error, into: &outbound.ordered)
             close(error.code == .settingsTimeout ? .timeout : .protocolError, wakeups: &wakeups)
 
-        case .gracefulGoaway(let last):
+        case .gracefulGoaway(let last, let final):
             HTTP2FrameEncoder.encodeGoaway(
                 lastStreamID: last, .noError, debugData: UnsafeRawBufferPointer(start: nil, count: 0),
                 into: &outbound.ordered)
-            draining = true
             wakeWriter(&wakeups)
-            if activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
+            if final {
+                draining = true
+                if activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
+            }
         }
         return action
     }
@@ -281,6 +341,13 @@ struct HTTP2SharedState: Sendable {
         if outbound.closeReason == nil { outbound.closeReason = reason }
         wakeWriter(&wakeups)
         wakeWaiters(&wakeups)
+        failPings(&wakeups)
+    }
+
+    /// No ACK can arrive any more: every PING waiter gets `false`.
+    mutating func failPings(_ wakeups: inout HTTP2Wakeups) {
+        for waiter in pingWaiters.values { wakeups.pings.append((waiter, false)) }
+        pingWaiters.removeAll()
     }
 
     /// The writer's send failed: drop everything queued and stop every writer.
@@ -289,15 +356,23 @@ struct HTTP2SharedState: Sendable {
         outbound.ordered = ByteBuffer()
         outbound.closeReason = .abort
         wakeWaiters(&wakeups)
+        failPings(&wakeups)
     }
 
     /// A stream task ended. Resets the stream if the peer is still sending, and finishes a
     /// graceful drain after the last stream.
     mutating func streamEnded(_ streamID: HTTP2StreamID, wakeups: inout HTTP2Wakeups) {
         activeStreams -= 1
+        if activeStreams == 0 && tracksIdleTime { idleSince = .now }
+        // DATA that still arrives has no reader: the reader credits it at once.
+        bodies.removeValue(forKey: streamID.rawValue)
+        tasks.removeValue(forKey: streamID.rawValue)
         if isOpen { _ = handle(.responseFinished(streamID: streamID), wakeups: &wakeups) }
         if draining && activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
     }
+
+    /// The stream tasks to cancel when the drain deadline passes.
+    var runningTasks: [HTTP2StreamTask] { Array(tasks.values) }
 
     // MARK: Waiters
 
