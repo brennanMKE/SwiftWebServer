@@ -26,14 +26,14 @@
 
 ## 🔒 Authentication
 
-* [ ] Add AuthenticationMiddleware
-* [ ] HMAC validation for JWT tokens
+* [x] Add AuthenticationMiddleware (#0093: `Authenticator`)
+* [x] HMAC validation for JWT tokens (#0093: `JWTVerifier`, HS256)
 * [ ] Add PasskeyMiddleware placeholder
 
 ## 🌍 Virtual Hosting
 
-* [ ] Define HostConfig mapping domains to roots
-* [ ] Route requests based on Host header
+* [x] Define HostConfig mapping domains to roots (#0092: `hosts` key)
+* [x] Route requests based on Host header (#0092: `VirtualHosts`)
 
 ## 🧩 Extension Support
 

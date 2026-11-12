@@ -17,9 +17,15 @@ public struct HTTP2Configuration: Sendable, Hashable {
     public var connectionWindowSize: UInt32
     /// `SETTINGS_MAX_FRAME_SIZE`: the largest frame payload accepted once acknowledged.
     public var maxFrameSize: Int
-    /// `SETTINGS_MAX_HEADER_LIST_SIZE`. Also caps the encoded header block (HEADERS plus
-    /// CONTINUATION) and the decoded header list.
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE` (#0055): a request head whose header list (RFC 9113
+    /// §6.5.2: name + value + 32 per field) is larger is answered `431` without the handler, or
+    /// reset with `PROTOCOL_ERROR` when its fields were already malformed. Blocks are still
+    /// decoded up to ``headerBlockLimit``; beyond it the connection closes.
     public var maxHeaderListSize: Int
+    /// The largest request body (#0055). A larger `content-length` is answered `413` without
+    /// the handler; a body without one that grows past it fails the handler's read with
+    /// `HTTPRequestBodyError.tooLarge`, answered `413`.
+    public var maxRequestBodySize: Int
     /// `SETTINGS_HEADER_TABLE_SIZE`: the HPACK dynamic table the client may use for requests.
     public var headerTableSize: Int
     /// The most HPACK dynamic table memory used for responses, whatever the client allows.
@@ -55,14 +61,27 @@ public struct HTTP2Configuration: Sendable, Hashable {
     /// so the client reads the GOAWAY instead of a reset caused by unread data. `nil` closes at
     /// once.
     public var lingerTimeout: Duration?
+    /// A lingering close also ends once the client sent nothing for this long: with no input
+    /// in flight, closing cannot reset the connection over unread data. `nil` waits for the
+    /// client to close or for ``lingerTimeout``.
+    public var lingerQuietTimeout: Duration?
     /// The most bytes a lingering close discards after a connection error.
     public var maxLingerSize: Int
+    /// Rate limits and timeouts against denial-of-service patterns (#0056).
+    public var abuseLimits: HTTP2AbuseLimits
 
     public static let defaultMaxConcurrentStreams = 100
     public static let defaultInitialWindowSize: UInt32 = 65_535
     public static let defaultConnectionWindowSize: UInt32 = 1 << 20
     public static let defaultMaxHeaderListSize = 16_384
     public static let defaultHeaderTableSize = 4_096
+    public static let defaultMaxRequestBodySize = 10 * 1024 * 1024
+
+    /// The hard cap on a header block, encoded (HEADERS plus CONTINUATION) and decoded: twice
+    /// ``maxHeaderListSize``. Up to it an oversized request head is still decoded (HPACK must
+    /// stay in step) and answered `431`; beyond it, `GOAWAY(ENHANCE_YOUR_CALM)` for the encoded
+    /// block (VU#421644) or `GOAWAY(COMPRESSION_ERROR)` for the decoded list (an HPACK bomb).
+    public var headerBlockLimit: Int { maxHeaderListSize * 2 }
 
     public init(
         cleartext: Bool = true,
@@ -71,6 +90,7 @@ public struct HTTP2Configuration: Sendable, Hashable {
         connectionWindowSize: UInt32 = HTTP2Configuration.defaultConnectionWindowSize,
         maxFrameSize: Int = HTTP2Settings.defaultMaxFrameSize,
         maxHeaderListSize: Int = HTTP2Configuration.defaultMaxHeaderListSize,
+        maxRequestBodySize: Int = HTTP2Configuration.defaultMaxRequestBodySize,
         headerTableSize: Int = HTTP2Configuration.defaultHeaderTableSize,
         responseHeaderTableSize: Int = HTTP2Configuration.defaultHeaderTableSize,
         settingsTimeout: Duration? = .seconds(10),
@@ -83,7 +103,9 @@ public struct HTTP2Configuration: Sendable, Hashable {
         drainTimeout: Duration? = nil,
         idleTimeout: Duration? = nil,
         lingerTimeout: Duration? = .seconds(2),
-        maxLingerSize: Int = 1024 * 1024
+        lingerQuietTimeout: Duration? = .milliseconds(500),
+        maxLingerSize: Int = 1024 * 1024,
+        abuseLimits: HTTP2AbuseLimits = HTTP2AbuseLimits()
     ) {
         precondition((0...HTTP2StreamTable.Configuration.maxSupportedConcurrentStreams).contains(maxConcurrentStreams),
                      "maxConcurrentStreams out of range")
@@ -94,11 +116,12 @@ public struct HTTP2Configuration: Sendable, Hashable {
                      "maxFrameSize is 2^14 through 2^24-1")
         precondition(maxHeaderListSize > 0 && headerTableSize >= 0 && responseHeaderTableSize >= 0,
                      "header sizes must not be negative")
+        precondition(maxRequestBodySize >= 0, "maxRequestBodySize must not be negative")
         precondition(receiveSize > 0 && outboundQueueSize > 0 && maxQueuedControlFrames > 0 && fileChunkSize > 0,
                      "HTTP2Configuration sizes must be positive")
         if let settingsTimeout { precondition(settingsTimeout > .zero, "settingsTimeout must be positive") }
         precondition(shutdownPingTimeout >= .zero && maxLingerSize >= 0, "shutdown limits must not be negative")
-        for timeout in [drainTimeout, idleTimeout, lingerTimeout] {
+        for timeout in [drainTimeout, idleTimeout, lingerTimeout, lingerQuietTimeout] {
             if let timeout { precondition(timeout > .zero, "HTTP2Configuration timeouts must be positive") }
         }
         self.cleartext = cleartext
@@ -107,6 +130,7 @@ public struct HTTP2Configuration: Sendable, Hashable {
         self.connectionWindowSize = connectionWindowSize
         self.maxFrameSize = maxFrameSize
         self.maxHeaderListSize = maxHeaderListSize
+        self.maxRequestBodySize = maxRequestBodySize
         self.headerTableSize = headerTableSize
         self.responseHeaderTableSize = responseHeaderTableSize
         self.settingsTimeout = settingsTimeout
@@ -119,7 +143,9 @@ public struct HTTP2Configuration: Sendable, Hashable {
         self.drainTimeout = drainTimeout
         self.idleTimeout = idleTimeout
         self.lingerTimeout = lingerTimeout
+        self.lingerQuietTimeout = lingerQuietTimeout
         self.maxLingerSize = maxLingerSize
+        self.abuseLimits = abuseLimits
     }
 
     /// The SETTINGS frame the server sends first. `SETTINGS_ENABLE_PUSH` is omitted: a server

@@ -264,4 +264,39 @@ struct H2CurlTests {
             #expect(output == "200 2 20000", "\(output)")
         }
     }
+
+    // MARK: h2load (#0053–#0056)
+
+    static let h2load = URL(fileURLWithPath: "/opt/homebrew/bin/h2load")
+    static var hasH2load: Bool { FileManager.default.isExecutableFile(atPath: h2load.path) }
+
+    static func h2load(_ arguments: [String]) async throws -> (Int32, String) {
+        let output = try await ChildProcess.run(h2load, arguments, timeout: .seconds(30), mergeStandardError: true)
+        return (output.status, output.stdout)
+    }
+
+    /// nghttp2's load client, many streams on a few connections: every request succeeds and
+    /// none trips a flow-control or abuse limit.
+    @Test(.enabled(if: hasH2load)) func h2loadRequestsAllSucceed() async throws {
+        try await Self.withServer(tls: false) { port, _ in
+            let (status, output) = try await Self.h2load(["-n", "2000", "-c", "4", "-m", "10", "http://127.0.0.1:\(port)/"])
+            #expect(status == 0, "\(output)")
+            #expect(output.contains("2000 succeeded, 0 failed, 0 errored"), "\(output)")
+        }
+    }
+
+    /// Large responses through 16 KiB stream and 64 KiB connection windows: the server waits
+    /// for WINDOW_UPDATEs and every response arrives whole.
+    @Test(.enabled(if: hasH2load)) func h2loadSmallWindowsDownloadWhole() async throws {
+        let body = ByteBuffer(bytes: Array(repeating: UInt8(ascii: "x"), count: 256 * 1024))
+        let handler = ClosureHandler { _ in HTTPResponse(body: .bytes(body)) }
+        try await Self.withServer(tls: false, handler: handler) { port, _ in
+            let (status, output) = try await Self.h2load([
+                "-n", "40", "-c", "2", "-m", "4", "-w", "14", "-W", "16", "http://127.0.0.1:\(port)/big"])
+            #expect(status == 0, "\(output)")
+            #expect(output.contains("40 succeeded, 0 failed, 0 errored"), "\(output)")
+            // 40 × 256 KiB of DATA payload.
+            #expect(output.contains("(10485760) data"), "\(output)")
+        }
+    }
 }

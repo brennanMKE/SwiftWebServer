@@ -3,6 +3,7 @@ import ConfigFile
 import Dispatch
 import Foundation
 import HTTP1
+import HTTP2
 import HTTPCore
 import HTTPServer
 import NetworkTransport
@@ -29,7 +30,7 @@ enum ServeCommand {
                                [--max-body-size N] [--root DIR]
                                [--tls [--identity FILE] [--password PW]]
                                [--access-log PATH|-] [--access-log-format F] [--metrics]
-                               [--websocket-echo PATH]
+                               [--websocket-echo PATH] [--h2 | --h2-only]
 
           --config FILE        http-config.json (README "Configuration"); "host", "port",
                                "transport", "maxConnections", "drainTimeout", "maxBodySize"
@@ -55,6 +56,11 @@ enum ServeCommand {
           --metrics            serve request metrics at GET /metrics (Prometheus text)
           --websocket-echo PATH  accept WebSocket handshakes on PATH (RFC 6455, #0108) and
                                echo every message back; other paths are served as usual
+          --h2                 also serve HTTP/2 (RFC 9113): cleartext with prior knowledge
+                               (h2load, curl --http2-prior-knowledge), and ALPN h2 with --tls
+          --h2-only            serve HTTP/2 only, no HTTP/1.1: a cleartext connection that does
+                               not start with the preface gets GOAWAY(PROTOCOL_ERROR) instead
+                               of an HTTP/1.1 400 (h2spec, scripts/h2spec.sh, #0061)
 
         Serves HTTP/1.1 (keep-alive, pipelining). POST echoes the request body, PUT answers
         with the body's length, anything else gets 200 text/plain. With --root, every request
@@ -83,6 +89,10 @@ enum ServeCommand {
         var metrics = false
         /// Request path of the WebSocket echo endpoint.
         var websocketEcho: String?
+        /// Serve HTTP/2 next to HTTP/1.1.
+        var h2 = false
+        /// Serve HTTP/2 without HTTP/1.1.
+        var h2Only = false
     }
 
     struct ConfigError: Error, CustomStringConvertible {
@@ -109,6 +119,8 @@ enum ServeCommand {
         let accessLogFormat = args.string("access-log-format")
         let metrics = args.flag("metrics") ?? false
         let websocketEcho = args.string("websocket-echo")
+        let h2Only = args.flag("h2-only") ?? false
+        let h2 = (args.flag("h2") ?? false) || h2Only
         try args.checkAllConsumed()
 
         var settings = Settings()
@@ -163,6 +175,8 @@ enum ServeCommand {
             }
         }
         settings.metrics = metrics
+        settings.h2 = h2
+        settings.h2Only = h2Only
         if let websocketEcho {
             guard websocketEcho.hasPrefix("/") else {
                 printError("sws-bench serve: --websocket-echo takes a path starting with /")
@@ -233,7 +247,12 @@ enum ServeCommand {
     }
 
     static func protocols(_ settings: Settings) -> [any ConnectionProtocol] {
-        [HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))]
+        let http1 = HTTP1(configuration: HTTP1Configuration(maxBodySize: settings.maxBodySize))
+        guard settings.h2 else { return [http1] }
+        let http2 = HTTP2(configuration: HTTP2Configuration(maxRequestBodySize: settings.maxBodySize))
+        if settings.h2Only { return [http2] }
+        // HTTP/2 first: HTTP/1.1's sniff also matches the `PRI * HTTP/2.0` preface.
+        return [http2, http1]
     }
 
     static func serve<L: TransportListener>(_ settings: Settings, configuration: ServerConfiguration, listener: L) async -> Int32 {
