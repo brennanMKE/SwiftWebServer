@@ -6,7 +6,7 @@ public import HTTPCore
 /// VirtualHost("example.com", "www.example.com", handler: StaticFiles(root: "/srv/example"))
 /// VirtualHost("*.example.org") {            // any subdomain of example.org
 ///     AccessLog()
-///     StaticFiles(root: "/srv/org") as some HTTPHandler
+///     StaticFiles(root: "/srv/org")
 /// }
 /// VirtualHost.default(handler: StaticFiles(root: "/srv/default"))
 /// ```

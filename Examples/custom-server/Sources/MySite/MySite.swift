@@ -17,10 +17,6 @@ func json(_ text: String, status: HTTPStatus = .ok) -> HTTPResponse {
     return HTTPResponse(status: status, headers: headers, body: .bytes(ByteBuffer(bytes: Array(text.utf8))))
 }
 
-/// `StaticFiles`, `Router` and `VirtualHosts` are both middlewares and handlers. Passing the
-/// last element of a chain through this tells the builder it is the terminal handler.
-func terminal(_ handler: some HTTPHandler) -> some HTTPHandler { handler }
-
 /// Runs `action` on SIGINT and SIGTERM. A plain (nonisolated) function, so the handler does
 /// not inherit `main()`'s main-actor isolation; it runs on a dispatch queue.
 func onShutdownSignal(_ action: @escaping @Sendable () -> Void) -> [any DispatchSourceSignal] {
@@ -65,7 +61,7 @@ struct MySite {
             Compression()
             echo
             router
-            terminal(files)
+            files               // the last element is the terminal handler
         }
 
         // SIGINT and SIGTERM: stop accepting, let open connections finish, then return.
