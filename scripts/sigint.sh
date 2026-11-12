@@ -1,10 +1,12 @@
 #!/bin/bash
+# Sends SIGINT to the process listening on PORT (default 8080); the server drains open
+# connections and exits 0.
 
 cd "$(dirname "$0")/.."
 
-PORT=8080
+PORT=${PORT:-8080}
 
-PID=$(lsof -ti tcp:$PORT)
+PID=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN)
 
 if [ -z "$PID" ]; then
   echo "No process is listening on port $PORT."
@@ -12,4 +14,4 @@ if [ -z "$PID" ]; then
 fi
 
 echo "Sending SIGINT (kill -2) to PID $PID using port $PORT..."
-kill -2 "$PID"
+kill -2 $PID

@@ -203,7 +203,7 @@ Known floor: `NWConnection` allocates `Data` and dispatch blocks per receive/sen
 
 ## 8. Milestones
 
-Each numbered item is one issue. The legacy server remains the shipped binary until M4 passes parity.
+Each numbered item is one issue. The legacy server was the shipped binary until the M4 cut-over (#0086), which deleted it.
 
 ### Mainline
 

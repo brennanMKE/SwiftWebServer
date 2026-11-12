@@ -1,3 +1,4 @@
+import ConfigFile
 import Dispatch
 import Foundation
 import HTTP1
@@ -6,8 +7,8 @@ import HTTPServer
 import NetworkTransport
 import StaticFiles
 
-/// `sws-bench serve`: the new stack's server entry point (#0079) until the shipped
-/// `SwiftWebServer` executable moves off Legacy (#0086).
+/// `sws-bench serve`: a bench and test harness for the new stack (#0079). The shipped server is
+/// the `SwiftWebServer` executable (#0086); this one adds built-in echo and hello handlers.
 ///
 /// Runs a ``Server`` over a `TCPListener` speaking HTTP/1.1 (#0080) with a built-in handler:
 /// a `POST` gets its body echoed back, a `PUT` gets the length of its body (read in bounded
@@ -26,8 +27,9 @@ enum ServeCommand {
                                [--max-body-size N] [--root DIR]
                                [--tls [--identity FILE] [--password PW]]
 
-          --config FILE        JSON object with any of "host", "port", "transport",
-                               "maxConnections", "drainTimeout" (seconds); flags override it
+          --config FILE        http-config.json (README "Configuration"); "host", "port",
+                               "transport", "maxConnections", "drainTimeout", "maxBodySize"
+                               and "root" apply; flags override it
           --host HOST          numeric address to bind (default 127.0.0.1)
           --transport T        bsd: POSIX sockets + kqueue (BSDSocketListener, default);
                                nw: Network.framework (TCPListener)
@@ -132,35 +134,25 @@ enum ServeCommand {
         return await serve(settings)
     }
 
+    /// Reads `path` with the shipped server's parser (ConfigFile, #0086): every key optional,
+    /// unknown keys warn, a bad value fails naming the key. Only the keys `serve` uses apply;
+    /// the defaults stay those of `serve` (port 0).
     static func loadConfig(path: String) throws -> Settings {
-        let data: Data
-        do {
-            data = try Data(contentsOf: URL(fileURLWithPath: path))
-        } catch {
-            throw ConfigError(description: "cannot read config file \(path): \(error.localizedDescription)")
-        }
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ConfigError(description: "config file \(path) is not a JSON object")
-        }
+        var defaults = ServerSettings()
+        defaults.port = 0
+        let file = try ConfigFile.load(path: path, defaults: defaults)
+        for warning in file.warnings { printError("sws-bench serve: warning: \(warning)") }
+        let parsed = file.settings
         var settings = Settings()
-        for (key, value) in object {
-            switch (key, value) {
-            case ("host", let text as String):
-                settings.host = text
-            case ("port", let number as NSNumber) where UInt16(exactly: number.doubleValue) != nil:
-                settings.port = UInt16(number.doubleValue)
-            case ("transport", let text as String) where TransportKind(rawValue: text) != nil:
-                settings.transport = TransportKind(rawValue: text)!
-            case ("maxConnections", let number as NSNumber) where Int(exactly: number.doubleValue) != nil:
-                settings.maxConnections = Int(number.doubleValue)
-            case ("drainTimeout", let number as NSNumber) where number.doubleValue >= 0:
-                settings.drainTimeout = number.doubleValue
-            case ("host", _), ("port", _), ("transport", _), ("maxConnections", _), ("drainTimeout", _):
-                throw ConfigError(description: "config file \(path): invalid value for \"\(key)\"")
-            default:
-                throw ConfigError(description: "config file \(path): unknown key \"\(key)\"")
-            }
+        settings.host = parsed.host
+        settings.port = parsed.port
+        settings.transport = parsed.transport == .nw ? .nw : .bsd
+        settings.maxConnections = parsed.maxConnections
+        if let drain = parsed.drainTimeout {
+            settings.drainTimeout = Double(drain.components.seconds) + Double(drain.components.attoseconds) / 1e18
         }
+        settings.maxBodySize = parsed.maxBodySize
+        if file.keys.contains("root") || file.keys.contains("path") { settings.root = parsed.resolvedRoot }
         return settings
     }
 
