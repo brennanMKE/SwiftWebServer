@@ -116,9 +116,21 @@ import Darwin
 ///   keeps reading (discarding input after a connection error, up to
 ///   ``HTTP2Configuration/maxLingerSize``), so the peer reads the GOAWAY rather than a reset.
 ///
+/// ## Outbound flow control (#0054)
+///
+/// A DATA frame is the smallest of the chunk, the stream's send window, the connection's send
+/// window and the peer's MAX_FRAME_SIZE. A writer that cannot send does not buffer: it waits
+/// for its turn (``HTTP2SharedState`` "Fair waiting"). A writer whose stream window is closed
+/// waits for that stream's WINDOW_UPDATE (or an INITIAL_WINDOW_SIZE change, which can make
+/// windows negative, §6.9.2); writers that need queue space or connection window wait in one
+/// FIFO queue, and only the first one that can proceed is woken. A writer that sent a frame and
+/// wants to send more while others wait goes to the back, so responses take turns frame by
+/// frame. A WINDOW_UPDATE of 0 is a `PROTOCOL_ERROR`, and a window above 2³¹−1 a
+/// `FLOW_CONTROL_ERROR` (on the stream, or the connection).
+///
 /// ## Not yet
 ///
-/// Fair window waiting (#0054), extended CONNECT
+/// Extended CONNECT
 /// (#0067: `.tunnel` answers `501`).
 public struct HTTP2: ConnectionProtocol {
     public var configuration: HTTP2Configuration
@@ -211,44 +223,51 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         wakeups.resume()
     }
 
-    /// Suspends until the shared state's generation moves past `generation` (queue space or
-    /// window became available, or the connection is closing) or the task is cancelled.
-    func waitForProgress(since generation: UInt64) async {
-        let id = state.withLock { shared -> UInt64 in
-            defer { shared.nextWaiterID &+= 1 }
-            return shared.nextWaiterID
-        }
+    /// Suspends until it is `ticket`'s turn (``HTTP2SharedState/grantNext(_:)``), its stream
+    /// window opened or closed, the connection is closing, or the task is cancelled.
+    func waitForTurn(_ ticket: UInt64) async {
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let resumeNow = state.withLock { shared -> Bool in
-                    if shared.generation != generation || !shared.isOpen || Task.isCancelled { return true }
-                    shared.waiters[id] = continuation
-                    return false
+                let waiting = state.withLock { shared -> Bool in
+                    !Task.isCancelled && shared.parkWaiter(ticket, continuation)
                 }
-                if resumeNow { continuation.resume() }
+                if !waiting { continuation.resume() }
             }
         } onCancel: {
-            state.withLock { $0.waiters.removeValue(forKey: id) }?.resume()
+            cancelWaiter(ticket)
         }
     }
 
-    /// Repeats `attempt` (a critical section) until it sends or drops, waiting in between.
-    /// Returns the sent length and END_STREAM, or `nil` when dropped or cancelled.
+    /// Forgets `ticket` and passes its turn on, if it had one.
+    func cancelWaiter(_ ticket: UInt64) {
+        var wakeups = HTTP2Wakeups()
+        state.withLock { $0.cancelWaiter(ticket, wakeups: &wakeups) }
+        wakeups.resume()
+    }
+
+    /// Repeats `attempt` (a critical section) until it sends or drops, waiting for its turn in
+    /// between (#0054). Returns the sent length and END_STREAM, or `nil` when dropped or
+    /// cancelled.
     func enqueue(
-        _ attempt: (inout HTTP2SharedState, inout HTTP2Wakeups) -> HTTP2SharedState.StreamStep
+        _ attempt: (inout HTTP2SharedState, UInt64?, inout HTTP2Wakeups) -> HTTP2SharedState.StreamStep
     ) async -> (length: Int, endStream: Bool)? {
+        var ticket: UInt64?
         while true {
             var wakeups = HTTP2Wakeups()
-            let step = state.withLock { attempt(&$0, &wakeups) }
+            let step = state.withLock { attempt(&$0, ticket, &wakeups) }
             wakeups.resume()
             switch step {
             case .sent(let length, let endStream):
                 return (length, endStream)
             case .dropped:
                 return nil
-            case .wait(let generation):
-                await waitForProgress(since: generation)
-                if Task.isCancelled { return nil }
+            case .wait(let next):
+                ticket = next
+                await waitForTurn(next)
+                if Task.isCancelled {
+                    cancelWaiter(next)
+                    return nil
+                }
             }
         }
     }
@@ -878,9 +897,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         case .file(let region): bodyless = !hasContent || region.length == 0
         case .stream: bodyless = !hasContent
         }
-        let head = await enqueue { shared, wakeups in
+        let head = await enqueue { shared, ticket, wakeups in
             shared.sendHeaders(streamID: id, status: status, headers: headers, contentLength: declaredLength,
-                               endStream: bodyless, wakeups: &wakeups)
+                               endStream: bodyless, ticket: ticket, wakeups: &wakeups)
         }
         guard head != nil, !bodyless else { return }
         do {
@@ -910,8 +929,8 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         var remaining = bytes
         while true {
             let chunk = remaining
-            guard let (length, ended) = await enqueue({ shared, wakeups in
-                shared.sendData(streamID: id, bytes: chunk, endStream: endStream, wakeups: &wakeups)
+            guard let (length, ended) = await enqueue({ shared, ticket, wakeups in
+                shared.sendData(streamID: id, bytes: chunk, endStream: endStream, ticket: ticket, wakeups: &wakeups)
             }) else {
                 try Task.checkCancellation()
                 return false
