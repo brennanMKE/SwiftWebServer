@@ -1,6 +1,7 @@
 public import HTTPCore
 import Dispatch
 import Network
+import os
 import Synchronization
 
 /// A TCP listener over `NWListener` whose accepted connections are a demand-driven
@@ -22,6 +23,15 @@ import Synchronization
 /// a free port; ``start()`` returns the actual port once the listener is ready.
 ///
 /// Handlers are installed in `init`, before `start(queue:)`.
+///
+/// ## TLS
+///
+/// With a ``TLSConfiguration`` (#0087) every accepted connection runs the TLS handshake inside
+/// Network.framework and is handed over only once it is done, with the negotiated ALPN token
+/// and TLS version in ``TCPTransport/info``. A handshake that fails (a client speaking
+/// cleartext, a bad ALPN offer, a rejected certificate) is logged, counted in
+/// ``failedHandshakeCount`` and closed; one that does not finish within
+/// ``TLSConfiguration/handshakeTimeout`` is reset. Neither reaches ``connections``.
 public final class TCPListener: Sendable {
     public struct Configuration: Sendable, Hashable {
         /// Numeric address to bind (`127.0.0.1`, `::1`, or `0.0.0.0` for all interfaces).
@@ -51,21 +61,25 @@ public final class TCPListener: Sendable {
     let queue: DispatchQueue
     let core: Core
     public let configuration: Configuration
+    /// The TLS settings, or `nil` for cleartext TCP.
+    public let tls: TLSConfiguration?
 
     /// Creates the listener and installs its handlers. Nothing is bound until ``start()``.
-    public init(configuration: Configuration = Configuration()) throws {
+    /// With `tls`, it serves TLS over TCP (#0087).
+    public init(configuration: Configuration = Configuration(), tls: TLSConfiguration? = nil) throws {
         self.configuration = configuration
+        self.tls = tls
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(configuration.host),
             port: NWEndpoint.Port(rawValue: configuration.port) ?? .any)
-        let parameters = configuration.tcp.makeParameters(localEndpoint: endpoint)
+        let parameters = configuration.tcp.makeParameters(localEndpoint: endpoint, tls: try tls?.makeOptions())
         do {
             listener = try NWListener(using: parameters)
         } catch let error as NWError {
             throw TransportError(error)
         }
-        queue = DispatchQueue(label: "sws.tcp.listener")
-        let core = Core(limit: configuration.pendingConnectionLimit)
+        queue = DispatchQueue(label: tls == nil ? "sws.tcp.listener" : "sws.tls.listener")
+        let core = Core(limit: configuration.pendingConnectionLimit, handshakeTimeout: tls?.handshakeTimeout, queue: queue)
         self.core = core
 
         listener.stateUpdateHandler = { [core, weak listener] state in
@@ -120,6 +134,10 @@ public final class TCPListener: Sendable {
 
     /// Connections cancelled because the pending-accept queue was full.
     public var rejectedConnectionCount: Int { core.state.withLock { $0.rejected } }
+
+    /// Accepted connections whose TCP or TLS handshake failed, or that were reset by the
+    /// handshake timeout (TLS only). They never reach ``connections``.
+    public var failedHandshakeCount: Int { core.state.withLock { $0.failedHandshakes } }
 
     /// Connections handed over by Network.framework and not yet taken by ``connections``.
     public var pendingConnectionCount: Int {
@@ -197,6 +215,7 @@ extension TCPListener {
             var readyHead = 0
             var consumer: UnsafeContinuation<TCPTransport?, any Error>?
             var rejected = 0
+            var failedHandshakes = 0
             var closeCalled = false
             var didCancel = false
             var cancelWaiters: [UnsafeContinuation<Void, Never>] = []
@@ -220,9 +239,17 @@ extension TCPListener {
 
         let state: Mutex<State>
         let limit: Int
+        /// TLS only: how long a connection may stay in the handshake.
+        let handshakeTimeout: Duration?
+        /// The listener's queue, for the handshake timers.
+        let queue: DispatchQueue
 
-        init(limit: Int) {
+        static let log = Logger(subsystem: "SwiftWebServer", category: "TLS")
+
+        init(limit: Int, handshakeTimeout: Duration?, queue: DispatchQueue) {
             self.limit = limit
+            self.handshakeTimeout = handshakeTimeout
+            self.queue = queue
             state = Mutex(State())
         }
 
@@ -243,22 +270,48 @@ extension TCPListener {
                 return
             }
             let box = SettleBox()
-            let transport = TCPTransport(connection: connection, failsWhileWaiting: false) { [self] ready in
-                self.settled(box.id, ready: ready)
+            let transport = TCPTransport(connection: connection, failsWhileWaiting: false) { [self] failure in
+                self.settled(box.id, failure: failure)
             }
             let id = ObjectIdentifier(transport)
             box.set(id)
             transport.core.state.withLock { $0.handedOverAt = handedOverAt }
             state.withLock { $0.preparing[id] = transport }
             transport.startConnection()
+            if let handshakeTimeout {
+                let (seconds, attoseconds) = handshakeTimeout.components
+                let nanoseconds = Int(clamping: seconds) &* 1_000_000_000 &+ Int(attoseconds / 1_000_000_000)
+                queue.asyncAfter(deadline: .now() + .nanoseconds(nanoseconds)) { [weak self] in
+                    self?.handshakeTimedOut(id)
+                }
+            }
+        }
+
+        /// The handshake timer fired: reset the connection if it is still in the handshake.
+        /// Its `.cancelled` state then settles it as failed.
+        private func handshakeTimedOut(_ id: ObjectIdentifier) {
+            guard let transport = state.withLock({ $0.preparing[id] }) else { return }
+            let remote = transport.connection.endpoint
+            Self.log.info("TLS handshake with \(String(describing: remote), privacy: .public) timed out; closing")
+            transport.core.state.withLock { $0.handshakeTimedOut = true }
+            transport.connection.forceCancel()
         }
 
         /// An accepted connection became ready (hand it over) or failed (drop it).
-        private func settled(_ id: ObjectIdentifier?, ready: Bool) {
+        private func settled(_ id: ObjectIdentifier?, failure: TransportError?) {
             guard let id else { return }
             let handoff = state.withLock { state -> (UnsafeContinuation<TCPTransport?, any Error>, TCPTransport)? in
                 guard let transport = state.preparing.removeValue(forKey: id) else { return nil }
-                guard ready, !state.closeCalled else { return nil }
+                if failure != nil, !state.closeCalled {
+                    let timedOut = transport.core.state.withLock { $0.handshakeTimedOut }
+                    state.failedHandshakes += 1
+                    if !timedOut, let failure {
+                        // Logged outside the hot path: a failed handshake is per connection.
+                        let remote = transport.connection.endpoint
+                        Self.log.info("handshake with \(String(describing: remote), privacy: .public) failed: \(String(describing: failure), privacy: .public); closing")
+                    }
+                }
+                guard failure == nil, !state.closeCalled else { return nil }
                 if let consumer = state.consumer {
                     state.consumer = nil
                     return (consumer, transport)

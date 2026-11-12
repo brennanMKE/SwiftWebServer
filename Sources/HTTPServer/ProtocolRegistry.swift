@@ -5,23 +5,50 @@ import Synchronization
 /// (docs/ROADMAP.md §5.1, §5.2).
 ///
 /// Selection, in order:
-/// 1. A TLS connection with a negotiated ALPN token uses the first protocol listing it.
-/// 2. With a single protocol, it serves every connection; nothing is read ahead.
-/// 3. Otherwise the first bytes are sniffed: each protocol's
+/// 1. A TLS connection with a negotiated ALPN token uses the first protocol listing it (#0088).
+/// 2. A TLS connection without one (the client offered no ALPN) or with a token no protocol
+///    lists uses the first protocol listing `http/1.1`, the TLS default (RFC 7301 §3.2 leaves
+///    the choice to the server).
+/// 3. With a single protocol, it serves every connection; nothing is read ahead.
+/// 4. Otherwise the first bytes are sniffed: each protocol's
 ///    ``ConnectionProtocol/matchesCleartextPreface(_:)`` is asked in registration order and the
 ///    first ``SniffResult/match`` wins. The sniffed bytes are replayed to the chosen protocol.
+///    A client that sends too little within ``sniffTimeout`` is closed.
 ///
 /// A connection no protocol accepts is closed with ``CloseReason/protocolError``.
+///
+/// ``alpnTokens`` is what a TLS listener should offer: `TLSConfiguration(alpn:)` in
+/// NetworkTransport. `h2` is offered only once an HTTP/2 protocol is registered (Track B).
 public struct ProtocolRegistry: Sendable {
     /// The registered protocols, in priority order.
     public let protocols: [any ConnectionProtocol]
     /// Most bytes read while sniffing before giving up.
     public let sniffLimit: Int
+    /// How long sniffing may wait for the first bytes before the connection is closed
+    /// (`nil` waits indefinitely). Defaults to the HTTP/1.1 header timeout (#0082), so a client
+    /// that connects and sends nothing is closed as promptly as one that stalls in a head.
+    public let sniffTimeout: Duration?
 
-    public init(_ protocols: [any ConnectionProtocol], sniffLimit: Int = 64) {
+    /// The ALPN token TLS connections fall back to when none was negotiated.
+    public static let defaultALPN = "http/1.1"
+
+    public init(_ protocols: [any ConnectionProtocol], sniffLimit: Int = 64, sniffTimeout: Duration? = .seconds(10)) {
         precondition(sniffLimit > 0, "sniffLimit must be positive")
         self.protocols = protocols
         self.sniffLimit = sniffLimit
+        self.sniffTimeout = sniffTimeout
+    }
+
+    /// The ALPN tokens of every registered protocol, in registration (preference) order,
+    /// without duplicates.
+    public var alpnTokens: [String] {
+        var tokens: [String] = []
+        for proto in protocols {
+            for token in type(of: proto).alpnTokens where !tokens.contains(token) {
+                tokens.append(token)
+            }
+        }
+        return tokens
     }
 
     /// The outcome of ``select(alpn:preface:)``.
@@ -35,13 +62,16 @@ public struct ProtocolRegistry: Sendable {
     }
 
     /// Chooses a protocol from the negotiated ALPN token or the bytes read so far. Pure.
-    public func select(alpn: String?, preface: borrowing ByteBuffer) -> Selection {
+    ///
+    /// `secure` marks a TLS connection: an absent or unknown token then falls back to the
+    /// `http/1.1` protocol instead of sniffing. Without `secure`, an unknown token is
+    /// ``Selection/unsupported``.
+    public func select(alpn: String?, secure: Bool = false, preface: borrowing ByteBuffer) -> Selection {
         if let alpn {
-            for (index, proto) in protocols.enumerated() where type(of: proto).alpnTokens.contains(alpn) {
-                return .selected(index: index)
-            }
-            return .unsupported
+            if let index = index(forALPN: alpn) { return .selected(index: index) }
+            if !secure { return .unsupported }
         }
+        if secure, let index = index(forALPN: Self.defaultALPN) { return .selected(index: index) }
         if protocols.count == 1 { return .selected(index: 0) }
         var undecided = false
         for (index, proto) in protocols.enumerated() {
@@ -54,13 +84,17 @@ public struct ProtocolRegistry: Sendable {
         return undecided ? .needMoreBytes : .unsupported
     }
 
+    private func index(forALPN token: String) -> Int? {
+        protocols.firstIndex { type(of: $0).alpnTokens.contains(token) }
+    }
+
     /// Picks the protocol for `transport` and runs it until the connection ends.
     public func serve<T: ByteStreamTransport, H: HTTPHandler>(
         _ transport: T, handler: H, context: ConnectionContext
     ) async {
-        let alpn = transport.info.negotiatedALPN
+        let info = transport.info
         let empty = ByteBuffer()
-        switch select(alpn: alpn, preface: empty) {
+        switch select(alpn: info.negotiatedALPN, secure: info.isSecure, preface: empty) {
         case .selected(let index):
             await Self.run(protocols[index], transport, handler: handler, context: context)
             return
@@ -71,29 +105,74 @@ public struct ProtocolRegistry: Sendable {
             break
         }
 
+        let outcome: SniffOutcome
+        if let sniffTimeout {
+            outcome = await sniff(transport, timeout: sniffTimeout)
+        } else {
+            outcome = await sniff(transport)
+        }
+        switch outcome {
+        case .selected(let index, let preface):
+            let replaying = PrefixedTransport(base: transport, prefix: preface)
+            await Self.run(protocols[index], replaying, handler: handler, context: context)
+        case .unsupported:
+            await transport.close(.protocolError)
+        case .failed:
+            await transport.close(.abort)
+        case .timedOut:
+            await transport.close(.timeout)
+        }
+    }
+
+    /// How sniffing ended.
+    enum SniffOutcome: Sendable {
+        case selected(index: Int, preface: ByteBuffer)
+        case unsupported
+        case failed
+        case timedOut
+    }
+
+    /// Sniffs, giving up after `timeout` (#0088; the gap the #0082 report flagged). The timer
+    /// is a sibling task that exists only while sniffing, which happens only for cleartext
+    /// connections with more than one protocol registered.
+    func sniff<T: ByteStreamTransport>(_ transport: T, timeout: Duration) async -> SniffOutcome {
+        await withTaskGroup(of: SniffOutcome.self) { group in
+            group.addTask { await self.sniff(transport) }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: timeout)
+                    return .timedOut
+                } catch {
+                    return .failed   // cancelled: the sniff finished first
+                }
+            }
+            let first = await group.next() ?? .failed
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// Reads until a protocol matches, none can, `sniffLimit` bytes arrive, or the peer ends.
+    func sniff<T: ByteStreamTransport>(_ transport: T) async -> SniffOutcome {
         var preface = ByteBuffer(capacity: sniffLimit)
         while preface.readableBytes < sniffLimit {
             let received: Int
             do {
                 received = try await transport.receive(into: &preface, maxLength: sniffLimit - preface.readableBytes)
             } catch {
-                await transport.close(.abort)
-                return
+                return .failed
             }
             if received == 0 { break }
             switch select(alpn: nil, preface: preface) {
             case .selected(let index):
-                let replaying = PrefixedTransport(base: transport, prefix: preface)
-                await Self.run(protocols[index], replaying, handler: handler, context: context)
-                return
+                return .selected(index: index, preface: preface)
             case .unsupported:
-                await transport.close(.protocolError)
-                return
+                return .unsupported
             case .needMoreBytes:
                 continue
             }
         }
-        await transport.close(.protocolError)
+        return .unsupported
     }
 
     private static func run<P: ConnectionProtocol, T: ByteStreamTransport, H: HTTPHandler>(

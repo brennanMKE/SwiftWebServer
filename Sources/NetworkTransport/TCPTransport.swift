@@ -42,8 +42,9 @@ public final class TCPTransport: ByteStreamTransport {
 
     /// Wraps `connection` and installs its handlers. The connection is not started yet; call
     /// ``startConnection()``. `onSettled` is called once, on the connection's queue, when the
-    /// connection becomes ready (`true`) or fails before that (`false`).
-    init(connection: NWConnection, failsWhileWaiting: Bool, onSettled: (@Sendable (Bool) -> Void)? = nil) {
+    /// connection becomes ready (`nil`) or fails before that (the failure; ``TransportError/closed``
+    /// when it was cancelled).
+    init(connection: NWConnection, failsWhileWaiting: Bool, onSettled: (@Sendable (TransportError?) -> Void)? = nil) {
         self.connection = connection
         self.queue = DispatchQueue(label: "sws.tcp.connection")
         self.executor = QueueTaskExecutor(queue: queue)
@@ -70,7 +71,8 @@ public final class TCPTransport: ByteStreamTransport {
 
     // MARK: Client
 
-    /// Opens a TCP connection to `host:port` and returns once it is ready.
+    /// Opens a TCP connection to `host:port` and returns once it is ready; with `tls`, once the
+    /// TLS handshake is done (``info`` then carries the negotiated ALPN and version).
     ///
     /// Network.framework parks a connection that cannot be established (refused, unreachable)
     /// in `.waiting` and retries when the path changes; this method treats `.waiting` as a
@@ -78,13 +80,14 @@ public final class TCPTransport: ByteStreamTransport {
     public static func connect(
         host: String,
         port: UInt16,
-        configuration: TCPConfiguration = TCPConfiguration()
+        configuration: TCPConfiguration = TCPConfiguration(),
+        tls: TLSClientConfiguration? = nil
     ) async throws -> TCPTransport {
         guard let nwPort = NWEndpoint.Port(rawValue: port), port != 0 else {
             throw TransportError.failed(code: EINVAL)
         }
         let connection = NWConnection(
-            host: NWEndpoint.Host(host), port: nwPort, using: configuration.makeParameters())
+            host: NWEndpoint.Host(host), port: nwPort, using: configuration.makeParameters(tls: tls?.makeOptions()))
         let transport = TCPTransport(connection: connection, failsWhileWaiting: true)
         transport.startConnection()
         try await transport.waitUntilReady()
@@ -262,17 +265,19 @@ extension TCPTransport {
             /// NW reported `.cancelled`.
             var didCancel = false
             var cancelWaiters: [UnsafeContinuation<Void, Never>] = []
-            var onSettled: (@Sendable (Bool) -> Void)?
+            var onSettled: (@Sendable (TransportError?) -> Void)?
             /// `CLOCK_UPTIME_RAW` nanoseconds when the listener handed the connection over, and
             /// when it became ready (#0113, `sws-bench accept`). Zero when not recorded.
             var handedOverAt: UInt64 = 0
             var readyAt: UInt64 = 0
+            /// The listener's handshake timer reset this connection (#0087).
+            var handshakeTimedOut = false
         }
 
         let state: Mutex<State>
         let failsWhileWaiting: Bool
 
-        init(failsWhileWaiting: Bool, onSettled: (@Sendable (Bool) -> Void)?) {
+        init(failsWhileWaiting: Bool, onSettled: (@Sendable (TransportError?) -> Void)?) {
             self.failsWhileWaiting = failsWhileWaiting
             var initial = State()
             initial.onSettled = onSettled
@@ -430,11 +435,18 @@ extension TCPTransport {
         func handle(_ newState: NWConnection.State, connection: NWConnection?) {
             switch newState {
             case .ready:
-                let info = ConnectionInfo(
+                var info = ConnectionInfo(
                     localAddress: TransportAddress(connection?.currentPath?.localEndpoint),
                     remoteAddress: TransportAddress(connection?.currentPath?.remoteEndpoint ?? connection?.endpoint))
+                if let tls = connection?.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata {
+                    // #0087/#0088: the handshake is done, so ALPN and the version are final.
+                    let metadata = tls.securityProtocolMetadata
+                    info.isSecure = true
+                    info.negotiatedALPN = sec_protocol_metadata_get_negotiated_protocol(metadata).map { String(cString: $0) }
+                    info.tlsVersion = TLSVersion(rawValue: sec_protocol_metadata_get_negotiated_tls_protocol_version(metadata).rawValue)
+                }
                 let (waiter, settled) = state.withLock { state in
-                    guard case .setup = state.phase else { return (nil, nil) as (UnsafeContinuation<Void, any Error>?, (@Sendable (Bool) -> Void)?) }
+                    guard case .setup = state.phase else { return (nil, nil) as (UnsafeContinuation<Void, any Error>?, (@Sendable (TransportError?) -> Void)?) }
                     state.phase = .ready
                     state.info = info
                     state.readyAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -442,7 +454,7 @@ extension TCPTransport {
                     return (state.readyWaiter, state.onSettled)
                 }
                 waiter?.resume()
-                settled?(true)
+                settled?(nil)
             case .waiting(let error):
                 guard failsWhileWaiting else { return }
                 fail(TransportError(error))
@@ -473,7 +485,7 @@ extension TCPTransport {
             taken.1?.resume(throwing: taken.0)
             taken.2?.resume(returning: .failure(taken.0))
             taken.3?.resume(throwing: taken.0)
-            taken.4?(false)
+            taken.4?(taken.0)
         }
 
         private func finishCancelled() {
@@ -492,7 +504,7 @@ extension TCPTransport {
             taken.0?.resume(throwing: TransportError.closed)
             taken.1?.resume(returning: .failure(.closed))
             taken.2?.resume(throwing: TransportError.closed)
-            taken.3?(false)
+            taken.3?(.closed)
             for waiter in taken.4 { waiter.resume() }
         }
     }
