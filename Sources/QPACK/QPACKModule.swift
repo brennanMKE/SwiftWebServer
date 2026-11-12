@@ -3,8 +3,9 @@ import HTTPCore
 
 /// QPACK header compression for HTTP/3 (RFC 9204).
 ///
-/// Static-table-only encoder and decoder (`QPACKEncoder`, `QPACKDecoder`) plus encoder and
-/// decoder stream instruction parsing; the dynamic table capacity is always 0.
+/// Static-table-only encoder and decoder (`QPACKEncoder`, `QPACKDecoder`), encoder and
+/// decoder stream instruction parsing, and the decoder side of the dynamic table
+/// (`QPACKDynamicTable`, `QPACKDynamicDecoder`, #0106). The encoder never inserts.
 public enum QPACKModule {
     /// The module name.
     public static let name = "QPACK"

@@ -115,8 +115,53 @@ enum QPACKBench {
             iterations: iterations, elapsed: elapsed, checksum: sink.checksum)
     }
 
-    /// Runs both measurements.
+    /// ns to decode ``typicalRequest`` when every field is a dynamic table entry (#0106): one
+    /// Indexed Field Line per field, plus taking the Section Acknowledgment it queues.
+    static func decodeDynamic(iterations: Int = 500_000) -> Result {
+        var decoder = QPACKDynamicDecoder(maxTableCapacity: 4096, maxBlockedStreams: 16)
+        var instructions: [UInt8] = [0x3F, 0xE1, 0x1F]   // Set Dynamic Table Capacity 4096
+        for field in typicalRequest {
+            field.name.withUnsafeBytes {
+                StringLiteral.encode($0, prefixBits: 5, flags: 0x40, huffman: .never, into: &instructions)
+            }
+            field.value.withUnsafeBytes { StringLiteral.encode($0, prefixBits: 7, huffman: .never, into: &instructions) }
+        }
+        instructions.withUnsafeBytes { bytes in
+            do throws(QPACKError) {
+                _ = try decoder.consumeEncoderStream(bytes)
+            } catch {
+                fatalError("benchmark encoder stream failed: \(error)")
+            }
+        }
+        // Required Insert Count 10 (encoded 10 % 256 + 1), Base 10; entry k is relative 9 - k.
+        var encoded: [UInt8] = [0x0B, 0x00]
+        for k in 0..<typicalRequest.count { encoded.append(0x80 | UInt8(typicalRequest.count - 1 - k)) }
+        var acknowledgments: [UInt8] = []
+        acknowledgments.reserveCapacity(16)
+        decoder.takeDecoderStreamOutput(into: &acknowledgments)
+        var sink = CountingSink()
+        let clock = ContinuousClock()
+        let start = clock.now
+        encoded.withUnsafeBytes { input in
+            for _ in 0..<iterations {
+                do throws(QPACKError) {
+                    try decoder.decode(input, requiredInsertCount: 10, streamID: 0, into: &sink)
+                } catch {
+                    fatalError("benchmark input failed to decode: \(error)")
+                }
+                acknowledgments.removeAll(keepingCapacity: true)
+                decoder.takeDecoderStreamOutput(into: &acknowledgments)
+            }
+        }
+        let elapsed = clock.now - start
+        precondition(sink.fields == typicalRequest.count * iterations, "QPACK field count mismatch")
+        return Result(
+            name: "qpack.decode.dynamic", fields: typicalRequest.count, encodedBytes: encoded.count,
+            iterations: iterations, elapsed: elapsed, checksum: sink.checksum)
+    }
+
+    /// Runs every measurement.
     static func run(iterations: Int = 500_000) -> [Result] {
-        [decode(iterations: iterations), encode(iterations: iterations)]
+        [decode(iterations: iterations), encode(iterations: iterations), decodeDynamic(iterations: iterations)]
     }
 }

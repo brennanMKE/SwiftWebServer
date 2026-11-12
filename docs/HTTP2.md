@@ -203,6 +203,8 @@ Counts are per connection, in a fixed window (`window`, 10 s) that starts at the
 | `timeouts.goawayGrace` | off | When set, a first GOAWAY with 2^62-4, the final one after this |
 | `timeouts.closeLinger` | 1 s | After the drain, before CONNECTION_CLOSE (ends early when the peer closes) |
 | `timeouts.send` | 30 s | One response send waits (send budget or a client that does not read): RESET_STREAM `H3_REQUEST_CANCELLED` |
+| `qpackMaxTableCapacity` (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`) | 0 | QPACK dynamic table for the peer's encoder (#0106); 0 keeps decoding static-only with no shared state. Encoder-stream errors are `QPACK_ENCODER_STREAM_ERROR`, bad references `QPACK_DECOMPRESSION_FAILED`; a decoder stream backlog over 64 KiB (peer not reading it) is `H3_EXCESSIVE_LOAD` |
+| `qpackBlockedStreams` (`SETTINGS_QPACK_BLOCKED_STREAMS`) | 0 | Request streams waiting for inserts at once (only with a table); one more is `QPACK_DECOMPRESSION_FAILED`. A blocked stream counts against `timeouts.header` and sends Stream Cancellation when it gives up |
 
 ### HTTP/3 abuse limits (#0104)
 
@@ -215,7 +217,7 @@ Over Network.framework the CONNECTION_CLOSE code does not reach the peer
 |---|---|---|---|
 | `maxAbortedRequestsPerWindow` | 100 | Rapid reset: request streams reset or STOP_SENDING'd by the peer before the response completed, or ended without a request | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
 | `maxIgnoredUniStreamsPerWindow` | 16 | Reserved/unknown unidirectional streams (each refused with STOP_SENDING `H3_STREAM_CREATION_ERROR`) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
-| `maxQPACKInstructionsPerWindow` | 1,000 | QPACK encoder/decoder stream instruction floods (with table capacity 0, Set Dynamic Table Capacity 0 is a free no-op) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
+| `maxQPACKInstructionsPerWindow` | 1,000 | QPACK encoder/decoder stream instruction floods (with table capacity 0, Set Dynamic Table Capacity 0 is a free no-op; with a table, every insert counts) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
 | `maxControlFramesPerWindow` | 1,000 | Control-stream frame floods (any type, unknown included) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
 | `maxUnknownRequestFramesPerWindow` | 1,000 | Reserved/unknown frames on request streams | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
 | `maxUnknownFrameLength` | 16 KiB | One reserved/unknown frame's declared length, any stream (skipped, never buffered) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |

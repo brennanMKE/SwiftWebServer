@@ -36,13 +36,13 @@ public enum H3HeadError: Error, Sendable, Equatable {
 /// them; that is left to a later change).
 public enum H3RequestHeadDecoder {
     /// Decodes `section` into `storage` and returns the request.
-    public static func decode(
-        _ section: UnsafeRawBufferPointer, decoder: inout QPACKDecoder, storage: HTTPRequestStorage,
+    public static func decode<Decoder: QPACKSectionDecoder>(
+        _ section: UnsafeRawBufferPointer, decoder: inout Decoder, storage: HTTPRequestStorage,
         allowsExtendedConnect: Bool = false
     ) throws(H3HeadError) -> HTTPRequest {
         var sink = RequestFieldSink(storage: storage)
         do throws(QPACKError) {
-            try decoder.decode(section, into: &sink)
+            _ = try decoder.decode(section, into: &sink)
         } catch {
             if let violation = sink.violation { throw .malformed(violation) }
             if error.reason == .fieldSectionTooLarge {
@@ -76,12 +76,12 @@ public enum H3RequestHeadDecoder {
 
     /// Decodes a trailing HEADERS frame: only regular, well-formed fields are allowed
     /// (RFC 9114 §4.1.2). Returns them for ``HTTPRequestBody/trailers``.
-    public static func decodeTrailers(
-        _ section: UnsafeRawBufferPointer, decoder: inout QPACKDecoder
+    public static func decodeTrailers<Decoder: QPACKSectionDecoder>(
+        _ section: UnsafeRawBufferPointer, decoder: inout Decoder
     ) throws(H3HeadError) -> HTTPFields {
         var sink = TrailerFieldSink()
         do throws(QPACKError) {
-            try decoder.decode(section, into: &sink)
+            _ = try decoder.decode(section, into: &sink)
         } catch {
             if let violation = sink.violation { throw .malformed(violation) }
             if error.reason == .fieldSectionTooLarge { throw .fieldSectionTooLarge }

@@ -8,7 +8,7 @@ import Synchronization
 /// |---|---|---|
 /// | ``maxAbortedRequestsPerWindow`` | request streams the peer resets (or STOP_SENDINGs) before the response is complete, or ends without a complete request (a rapid-reset analogue) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
 /// | ``maxIgnoredUniStreamsPerWindow`` | reserved and unknown unidirectional streams (each is refused with STOP_SENDING, but costs a stream) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
-/// | ``maxQPACKInstructionsPerWindow`` | instructions on the peer's QPACK encoder and decoder streams (with a table capacity of 0 the only legal encoder instruction is a no-op) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
+/// | ``maxQPACKInstructionsPerWindow`` | instructions on the peer's QPACK encoder and decoder streams (with a table capacity of 0 the only legal encoder instruction is a no-op; with a dynamic table each insert counts) | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
 /// | ``maxControlFramesPerWindow`` | frames on the peer's control stream after SETTINGS, unknown and reserved ones included | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
 /// | ``maxUnknownRequestFramesPerWindow`` | reserved and unknown frames on request streams | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
 /// | ``maxUnknownFrameLength`` | the declared length of one reserved or unknown frame, on any stream | CONNECTION_CLOSE `H3_EXCESSIVE_LOAD` |
@@ -287,6 +287,8 @@ public final class H3ConnectionTracker: Sendable {
     private let requestStreams = Atomic<Int>(0)
     private let handlers = Atomic<Int>(0)
     private let bodyChannels = Atomic<Int>(0)
+    private let dynamicInserts = Atomic<Int>(0)
+    private let dynamicSections = Atomic<Int>(0)
 
     public init() {}
 
@@ -298,6 +300,12 @@ public final class H3ConnectionTracker: Sendable {
     public var liveHandlers: Int { handlers.load(ordering: .relaxed) }
     /// Request body channels alive (each holds the body queue and its waiters).
     public var liveBodyChannels: Int { bodyChannels.load(ordering: .relaxed) }
+    /// QPACK dynamic table entries the peers' encoder streams inserted, over all connections
+    /// (#0106).
+    public var qpackDynamicInserts: Int { dynamicInserts.load(ordering: .relaxed) }
+    /// Request field sections with a non-zero Required Insert Count (that is, referencing the
+    /// QPACK dynamic table), over all connections (#0106).
+    public var qpackDynamicSections: Int { dynamicSections.load(ordering: .relaxed) }
     /// Connections with no open request stream.
     public var idleConnections: Int { state.withLock { $0.idle.count } }
     /// Connections shut down because there were more than ``H3AbuseLimits/maxIdleConnections``.
@@ -343,6 +351,8 @@ public final class H3ConnectionTracker: Sendable {
     }
 
     func requestStreamStarted() { requestStreams.add(1, ordering: .relaxed) }
+    func qpackInserted(_ count: Int) { dynamicInserts.add(count, ordering: .relaxed) }
+    func qpackDynamicSectionDecoded() { dynamicSections.add(1, ordering: .relaxed) }
     func requestStreamEnded() { requestStreams.subtract(1, ordering: .relaxed) }
     func handlerStarted() { handlers.add(1, ordering: .relaxed) }
     func handlerEnded() { handlers.subtract(1, ordering: .relaxed) }
