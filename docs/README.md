@@ -2,7 +2,8 @@
 
 | Document | Purpose |
 |---|---|
-| [../README.md](../README.md) | What the server does, how to run it, configuration reference |
+| [../README.md](../README.md) | Front page: what the server does, quick start |
+| [guide/](guide/README.md) | Developer guides: architecture, choosing components, running on a Mac (full config reference), static and dynamic sites, performance |
 | [SERVER-COMPARISON.md](SERVER-COMPARISON.md) | New server vs nginx, Apache, Caddy, lighttpd, h2o (and the legacy server, until #0086) |
 | [PROGRESS.md](PROGRESS.md) | Milestone status |
 | [ROADMAP.md](ROADMAP.md) | Current architecture and milestone plan (authoritative) |
@@ -34,5 +35,6 @@ Examples:
 
 | Path | Purpose |
 |---|---|
-| `Examples/go-api` | Stdlib-only Go REST API (`/api/health`, `/api/items`, `/api/echo`) used as the upstream for the reverse proxy (M17). `go run ./Examples/go-api` |
-| `Root/http-config.proxy.json` | Static site at `/` plus `/api` proxied to the Go app; takes effect once M17 lands |
+| `Examples/go-api` | Stdlib-only Go REST API (`/api/health`, `/api/items`, `/api/echo`) used as the upstream for the reverse proxy (M17). `cd Examples/go-api && go run .` |
+| `Examples/custom-server` | A separate Swift package composing StaticFiles, Router, WebSockets, Compression and AccessLog from the library products |
+| `Root/http-config.proxy.json` | Static site at `/` plus `/api` proxied to the Go app (with TLS and HTTP/3) |
