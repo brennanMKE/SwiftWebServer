@@ -169,6 +169,8 @@ final class AccessLogCore: Sendable {
     let live = Mutex<[ObjectIdentifier: AccessLogConnection]>([:])
 
     let counters = LogCounters()
+    /// Bumped by ``AccessLog/reopen()``; the writer reopens its file when it changed.
+    let reopenRequests = Atomic<UInt64>(0)
     /// Written batches' buffers, reused by connections for their next batch so a batch costs
     /// no `malloc`/`free` pair (the free would be on the writer's thread).
     let spareBuffers = Mutex<[ByteBuffer]>([])

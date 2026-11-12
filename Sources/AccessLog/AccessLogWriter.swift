@@ -71,8 +71,23 @@ extension AccessLogCore {
         guard let destination else {
             return   // metrics only: nothing to write
         }
-        let sink = try AccessLogSink.open(destination)
+        var sink = try AccessLogSink.open(destination)
         defer { sink.close() }
+        var reopens = reopenRequests.load(ordering: .acquiring)
+        /// A ``AccessLog/reopen()`` since the last check: the file again by its path (log
+        /// rotation, #0127). On failure the old descriptor stays and the failure is counted.
+        func reopenIfRequested() {
+            let requested = reopenRequests.load(ordering: .acquiring)
+            guard requested != reopens else { return }
+            reopens = requested
+            guard case .file = destination else { return }
+            if let fresh = try? AccessLogSink.open(destination) {
+                sink.close()
+                sink = fresh
+            } else {
+                counters.writeErrors.wrappingAdd(1, ordering: .relaxed)
+            }
+        }
         let interval = options.flushInterval
         await withDiscardingTaskGroup { group in
             group.addTask {
@@ -82,6 +97,7 @@ extension AccessLogCore {
             }
             // `next()` returns nil once this task is cancelled and the queue is empty.
             while let batch = await queue.next() {
+                reopenIfRequested()
                 write(batch, to: sink)
                 while let more = queue.tryNext() { write(more, to: sink) }
                 // Let batches gather before waiting again: a busy server then wakes the writer
@@ -95,6 +111,7 @@ extension AccessLogCore {
         // hold, written directly so a full queue drops nothing here.
         // Lines handed over after this are dropped and counted.
         queue.finish()
+        reopenIfRequested()
         while let batch = await queue.next() { write(batch, to: sink) }
         for batch in takeAll() {
             counters.linesLogged.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
@@ -105,9 +122,17 @@ extension AccessLogCore {
     /// How long the writer lets batches gather after each burst.
     static let writerCoalescing: Duration = .milliseconds(1)
 
+    /// Asks the writer to reopen a file destination by its path before its next write, and
+    /// wakes it with an empty batch so the new file appears without waiting for a request.
+    func requestReopen() {
+        reopenRequests.wrappingAdd(1, ordering: .releasing)
+        _ = queue.trySend(LogBatch(bytes: ByteBuffer(), lines: 0))
+    }
+
     /// Writes one batch, counts it and keeps its buffer for reuse.
     func write(_ batch: LogBatch, to sink: AccessLogSink) {
         defer { recycle(batch.bytes) }
+        guard batch.bytes.readableBytes > 0 else { return }
         if sink.write(batch.bytes) {
             counters.linesWritten.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
             counters.bytesWritten.wrappingAdd(UInt64(batch.bytes.readableBytes), ordering: .relaxed)

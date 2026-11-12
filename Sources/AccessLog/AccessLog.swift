@@ -69,6 +69,15 @@ public struct AccessLog: HTTPMiddleware, RequestStartTimeConsumer, ConnectionObs
         core.collect()
     }
 
+    /// Reopens a ``AccessLogDestination/file(path:)`` destination by its path before the next
+    /// write (#0127): after a log rotator renamed the file, the next lines go to a new file at
+    /// the path. Lines written before stay in the renamed file. Never waits; other
+    /// destinations ignore it. A path that can no longer be opened keeps the old file and
+    /// counts a write error.
+    public func reopen() {
+        core.requestReopen()
+    }
+
     // MARK: HTTPMiddleware
 
     @inlinable
