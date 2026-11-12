@@ -57,7 +57,7 @@ private func makeRequest(_ storage: HTTPRequestStorage) -> HTTPRequest {
         #expect(response.body.knownLength == 5)
         response.body = .stream(length: nil) { writer in try await writer.write(ByteBuffer("x")) }
         #expect(response.body.knownLength == nil)
-        response.body = .tunnel { transport in await transport.close(.normal) }
+        response.body = .tunnel { transport, _ in await transport.close(.normal) }
         #expect(response.body.knownLength == nil)
     }
 

@@ -117,8 +117,9 @@ public struct WebSocketUpgrade: HTTPMiddleware {
         if let chosen { headers.append(.secWebSocketProtocol, string: chosen) }
         let configuration = configuration
         let handler = handler
-        return HTTPResponse(status: .switchingProtocols, headers: headers, body: .tunnel { transport in
-            await Self.serve(transport, subprotocol: chosen, configuration: configuration) { socket in
+        return HTTPResponse(status: .switchingProtocols, headers: headers, body: .tunnel { transport, tunnel in
+            await Self.serve(transport, subprotocol: chosen, configuration: configuration,
+                             shutdown: tunnel.shutdown) { socket in
                 try await handler(socket, info)
             }
         })
@@ -126,9 +127,10 @@ public struct WebSocketUpgrade: HTTPMiddleware {
 
     /// Opens the existential so the session is specialized on the transport type.
     static func serve<T: ByteStreamTransport>(
-        _ transport: T, subprotocol: String?, configuration: WebSocketConfiguration,
+        _ transport: T, subprotocol: String?, configuration: WebSocketConfiguration, shutdown: ShutdownSignal,
         handler: @escaping @Sendable (WebSocket) async throws -> Void
     ) async {
-        await WebSocket.run(over: transport, subprotocol: subprotocol, configuration: configuration, handler: handler)
+        await WebSocket.run(over: transport, subprotocol: subprotocol, configuration: configuration,
+                            shutdown: shutdown, handler: handler)
     }
 }

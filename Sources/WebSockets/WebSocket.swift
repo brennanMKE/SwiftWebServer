@@ -209,18 +209,22 @@ public final class WebSocket: Sendable {
 
     // MARK: Session
 
-    enum Role { case reader, writer, handler, timer }
+    enum Role { case reader, writer, handler, timer, shutdownWatcher }
 
     /// Runs a WebSocket session over `transport` (after the handshake) until the connection
     /// closes and `handler` returns, then closes the transport.
     ///
     /// When `handler` returns while the connection is open, the session closes it with 1000;
-    /// when it throws, with 1011. The session reads, writes and times the close handshake in
-    /// child tasks of one task group; nothing outlives this call.
+    /// when it throws, with 1011. When `shutdown` triggers (the server is draining, from the
+    /// tunnel's ``TunnelContext``), the session starts the close handshake with 1001 Going
+    /// Away; the handler sees ``messages`` end once the peer answers (#0116). The session
+    /// reads, writes and times the close handshake in child tasks of one task group; nothing
+    /// outlives this call.
     public static func run<T: ByteStreamTransport>(
         over transport: T,
         subprotocol: String? = nil,
         configuration: WebSocketConfiguration = WebSocketConfiguration(),
+        shutdown: ShutdownSignal? = nil,
         handler: @escaping @Sendable (WebSocket) async throws -> Void
     ) async {
         let socket = WebSocket(subprotocol: subprotocol, connectionInfo: transport.info, configuration: configuration)
@@ -228,6 +232,15 @@ public final class WebSocket: Sendable {
             group.addTask { await socket.readLoop(transport); return .reader }
             group.addTask { await socket.writeLoop(transport); return .writer }
             group.addTask { await socket.closeTimer(transport); return .timer }
+            if let shutdown {
+                group.addTask {
+                    await shutdown.wait()
+                    if shutdown.isTriggered && !Task.isCancelled {
+                        try? await socket.close(code: .goingAway)
+                    }
+                    return .shutdownWatcher
+                }
+            }
             group.addTask {
                 do {
                     try await handler(socket)
@@ -240,7 +253,7 @@ public final class WebSocket: Sendable {
             }
             var running = 3
             while let role = await group.next() {
-                if role != .timer {
+                if role != .timer && role != .shutdownWatcher {
                     running -= 1
                     if running == 0 { group.cancelAll() }
                 }

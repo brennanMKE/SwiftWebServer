@@ -116,8 +116,9 @@ public enum HTTPResponseBody: Sendable {
     case file(FileRegion)
     /// The single protocol-switch hook: after the head is sent (`101` for HTTP/1.1, `200` for
     /// extended CONNECT on HTTP/2 and HTTP/3), the connection hands its byte stream to the
-    /// closure and does no more HTTP on it.
-    case tunnel(@Sendable (any ByteStreamTransport) async -> Void)
+    /// closure and does no more HTTP on it. The ``TunnelContext`` carries the server's drain
+    /// signal, so a long-lived tunnel (a WebSocket) can end itself gracefully (#0116).
+    case tunnel(@Sendable (any ByteStreamTransport, TunnelContext) async -> Void)
 
     /// The content length when it is known without running a writer.
     @inlinable
@@ -129,6 +130,19 @@ public enum HTTPResponseBody: Sendable {
         case .file(let region): Int(region.length)
         case .tunnel: nil
         }
+    }
+}
+
+/// What a ``HTTPResponseBody/tunnel(_:)`` closure learns from the connection besides its
+/// byte stream (#0116).
+public struct TunnelContext: Sendable {
+    /// Triggers when the server starts draining. The connection keeps running the tunnel, so
+    /// a long-lived protocol should finish its conversation (a WebSocket sends Close 1001) and
+    /// return; tunnels still running at the server's drain deadline are cancelled.
+    public var shutdown: ShutdownSignal
+
+    public init(shutdown: ShutdownSignal = ShutdownSignal()) {
+        self.shutdown = shutdown
     }
 }
 

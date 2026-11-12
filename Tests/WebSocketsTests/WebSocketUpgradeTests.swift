@@ -34,13 +34,14 @@ func withServer(
     request: String,
     trailing: [UInt8] = [],
     serverConfiguration: InMemoryTransport.Configuration = .init(),
+    shutdown: ShutdownSignal = ShutdownSignal(),
     _ body: @Sendable (InMemoryTransport, ResponseHead, ByteBuffer) async throws -> Void
 ) async throws {
     let (client, server) = InMemoryTransport.makePair(server: serverConfiguration)
     try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask {
             await HTTP1().run(server, handler: MiddlewareChain(middleware: middleware, next: NotFoundHandler()),
-                              context: ConnectionContext(info: server.info))
+                              context: ConnectionContext(info: server.info, shutdown: shutdown))
         }
         var request = ByteBuffer(bytes: Array(request.utf8) + trailing)
         try await client.send(request, endOfStream: false)
