@@ -40,8 +40,8 @@ let libraries: [Library] = [
     Library("HPACK", dependencies: ["HeaderCompression", "HTTPCore"]),
     Library("QPACK", dependencies: ["HeaderCompression", "HTTPCore"]),
     // Optional protocols
-    Library("HTTP2", dependencies: ["HPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "HTTPServer", "HTTP1", "NetworkTransport", "WebSockets"]),
-    Library("HTTP3", dependencies: ["QPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "NetworkTransport", "WebSockets"]),
+    Library("HTTP2", dependencies: ["HPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "HTTPServer", "HTTP1", "NetworkTransport", "WebSockets", "Proxy"]),
+    Library("HTTP3", dependencies: ["QPACK", "HTTPCore"], testDependencies: ["HTTPTestSupport", "NetworkTransport", "WebSockets", "Proxy", "HTTPServer", "HTTP1"]),
     Library("WebSockets", dependencies: ["HTTPCore", "Compression"], testDependencies: ["HTTPTestSupport", "HTTP1", "HTTPServer", "NetworkTransport"]),
     // Optional components
     Library("StaticFiles", dependencies: ["HTTPCore", "Compression"], testDependencies: ["HTTP1"]),
@@ -50,7 +50,7 @@ let libraries: [Library] = [
     Library("Auth", dependencies: ["HTTPCore"], testDependencies: ["Router"]),
     Library("AccessLog", dependencies: ["HTTPCore"], testDependencies: ["HTTP1", "HTTPServer", "HTTPTestSupport"]),
     Library("Router", dependencies: ["HTTPCore"]),
-    Library("Proxy", dependencies: ["HTTPCore", "HTTP1", "NetworkTransport"], testDependencies: ["HTTPTestSupport"]),
+    Library("Proxy", dependencies: ["HTTPCore", "HTTP1", "NetworkTransport"], testDependencies: ["HTTPTestSupport", "WebSockets", "HTTPServer"]),
     Library("ConfigFile", dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "StaticFiles", "Compression", "VirtualHosts", "Auth", "Proxy"]),
     // Test support
     Library("HTTPTestSupport", dependencies: ["HTTPCore", "HTTP1"]),
