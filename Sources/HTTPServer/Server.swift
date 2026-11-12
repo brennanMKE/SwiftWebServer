@@ -5,15 +5,30 @@ import Synchronization
 /// ``ServerLifecycle`` (#0079; replaces the legacy singleton, #0002).
 ///
 /// ```swift
-/// let server = Server(configuration: config, listeners: [try TCPListener()],
-///                     protocols: [HTTP1()], handler: app)
+/// let server = Server(configuration: config, listeners: [try TCPListener()], protocols: [HTTP1()]) {
+///     AccessLog()
+///     if config.compression { Compression() }
+///     StaticFiles(root: publicURL)
+/// }
 /// try await server.run()          // returns after a graceful shutdown
 /// ```
 ///
+/// The trailing closure is a ``MiddlewareBuilder``: `Handler` is the chain's nested generic
+/// type, so components left out by an `if` are not in it (#0083). `handler: app` is the same
+/// as a builder with one element.
+///
+/// ## Components
+///
+/// ``ServerComponent``s (background work: log flushing, cache eviction) come from the
+/// `components:` parameter and from the builder chain (a middleware that is also a component).
+/// They run as child tasks once the listeners are bound and are cancelled after the last
+/// connection closes. A component that throws shuts the server down, and `run()` rethrows the
+/// error after draining.
+///
 /// ## Task tree
 ///
-/// `run()` is the root: one child task per listener, and under each listener one child task per
-/// connection, all in discarding task groups (no unstructured tasks, #0029). Cancelling the
+/// `run()` is the root: one child task per component, one per listener, and under each listener
+/// one child task per connection, all in discarding task groups (no unstructured tasks, #0029). Cancelling the
 /// task that calls `run()` cancels the whole tree.
 ///
 /// ## Connection limit
@@ -35,6 +50,10 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
     public let protocols: ProtocolRegistry
     let listeners: [Listener]
     let handler: Handler
+    /// Background components: the `components:` argument, then those found in the chain.
+    let components: [any ServerComponent]
+    /// The chain reads ``RequestContext/startTime``, so the runners stamp each request.
+    let recordsRequestStartTime: Bool
 
     /// Triggers when draining starts; handed to every connection.
     let shutdownSignal = ShutdownSignal()
@@ -68,17 +87,39 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
     ///   - configuration: captured once; validated by `run()`.
     ///   - listeners: where connections come from. `run()` binds them.
     ///   - protocols: the protocols connections may speak, in priority order.
-    ///   - handler: answers requests. (#0082 replaces this with the middleware builder.)
+    ///   - components: background components to run besides those found in `handler`.
+    ///   - handler: answers requests; a builder chain with one element.
     public init(
         configuration: ServerConfiguration = ServerConfiguration(),
         listeners: [Listener],
         protocols: [any ConnectionProtocol],
+        components: [any ServerComponent] = [],
         handler: Handler
     ) {
         self.configuration = configuration
         self.listeners = listeners
         self.protocols = ProtocolRegistry(protocols)
         self.handler = handler
+        self.components = components + MiddlewareChainInspector.serverComponents(in: handler)
+        self.recordsRequestStartTime = MiddlewareChainInspector.needsRequestStartTime(handler)
+    }
+
+    /// - Parameters:
+    ///   - configuration: captured once; validated by `run()`.
+    ///   - listeners: where connections come from. `run()` binds them.
+    ///   - protocols: the protocols connections may speak, in priority order.
+    ///   - components: background components to run besides those found in the chain.
+    ///   - chain: the middlewares, in the order they see requests, optionally ending in a
+    ///     handler (``NotFoundHandler`` otherwise). See ``MiddlewareBuilder``.
+    public convenience init(
+        configuration: ServerConfiguration = ServerConfiguration(),
+        listeners: [Listener],
+        protocols: [any ConnectionProtocol],
+        components: [any ServerComponent] = [],
+        @MiddlewareBuilder _ chain: () -> Handler
+    ) {
+        self.init(configuration: configuration, listeners: listeners, protocols: protocols,
+                  components: components, handler: chain())
     }
 
     // MARK: Observation
@@ -219,7 +260,7 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         }
         for waiter in waiters { waiter.resume(returning: addresses) }
 
-        await serve()
+        await serve(addresses: addresses)
 
         if let error = state.withLock({ $0.runError }) { throw error }
     }
@@ -239,7 +280,31 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
 
     /// The running phase: accept on every listener until shutdown, drain, then cancel what is
     /// left at the deadline.
-    private func serve() async {
+    private func serve(addresses: [TransportAddress]) async {
+        guard !components.isEmpty else { return await serveConnections() }
+        let handle = ServerHandle(localAddresses: addresses, draining: shutdownSignal) { [weak self] in
+            self?.requestShutdown()
+        }
+        await withDiscardingTaskGroup { group in
+            for component in components {
+                group.addTask { await self.runComponent(component, handle: handle) }
+            }
+            await serveConnections()
+            // The connections are gone: stop the components (they may flush first).
+            group.cancelAll()
+        }
+    }
+
+    private func runComponent(_ component: any ServerComponent, handle: ServerHandle) async {
+        do {
+            try await component.run(server: handle)
+        } catch is CancellationError {
+        } catch {
+            failedWhileRunning(error)
+        }
+    }
+
+    private func serveConnections() async {
         state.withLock { $0.activeAcceptLoops = listeners.count }
         await withDiscardingTaskGroup { group in
             for listener in listeners {
@@ -308,7 +373,7 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
                     next = try await iterator.next()
                 } catch {
                     if reserved { releaseSlot(reservation: true) }
-                    if !(error is CancellationError) { listenerFailed(error) }
+                    if !(error is CancellationError) { failedWhileRunning(error) }
                     break accepting
                 }
                 guard let transport = next else {
@@ -352,13 +417,14 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
     }
 
     private func serveConnection(_ transport: Listener.Transport) async {
-        let context = ConnectionContext(info: transport.info, shutdown: shutdownSignal)
+        let context = ConnectionContext(info: transport.info, shutdown: shutdownSignal,
+                                        recordsRequestStartTime: recordsRequestStartTime)
         await protocols.serve(transport, handler: handler, context: context)
         await transport.close(.normal)
     }
 
-    /// A listener failed while running: remember the error, then shut down.
-    private func listenerFailed(_ error: any Error) {
+    /// A listener or component failed while running: remember the first error, then shut down.
+    private func failedWhileRunning(_ error: any Error) {
         state.withLock { state in
             if state.runError == nil { state.runError = error }
         }
