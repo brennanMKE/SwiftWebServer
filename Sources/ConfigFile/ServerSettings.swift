@@ -96,6 +96,11 @@ public struct ServerSettings: Sendable, Equatable {
     /// The HTTP/3 (QUIC) listener (#0089, #0103). `nil` (the default) serves no HTTP/3. Needs
     /// ``tls``. In the file: `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`.
     public var http3: HTTP3Settings?
+    /// HTTP/2 (#0119). On by default: TLS listeners offer `h2` and `http/1.1` via ALPN.
+    /// `nil` (`"http2": false`) serves HTTP/1.1 only. Cleartext h2c is a separate opt-in
+    /// (``HTTP2Settings/cleartext``). In the file:
+    /// `"http2": {"enabled": true, "cleartext": false, "maxConcurrentStreams": 100, …}`.
+    public var http2: HTTP2Settings? = HTTP2Settings()
     /// Response compression (#0091). `nil` (the default) compresses nothing. In the file:
     /// `"compression": true`, or an object (see ``CompressionSettings``). The legacy
     /// `"enableCompression": true` is the same as `"compression": true`.
@@ -160,6 +165,54 @@ public struct ServerSettings: Sendable, Equatable {
             self.port = port
             self.altSvcMaxAge = altSvcMaxAge
         }
+    }
+
+    /// HTTP/2 settings (#0119). Plain values: the executable turns them into the `HTTP2`
+    /// target's `HTTP2Configuration`, so this target does not link HTTP/2.
+    public struct HTTP2Settings: Sendable, Equatable {
+        /// Serve cleartext connections that start with the HTTP/2 preface (prior knowledge,
+        /// RFC 9113 §3.3). Default false: the cleartext listener then speaks only HTTP/1.1 and
+        /// reads no bytes ahead to choose a protocol. Turning it on routes every cleartext
+        /// connection through protocol sniffing and a replay wrapper.
+        public var cleartext = false
+        /// `SETTINGS_MAX_CONCURRENT_STREAMS`. Default 100.
+        public var maxConcurrentStreams = 100
+        /// `SETTINGS_INITIAL_WINDOW_SIZE`, each stream's receive window. Default 65,535.
+        public var initialWindowSize = 65_535
+        /// Largest request body on HTTP/2; `nil` (the default) uses ``ServerSettings/maxBodySize``.
+        public var maxRequestBodySize: Int?
+        /// Overrides of the HTTP/2 abuse limits (#0056); unset fields keep the defaults.
+        public var abuseLimits = AbuseLimitOverrides()
+
+        public static let maxSupportedConcurrentStreams = 1 << 16
+        public static let maxWindowSize = Int(Int32.max)
+
+        public init() {}
+    }
+
+    /// `http2.abuseLimits`: each field `nil` keeps the `HTTP2AbuseLimits` default; for the
+    /// optional limits, `.some(nil)` (JSON `null`) turns the limit off.
+    public struct AbuseLimitOverrides: Sendable, Equatable {
+        /// Rate window. Default 10 s.
+        public var window: Duration?
+        /// Default 100.
+        public var maxResetStreamsPerWindow: Int??
+        /// Default 1,000.
+        public var maxControlFramesPerWindow: Int??
+        /// Default 100.
+        public var maxEmptyFramesPerWindow: Int??
+        /// Default 10,000.
+        public var maxWindowUpdatesPerWindow: Int??
+        /// Default 1,000.
+        public var maxSmallDataFramesPerWindow: Int??
+        /// Default 256 bytes.
+        public var smallDataFrameSize: Int?
+        /// Default 30 s.
+        public var windowStallTimeout: Duration??
+        /// Default 100,000.
+        public var maxStreamsPerConnection: Int??
+
+        public init() {}
     }
 
     public init() {}

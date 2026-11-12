@@ -13,7 +13,8 @@ built, what Network.framework does underneath it, and what one round trip costs 
   Nothing reads ahead, so a task that stops reading applies TCP backpressure.
 - **Sends** copy the `ByteBuffer` into `Data` (the one copy on the write path), send with
   `isComplete: true`, and resume on `.contentProcessed`. `endOfStream` uses `.finalMessage`,
-  which is a TCP half-close (FIN). Receiving keeps working afterwards.
+  which is a TCP half-close (FIN). Receiving keeps working afterwards. Over TLS NW sends
+  nothing for it (see "No half-close over TLS" below).
 - **Handlers before `start`.** State and viability handlers are installed in `init`. The
   connection is started separately (#0010). The listener's state and new-connection handlers
   are installed in `TCPListener.init`, and `start()` comes after.
@@ -186,6 +187,45 @@ Observed:
    ending on the client's first receive.
 4. curl and `URLSession` negotiate TLS 1.3 (`AEAD-CHACHA20-POLY1305-SHA256` for curl).
 5. Keep-alive throughput is 36% below cleartext over NW (`docs/benchmarks/M5-tls.md`).
+
+## No half-close over TLS (#0118)
+
+**Known limitation: Network.framework cannot half-close a TLS connection.** Found in #0061,
+measured with a raw `NWConnection` TLS client and `/usr/bin/openssl s_client` (LibreSSL 3.3.6)
+on macOS 27.0, TLS 1.3 and TLS 1.2:
+
+1. **A final-message send puts nothing on the wire.** After
+   `send(content:contentContext: .finalMessage, isComplete: true)` on the server, the client
+   gets the bytes but no EOF; its next receive stays pending until the server closes. The same
+   holds for data then `send(content: nil, contentContext: .finalMessage)`, and for a custom
+   `NWConnection.ContentContext(identifier:isFinal: true)`. `s_client` prints neither `closed`
+   (close_notify) nor `read:errno=0` (a FIN without close_notify), so neither is sent.
+   On cleartext TCP the same call sends a FIN.
+2. **The connection stays fully usable in the other direction.** The client can still send and
+   the server still receives, so the server side behaves as half-closed locally. Every
+   receive the client sees reports `context.isFinal == true` on a TLS connection, with or
+   without a final message, so that flag carries no information.
+3. **Only `cancel()` ends the stream for the peer.** It sends close_notify and a FIN (`s_client`
+   prints `closed`), and an NW client's pending receive completes with `isComplete` and no
+   error within a few milliseconds. After that the peer can no longer send (its next send
+   reaches a cancelled connection and it fails with `ECONNRESET`). `forceCancel()` gives the
+   peer `ECONNRESET` (`read:errno=54`).
+4. **`cancel()` is immediate and keeps accepted bytes over TLS too.** With the client not
+   reading, a server that sent 64 KiB, 512 KiB or 4 MiB and then called `close(.normal)` got
+   control back in under 0.2 ms; the client read every byte afterwards, then EOF.
+
+So `TCPTransport.send(_:endOfStream: true)` over TLS only shuts down the local write side
+(later sends throw `outputShutdown`; receiving continues), `TCPTransport.supportsHalfClose`
+is `false` for a TLS connection (generic code can check `info.isSecure`), and
+`close(.normal)` (`cancel()`) is the fastest correct full close: no extra flush or wait is
+needed before it. A lingering close over TLS (HTTP/1.1 after an error response, HTTP/2 after
+GOAWAY) cannot rely on the peer reacting to the half-close: the peer only learns that the
+response is complete from the protocol itself (Content-Length, chunked end, END_STREAM,
+GOAWAY), and the linger ends when the peer closes or by its own timeout. A short quiet
+timeout, then `close(.normal)`, is the right ending there. Tests:
+`TLSTransportTests.endOfStreamOverTLSReachesThePeerOnlyOnClose` (fails if a macOS release
+starts sending the EOF), `opensslSeesCloseNotifyOnlyOnClose`, and
+`normalCloseOverTLSIsImmediateAndKeepsAcceptedBytes`.
 
 # Network.framework QUIC transport (#0098)
 

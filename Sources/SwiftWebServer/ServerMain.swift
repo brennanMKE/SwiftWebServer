@@ -12,6 +12,9 @@ import NetworkTransport
 /// The shipped server (#0086): `Server` + HTTP/1.1 + `ErrorPages` + `StaticFiles`
 /// (with conditional requests), configured by `http-config.json` and the command line.
 ///
+/// Protocols (#0119): HTTP/2 is on by default for TLS (ALPN `h2`, `http/1.1`); cleartext h2c
+/// only with `"http2": {"cleartext": true}`. See ``ServerProtocols``.
+///
 /// Listeners (#0089): cleartext HTTP/1.1 always; HTTPS when the config has `tls`; HTTP/3 over
 /// QUIC when it also has `http3` (by default on the TLS port number, UDP). All run under one
 /// `Server`: one connection limit, one drain, and SIGTERM sends HTTP/3 GOAWAY too.
@@ -34,8 +37,8 @@ enum ServerMain {
           --host HOST     numeric address to bind (overrides "host"; default 127.0.0.1)
           --port PORT     port to bind (overrides "port"; default 8080; 0 picks a free one)
 
-        Relative paths in the config file resolve against the file's directory. HTTPS and
-        HTTP/3 are configured with the "tls" and "http3" keys. Prints "listening HOST:PORT"
+        Relative paths in the config file resolve against the file's directory. HTTPS,
+        HTTP/2 and HTTP/3 are configured with the "tls", "http2" and "http3" keys. Prints "listening HOST:PORT"
         on stdout once bound (then "listening HOST:PORT (https)" and "(h3)" lines for the
         other listeners). SIGINT/SIGTERM shut down gracefully.
         """
@@ -142,6 +145,7 @@ enum ServerMain {
             } catch {
                 throw ConfigFileError("\(error)")
             }
+            let protocols = try ServerProtocols.make(settings)
             let listeners = try makeListeners(settings, environment: environment)
             if settings.hosts.isEmpty {
                 printError("\(name): serving \(settings.resolvedRoot)")
@@ -160,12 +164,12 @@ enum ServerMain {
                     altSvc
                     handler
                 }
-                return await serve(settings, listeners: listeners, handler: chain) { addresses, names in
+                return await serve(settings, listeners: listeners, protocols: protocols, handler: chain) { addresses, names in
                     if let index = names.firstIndex(of: "h3") { altSvc.advertise(port: addresses[index].port) }
                 }
             }
             #endif
-            return await serve(settings, listeners: listeners, handler: handler)
+            return await serve(settings, listeners: listeners, protocols: protocols, handler: handler)
         } catch {
             printError("\(name): \(error)")
             return 1
@@ -225,11 +229,11 @@ enum ServerMain {
     /// Runs the server until a signal stops it. `onBound` runs once every listener is bound,
     /// before the `listening` lines are printed, with the addresses and listener names.
     static func serve<H: HTTPHandler>(
-        _ settings: ServerSettings, listeners: [ServerListener], handler: H,
+        _ settings: ServerSettings, listeners: [ServerListener], protocols: [any ConnectionProtocol], handler: H,
         onBound: @escaping @Sendable ([TransportAddress], [String]) -> Void = { _, _ in }
     ) async -> Int32 {
         let server = Server(configuration: settings.serverConfiguration, listeners: listeners,
-                            protocols: [HTTP1(configuration: settings.http1Configuration)],
+                            protocols: protocols,
                             handler: handler)
 
         // Ignore the default actions first, so a signal is never fatal, then route both to a

@@ -20,6 +20,15 @@ import Synchronization
 /// bytes. `endOfStream` sends a final message, which shuts down the TCP write side (FIN) while
 /// receiving continues.
 ///
+/// **Over TLS there is no half-close (#0118).** Network.framework ignores the final message on
+/// a TLS connection: it sends neither close_notify nor a FIN, so the peer does not read end of
+/// stream until the connection is closed. Locally the transport still behaves as
+/// half-closed (later sends throw ``TransportError/outputShutdown``, receiving continues).
+/// ``supportsHalfClose`` is false for such a connection. ``close(_:)`` with a normal reason is
+/// the full close: it returns at once, delivers the bytes already accepted, then sends
+/// close_notify and a FIN. A protocol that half-closes and then waits for the peer to close
+/// (a lingering close) should not expect the peer to react to the half-close over TLS.
+///
 /// ## Lifecycle
 ///
 /// The state, viability and receive handlers are installed before `start(queue:)` (#0010).
@@ -141,6 +150,13 @@ public final class TCPTransport: ByteStreamTransport {
     /// The last viability reported by Network.framework (false while the path is unusable).
     public var isViable: Bool { core.state.withLock { $0.isViable } }
 
+    /// Whether `send(_:endOfStream: true)` reaches the peer as end of stream while this side
+    /// keeps receiving. True for cleartext TCP (a FIN). False over TLS: Network.framework puts
+    /// nothing on the wire for a final message, and the peer sees end of stream only when the
+    /// connection is closed (#0118, docs/notes/nw-transport.md). Valid once the connection is
+    /// ready; generic callers can use `info.isSecure` for the same answer.
+    public var supportsHalfClose: Bool { !info.isSecure }
+
     // MARK: ByteStreamTransport
 
     public func receive(into buffer: inout ByteBuffer, maxLength: Int) async throws -> Int {
@@ -209,7 +225,8 @@ public final class TCPTransport: ByteStreamTransport {
                 continuation.resume()
                 return
             }
-            // `cancel()` disconnects gracefully (FIN after the bytes already accepted);
+            // `cancel()` disconnects gracefully (FIN after the bytes already accepted; over
+            // TLS, close_notify then FIN, the only way to signal end of stream there, #0118);
             // `forceCancel()` discards them and resets the connection.
             if reason.isAbortive { connection.forceCancel() } else { connection.cancel() }
         }

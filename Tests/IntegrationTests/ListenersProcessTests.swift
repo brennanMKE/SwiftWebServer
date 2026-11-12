@@ -78,7 +78,7 @@ import Testing
         var output = try await curl(["-w", " %{http_code} %{http_version}", "http://127.0.0.1:\(ports.http)/"])
         #expect(output.stdout == "<h1>home</h1> 200 1.1", "\(output.stderr)")
         output = try await curl(["-k", "-w", " %{http_code} %{http_version}", "https://127.0.0.1:\(https)/"])
-        #expect(output.stdout == "<h1>home</h1> 200 1.1", "\(output.stderr)")
+        #expect(output.stdout == "<h1>home</h1> 200 2", "HTTP/2 via ALPN by default (#0119): \(output.stderr)")
         output = try await curl(["-k", "--http3-only", "-w", " %{http_code} %{http_version}", "https://127.0.0.1:\(https)/"], h3: true)
         #expect(output.stdout == "<h1>home</h1> 200 3", "\(output.stderr)")
         output = try await curl(["-k", "--http3-only", "-w", "%{http_code}", "-o", "/dev/null", "https://127.0.0.1:\(https)/missing"], h3: true)
@@ -94,8 +94,8 @@ import Testing
     }
 
     /// #0103: HTTPS responses advertise HTTP/3 on the UDP port with the configured max age;
-    /// cleartext and HTTP/3 responses do not. Homebrew curl with an alt-svc cache uses HTTP/1.1
-    /// first and HTTP/3 for the second request.
+    /// cleartext and HTTP/3 responses do not. Homebrew curl with an alt-svc cache uses HTTP/2
+    /// (ALPN, #0119) first and HTTP/3 for the second request.
     @Test(.timeLimit(.minutes(1)), .enabled(if: hasH3Curl))
     func altSvcOnHTTPSOnlyAndCurlUpgradesToHTTP3() async throws {
         let fixture = try ParityTests.Fixture(config: try Self.tlsConfig(http3: #"{"altSvcMaxAge": 600}"#))
@@ -124,7 +124,7 @@ import Testing
                                      "https://127.0.0.1:\(https)/"], h3: true)
             versions.append(output.stdout)
         }
-        #expect(versions == ["1.1", "3"], "\(output.stderr)")
+        #expect(versions == ["2", "3"], "\(output.stderr)")
 
         child.signal(SIGTERM)
         #expect(try await child.waitForExit(timeout: .seconds(15)) == 0, "\(child.stderr)")
@@ -139,7 +139,7 @@ import Testing
         let ports = try await Self.ports(child, expecting: 2)
         #expect(ports.h3 == nil)
         let output = try await curl(["-k", "-i", "https://127.0.0.1:\(try #require(ports.https))/"])
-        #expect(output.stdout.hasPrefix("HTTP/1.1 200"), "\(output.stdout)")
+        #expect(output.stdout.hasPrefix("HTTP/2 200"), "\(output.stdout)")
         #expect(altSvc(output.stdout).isEmpty)
         child.signal(SIGTERM)
         #expect(try await child.waitForExit(timeout: .seconds(15)) == 0, "\(child.stderr)")

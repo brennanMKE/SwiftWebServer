@@ -81,7 +81,7 @@ targets += [
     .executableTarget(
         name: "SwiftWebServer",
         dependencies: ["ConfigFile", "HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport",
-                       .target(name: "HTTP3", condition: .when(traits: ["HTTP3"]))],
+                       .target(name: "HTTP2", condition: .when(traits: ["HTTP2"])), .target(name: "HTTP3", condition: .when(traits: ["HTTP3"]))],
         swiftSettings: modernSwiftSettings),
     .executableTarget(
         name: "SWSBench",
