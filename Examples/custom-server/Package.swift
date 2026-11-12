@@ -1,7 +1,8 @@
 // swift-tools-version: 6.2
 // A custom server built from SwiftWebServer's library products: static files, a Router API,
-// a WebSocket echo, compression and an access log, over HTTP/1.1. See
-// docs/guide/choosing-components.md. In your own package, replace the path dependency with
+// a WebSocket echo, compression and an access log, over HTTP/1.1 (HTTP/2 once a TLS
+// listener negotiates it). See docs/guide/choosing-components.md. In your own package,
+// replace the path dependency with
 // .package(url: "https://github.com/brennanMKE/SwiftWebServer.git", branch: "main").
 import PackageDescription
 
@@ -17,6 +18,7 @@ let package = Package(
             dependencies: [
                 .product(name: "HTTPCore", package: "SwiftWebServer"),
                 .product(name: "HTTP1", package: "SwiftWebServer"),
+                .product(name: "HTTP2", package: "SwiftWebServer"),
                 .product(name: "HTTPServer", package: "SwiftWebServer"),
                 .product(name: "NetworkTransport", package: "SwiftWebServer"),
                 .product(name: "StaticFiles", package: "SwiftWebServer"),

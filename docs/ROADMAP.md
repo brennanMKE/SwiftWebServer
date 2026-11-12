@@ -75,7 +75,7 @@ Sources/
 Tests/               one test target per source target, plus IntegrationTests
 ```
 
-TLS is configuration inside NetworkTransport. Package traits (Swift 6.1+) let the CLI compile out HTTP2/HTTP3/WebSockets. Protocol selection happens once per connection; the middleware chain is a nested generic built by a result builder, so an absent component is absent from the compiled chain.
+TLS is configuration inside NetworkTransport. Package traits (Swift 6.1+) let the CLI compile out HTTP2/HTTP3 (WebSockets has no trait: the CLI has no in-process WebSocket endpoints, only proxied ones, so there is nothing to compile out; #0130). Protocol selection happens once per connection; the middleware chain is a nested generic built by a result builder, so an absent component is absent from the compiled chain.
 
 ### 5.2 Extension points (the only five)
 

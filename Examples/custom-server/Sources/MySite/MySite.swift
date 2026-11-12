@@ -3,6 +3,7 @@ import Compression
 import Dispatch
 import Darwin
 import HTTP1
+import HTTP2
 import HTTPCore
 import HTTPServer
 import NetworkTransport
@@ -56,7 +57,10 @@ struct MySite {
         let files = try StaticFiles(root: root)
         let listener = try BSDSocketListener(configuration: .init(host: "127.0.0.1", port: port))
 
-        let server = Server(listeners: [listener], protocols: [HTTP1()]) {
+        // HTTP/2 only where TLS negotiates it by ALPN (add a TLS listener to use it); cleartext
+        // connections go straight to HTTP/1.1 with no first-bytes sniffing.
+        let protocols = [TLSNegotiated(HTTP2(), fallback: HTTP1())]
+        let server = Server(listeners: [listener], protocols: protocols) {
             AccessLog(format: .combined, destination: .standardOutput)
             Compression()
             echo

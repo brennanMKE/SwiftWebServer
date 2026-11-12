@@ -106,8 +106,7 @@ let package = Package(
     traits: [
         .trait(name: "HTTP2", description: "Include HTTP/2 (HPACK, HTTP2) in the server executable."),
         .trait(name: "HTTP3", description: "Include HTTP/3 (QPACK, HTTP3) in the server executable."),
-        .trait(name: "WebSockets", description: "Include WebSockets in the server executable."),
-        .default(enabledTraits: ["HTTP2", "HTTP3", "WebSockets"]),
+        .default(enabledTraits: ["HTTP2", "HTTP3"]),
     ],
     dependencies: [],
     targets: targets,

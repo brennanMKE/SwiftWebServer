@@ -47,13 +47,14 @@ product of its own.
 ## Package traits for the executable
 
 The `SwiftWebServer` executable links HTTP/2 and HTTP/3 through package traits, both on by
-default:
+default. There is no `WebSockets` trait: the executable has no in-process WebSocket endpoints
+(those need Swift code, `WebSocketUpgrade`, so they belong in a custom server), and WebSocket
+*proxying* (`"websocket": true` on a mount) is part of `Proxy` and always available.
 
 | Trait | Effect when off |
 |---|---|
 | `HTTP2` | HPACK and HTTP2 are not linked; HTTPS speaks HTTP/1.1 only. `"http2": {"cleartext": true}` then fails at startup |
 | `HTTP3` | QPACK and HTTP3 are not linked; an `http3` key fails at startup with "this build has no HTTP/3" |
-| `WebSockets` | Declared, but currently has no effect: the executable does not link the `WebSockets` target (WebSocket *proxying* is part of `Proxy` and always available) |
 
 ```bash
 swift build -c release -j 2 --product SwiftWebServer --disable-default-traits   # HTTP/1.1 only
@@ -85,6 +86,7 @@ let package = Package(
             dependencies: [
                 .product(name: "HTTPCore", package: "SwiftWebServer"),
                 .product(name: "HTTP1", package: "SwiftWebServer"),
+                .product(name: "HTTP2", package: "SwiftWebServer"),
                 .product(name: "HTTPServer", package: "SwiftWebServer"),
                 .product(name: "NetworkTransport", package: "SwiftWebServer"),
                 .product(name: "StaticFiles", package: "SwiftWebServer"),
@@ -108,6 +110,7 @@ import Compression
 import Darwin
 import Dispatch
 import HTTP1
+import HTTP2
 import HTTPCore
 import HTTPServer
 import NetworkTransport
@@ -161,7 +164,10 @@ struct MySite {
         let files = try StaticFiles(root: root)
         let listener = try BSDSocketListener(configuration: .init(host: "127.0.0.1", port: port))
 
-        let server = Server(listeners: [listener], protocols: [HTTP1()]) {
+        // HTTP/2 only where TLS negotiates it by ALPN (add a TLS listener to use it); cleartext
+        // connections go straight to HTTP/1.1 with no first-bytes sniffing.
+        let protocols = [TLSNegotiated(HTTP2(), fallback: HTTP1())]
+        let server = Server(listeners: [listener], protocols: protocols) {
             AccessLog(format: .combined, destination: .standardOutput)
             Compression()
             echo
@@ -269,9 +275,7 @@ let listeners: [ServerListener] = [
                          identity: identity)
     },
 ]
-var h2 = HTTP2Configuration()
-h2.cleartext = false
-let server = Server(listeners: listeners, protocols: [HTTP2(configuration: h2), HTTP1()]) {
+let server = Server(listeners: listeners, protocols: [TLSNegotiated(HTTP2(), fallback: HTTP1())]) {
     altSvc
     files
 }
@@ -283,9 +287,13 @@ try await server.run()
   ALPN always matches what the server can speak.
 - Listeners bind in order. A QUIC listener can use `bind.boundAddresses` to take the TLS
   listener's port number when that was 0, as the executable does.
-- With two byte-stream protocols registered, every cleartext connection is sniffed to tell
-  HTTP/2 prior knowledge from HTTP/1.1. The executable avoids that cost with an internal
-  `TLSNegotiatedHTTP2` wrapper (h2 only after ALPN); it is not a public type.
+- `TLSNegotiated(HTTP2(), fallback: HTTP1())` (HTTPServer) is one protocol that offers `h2`
+  and `http/1.1` by ALPN and runs HTTP/2 only when TLS negotiated `h2`. Cleartext connections
+  go straight to HTTP/1.1: with a single protocol registered nothing is read ahead. The
+  executable registers exactly this unless `"http2": {"cleartext": true}`.
+- `[HTTP2(), HTTP1()]` instead also serves h2c (HTTP/2 prior knowledge) on cleartext, at the
+  cost of sniffing the first bytes of every cleartext connection. Register HTTP/2 first:
+  HTTP/1.1's sniff also matches the `PRI * HTTP/2.0` preface.
 - `HTTP2` advertises extended CONNECT automatically when a `WebSocketUpgrade` is in the chain,
   so the same WebSocket endpoint works over h2 and h3.
 
