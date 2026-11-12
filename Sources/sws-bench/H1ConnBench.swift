@@ -1,3 +1,4 @@
+import AccessLog
 import Foundation
 import HTTP1
 import HTTPCore
@@ -25,6 +26,18 @@ enum H1ConnBench {
           disabledif   `if disabled { NoOp() }` in front of the handler (the condition is read at
                        run time, so the component is compiled in but absent)
           starttime    the bare handler with `RequestContext.startTime` stamped per request
+
+        and with the access log (#0090) in front of the handler, its writer running:
+
+          log-metrics  `AccessLog(metrics:)`: counters and latency histogram, no lines
+          log-null     Common Log Format lines to the `.discard` destination (formatted,
+                       batched and handed to the writer, which drops them)
+          log-json     JSON lines to `.discard`
+          log-file     Common Log Format lines appended to a file in $TMPDIR (deleted after)
+          log-file-metrics  the same plus metrics
+
+        Compare the log rows with `empty` (the same chain boundary, no component): the
+        difference is the access log's cost, its start-time stamp included.
 
         The `dispatch` rows call the handler in a loop without the connection, through `any
         HTTPHandler` (unspecialized, as the protocol runners call it), so they isolate the
@@ -67,7 +80,29 @@ enum H1ConnBench {
             hello
         }
 
+        let logPath = FileManager.default.temporaryDirectory
+            .appending(path: "sws-bench-h1conn-\(ProcessInfo.processInfo.processIdentifier).log").path
+        defer { try? FileManager.default.removeItem(atPath: logPath) }
+        let logMetrics = AccessLog(metrics: AccessLogMetrics())
+        let logNull = AccessLog(format: .common, destination: .discard)
+        let logJSON = AccessLog(format: .json, destination: .discard)
+        let logFile = AccessLog(format: .common, destination: .file(path: logPath))
+        let logFileMetrics = AccessLog(format: .common, destination: .file(path: logPath), metrics: AccessLogMetrics())
+        let logs = [logMetrics, logNull, logJSON, logFile, logFileMetrics]
+        let withLogMetrics = MiddlewareBuilder.build { logMetrics; hello }
+        let withLogNull = MiddlewareBuilder.build { logNull; hello }
+        let withLogJSON = MiddlewareBuilder.build { logJSON; hello }
+        let withLogFile = MiddlewareBuilder.build { logFile; hello }
+        let withLogFileMetrics = MiddlewareBuilder.build { logFileMetrics; hello }
+
+        // The writers run beside the measurements, as a server runs them.
+        let handle = ServerHandle(localAddresses: [], draining: ShutdownSignal()) {}
         var results: [Result] = []
+        let calls = max(requests * 10, 10_000)  // dispatch rows
+        await withDiscardingTaskGroup { writers in
+        for log in logs {
+            writers.addTask { try? await log.run(server: handle) }
+        }
         for (name, pipeline) in [("keepalive", 1), ("pipelined16", 16)] {
             let count = max(requests, 1000)
             results.append(await measure(name: "h1conn.\(name) request", requests: count, pipeline: pipeline, handler: hello))
@@ -77,8 +112,27 @@ enum H1ConnBench {
             results.append(await measure(name: "h1conn.\(name) disabledif", requests: count, pipeline: pipeline, handler: disabledIf))
             results.append(await measure(name: "h1conn.\(name) starttime", requests: count, pipeline: pipeline, handler: hello,
                                          recordsStartTime: true))
+            results.append(await measure(name: "h1conn.\(name) log-metrics", requests: count, pipeline: pipeline, handler: withLogMetrics))
+            results.append(await measure(name: "h1conn.\(name) log-null", requests: count, pipeline: pipeline, handler: withLogNull))
+            results.append(await measure(name: "h1conn.\(name) log-json", requests: count, pipeline: pipeline, handler: withLogJSON))
+            results.append(await measure(name: "h1conn.\(name) log-file", requests: count, pipeline: pipeline, handler: withLogFile))
+            results.append(await measure(name: "h1conn.\(name) log-file-metrics", requests: count, pipeline: pipeline,
+                                         handler: withLogFileMetrics))
         }
-        let calls = max(requests * 10, 10_000)
+        for (name, chain) in [("log-metrics", withLogMetrics), ("log-null", withLogNull), ("log-json", withLogJSON)] {
+            var connection = ConnectionContext(info: benchConnectionInfo, recordsRequestStartTime: true)
+            ConnectionObservers(chain: chain).connectionWillStart(&connection)
+            var context = connection.requestContext
+            context.startTime = .now()
+            results.append(await dispatch(name: "dispatch \(name)", calls: calls, handler: chain, context: context))
+        }
+        writers.cancelAll()
+        }
+        for (name, log) in zip(["log-metrics", "log-null", "log-json", "log-file", "log-file-metrics"], logs)
+        where log.statistics.linesDropped > 0 {
+            printError("h1conn: \(name) dropped \(log.statistics.linesDropped) of \(log.statistics.linesLogged) lines "
+                + "(the writer fell behind; the request path does not wait)")
+        }
         results.append(await dispatch(name: "dispatch request", calls: calls, handler: hello))
         results.append(await dispatch(name: "dispatch empty", calls: calls, handler: empty))
         results.append(await dispatch(name: "dispatch chain3", calls: calls, handler: chain3))
@@ -100,6 +154,8 @@ enum H1ConnBench {
 
     static func measure<H: HTTPHandler>(name: String, requests: Int, pipeline: Int, handler: H,
                                         recordsStartTime: Bool = false) async -> Result {
+        // As `Server` does: stamp start times and open per-connection state for the chain.
+        let recordsStartTime = recordsStartTime || MiddlewareChainInspector.needsRequestStartTime(handler)
         let protocolInstance = HTTP1()
         // Warm up.
         _ = await serve(protocolInstance, handler, batches: 100, pipeline: pipeline, recordsStartTime: recordsStartTime)
@@ -122,12 +178,15 @@ enum H1ConnBench {
         var batch = ByteBuffer()
         for _ in 0..<pipeline { batch.append(contentsOf: Array(request.utf8)) }
         let transport = RepeatingTransport(batch: batch, count: batches)
-        let context = ConnectionContext(info: ConnectionInfo(), recordsRequestStartTime: recordsStartTime)
+        var context = ConnectionContext(info: benchConnectionInfo, recordsRequestStartTime: recordsStartTime)
+        let observers = ConnectionObservers(chain: handler)
         let clock = ContinuousClock()
         var elapsed = Duration.zero
         let allocations = await AllocationCounter.countAsync {
             let start = clock.now
+            observers.connectionWillStart(&context)
             await proto.run(transport, handler: handler, context: context)
+            observers.connectionDidEnd(context)
             elapsed = clock.now - start
         }
         precondition(transport.sentBytes > 0, "h1conn bench: nothing was sent")
@@ -136,11 +195,11 @@ enum H1ConnBench {
 
     /// ns and allocations per direct `handle` call (no connection, no clock read): the cost of
     /// the chain itself. Short and long runs as in ``measure(name:requests:pipeline:handler:)``.
-    static func dispatch<H: HTTPHandler>(name: String, calls: Int, handler: H) async -> Result {
+    static func dispatch<H: HTTPHandler>(name: String, calls: Int, handler: H,
+                                         context: RequestContext = RequestContext()) async -> Result {
         let storage = HTTPRequestStorage(bufferCapacity: 256, fieldCapacity: 8)
         storage.buffer.append("/")
         let request = HTTPRequest(method: .get, path: ByteView(offset: 0, length: 1), headers: storage.fieldsView)
-        let context = RequestContext()
         // Through an existential, as the protocol runners call it: unspecialized.
         let handler: any HTTPHandler = opaque(handler)
         func loop(_ n: Int) async -> (Duration, Int?) {
@@ -169,6 +228,10 @@ enum H1ConnBench {
                       allocationsPerRequest: allocs)
     }
 }
+
+/// The peer every h1conn connection reports (an access log renders it once per connection).
+let benchConnectionInfo = ConnectionInfo(localAddress: TransportAddress(host: "127.0.0.1", port: 8080),
+                                         remoteAddress: TransportAddress(host: "127.0.0.1", port: 54321))
 
 /// ``NoOpMiddleware`` that the optimizer always inlines into the chain.
 struct InlineNoOpMiddleware: HTTPMiddleware {
