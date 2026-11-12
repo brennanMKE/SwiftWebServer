@@ -164,10 +164,10 @@ overlapping hosts is an error.
 | `rewriteLocation` | bool | `true` | Rewrite upstream `Location` and `Content-Location` into the client's URL space |
 | `rewriteCookiePath` | bool | `false` | With `stripPrefix` or a base path, rewrite `Set-Cookie` `Path` (`Path=/` → `Path=/api`) |
 | `websocket` | bool | `false` | Tunnel WebSocket / `Upgrade` requests |
-| `timeouts.connect` | seconds | `10` | Connecting to the upstream |
-| `timeouts.response` | seconds | `60` | Request sent → response head |
-| `timeouts.idle` | seconds | `60` | Between body reads; also closes an idle tunnel (tunnels default to 300 s without it) |
-| `timeouts.total` | seconds | none | Whole exchange |
+| `timeouts.connect` | seconds, `0`/`null` off | `10` | Connecting to the upstream |
+| `timeouts.response` | seconds, `0`/`null` off | `60` | Request sent → response head |
+| `timeouts.idle` | seconds, `0`/`null` off | `60` | Between body reads; also closes an idle tunnel (tunnels default to 300 s without it) |
+| `timeouts.total` | seconds, `0`/`null` off | none | Whole exchange |
 | `retries` | integer 0–10 | `1` | Extra attempts on the next upstream after a connect failure, idempotent methods only |
 | `health.failures` | integer 0–1000 | `3` | Consecutive failures that mark an upstream down (`0`: passive tracking off) |
 | `health.cooldown` | seconds | `10` | How long it stays down |
@@ -179,8 +179,10 @@ overlapping hosts is an error.
 | `pool.maxIdle` | integer | `16` | Kept-alive idle connections per upstream. **Raise it to your expected concurrency**: with more concurrent requests than `maxIdle`, extra connections are opened and closed per request |
 | `pool.idleTimeout` | seconds | `60` | Idle connections closed after this (`0` keeps them) |
 
-For `timeouts.connect`, `response` and `idle`, `0` or `null` keeps the default rather than
-turning the limit off; `total` is off unless set.
+For all four `timeouts` keys, `0` or `null` turns that limit off and a missing key keeps the
+default (`total` is off by default). Values are capped at one year. For long-polling or
+streaming upstreams (server-sent events, long downloads), set `"idle": 0` and `"response": 0`
+(or large values); `idle: 0` also leaves upgraded tunnels without an idle limit.
 
 ### Apache `mod_proxy` → SwiftWebServer
 

@@ -21,7 +21,7 @@ JSON file, or compose its components into your own Swift server.
 | Compression | Brotli, gzip, deflate; static files compressed once or served from `.br`/`.gz` sidecars |
 | Sites | Virtual hosts with wildcards; custom or generated error pages |
 | Security | TLS from a PKCS#12 file loaded in memory (no keychain); Basic (PBKDF2), HS256 JWT and bearer-token auth with failure limiting; HTTP/2 abuse limits |
-| Dynamic content | Reverse proxy to local apps over TCP or Unix sockets (pooling, timeouts, retries, health checks, WebSocket tunnelling); in-process `Router` and `WebSocketUpgrade` for Swift handlers |
+| Dynamic content | Reverse proxy to local apps over TCP or Unix sockets (pooling, timeouts that `0` turns off for streaming, retries, health checks, WebSocket tunnelling); in-process `Router` and `WebSocketUpgrade` for Swift handlers |
 | Operations | Access log (Common, Combined, JSON) and Prometheus metrics; connection limits and timeouts; graceful drain on SIGINT/SIGTERM |
 
 ## Quick start

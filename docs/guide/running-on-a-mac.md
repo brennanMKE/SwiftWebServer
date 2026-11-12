@@ -45,8 +45,11 @@ a warning and are ignored. A wrong type or out-of-range value stops the server (
 message such as `"timeouts.idle" must be a number of seconds`. **Relative paths resolve
 against the directory holding the config file** (except `--root`).
 
-Durations are numbers of seconds (fractions allowed). For the HTTP/1.1 `timeouts`, `0` or
-`null` turns a limit off.
+Durations are numbers of seconds (fractions allowed, at most one year). For the HTTP/1.1
+`timeouts` and the proxy's `proxy[].timeouts` (`connect`, `response`, `idle`, `total`), `0` or
+`null` turns a limit off; leaving a key out keeps its default. Turn off the proxy's `idle` and
+`response` limits (or set them large) for long-polling or streaming upstreams such as
+server-sent events.
 
 [`Root/http-config.json`](../../Root/http-config.json) spells out the core defaults;
 [`Root/http-config.tls.json`](../../Root/http-config.tls.json) adds HTTPS and HTTP/3;
