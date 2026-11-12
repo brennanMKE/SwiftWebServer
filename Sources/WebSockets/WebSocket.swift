@@ -28,6 +28,10 @@ public struct WebSocketConfiguration: Sendable, Hashable {
     public var outboundFrameCapacity: Int
     /// Largest single read from the transport.
     public var receiveSize: Int
+    /// permessage-deflate (RFC 7692, #0110): `nil` (the default) declines the extension;
+    /// otherwise ``WebSocketUpgrade`` accepts a client's offer on these terms. The inflated
+    /// size of a received message is bounded by ``maxMessageSize``.
+    public var compression: PerMessageDeflate.Configuration?
 
     public init(
         maxFrameSize: Int = 16 * 1024 * 1024,
@@ -35,7 +39,8 @@ public struct WebSocketConfiguration: Sendable, Hashable {
         closeTimeout: Duration = .seconds(5),
         inboundMessageCapacity: Int = 1,
         outboundFrameCapacity: Int = 8,
-        receiveSize: Int = 64 * 1024
+        receiveSize: Int = 64 * 1024,
+        compression: PerMessageDeflate.Configuration? = nil
     ) {
         precondition(maxFrameSize >= 125 && maxMessageSize >= 0 && inboundMessageCapacity >= 1
                      && outboundFrameCapacity >= 1 && receiveSize > 0)
@@ -45,6 +50,7 @@ public struct WebSocketConfiguration: Sendable, Hashable {
         self.inboundMessageCapacity = inboundMessageCapacity
         self.outboundFrameCapacity = outboundFrameCapacity
         self.receiveSize = receiveSize
+        self.compression = compression
     }
 }
 
@@ -63,6 +69,9 @@ public struct WebSocketConfiguration: Sendable, Hashable {
 public final class WebSocket: Sendable {
     /// The subprotocol agreed in the handshake, if any.
     public let subprotocol: String?
+    /// The permessage-deflate parameters agreed in the handshake, or `nil` when messages are
+    /// not compressed.
+    public let compression: PerMessageDeflate.Parameters?
     /// The underlying connection's addresses.
     public let connectionInfo: ConnectionInfo
     public let configuration: WebSocketConfiguration
@@ -92,16 +101,26 @@ public final class WebSocket: Sendable {
     let shared: Mutex<Shared>
     /// Triggered when a Close frame is queued: starts the close timer.
     let closeStarted = ShutdownSignal()
+    /// Compresses outgoing data messages; used only by the writer task.
+    let deflater: PerMessageDeflate.Deflater?
 
-    init(subprotocol: String?, connectionInfo: ConnectionInfo, configuration: WebSocketConfiguration) {
+    init(subprotocol: String?, connectionInfo: ConnectionInfo, configuration: WebSocketConfiguration,
+         compression: PerMessageDeflate.Parameters? = nil, deflater: PerMessageDeflate.Deflater? = nil,
+         inflater: PerMessageDeflate.Inflater? = nil) {
         self.subprotocol = subprotocol
         self.connectionInfo = connectionInfo
         self.configuration = configuration
+        self.compression = compression
+        self.deflater = deflater
         inbound = BoundedAsyncQueue(capacity: configuration.inboundMessageCapacity)
         outbound = BoundedAsyncQueue(capacity: configuration.outboundFrameCapacity)
         shared = Mutex(Shared(connection: WSConnection(configuration: .init(
-            maxFrameSize: configuration.maxFrameSize, maxMessageSize: configuration.maxMessageSize))))
+            maxFrameSize: configuration.maxFrameSize, maxMessageSize: configuration.maxMessageSize),
+            inflater: inflater)))
     }
+
+    /// Compressed messages received so far.
+    var compressedMessagesReceived: Int { shared.withLock { $0.connection.compressedMessages } }
 
     // MARK: Application API
 
@@ -220,14 +239,35 @@ public final class WebSocket: Sendable {
     /// Away; the handler sees ``messages`` end once the peer answers (#0116). The session
     /// reads, writes and times the close handshake in child tasks of one task group; nothing
     /// outlives this call.
+    ///
+    /// `compression` is the permessage-deflate agreement from the handshake
+    /// (``PerMessageDeflate/negotiate(offers:configuration:)``); with it, data messages are
+    /// compressed per message and RSV1 messages from the peer are inflated.
     public static func run<T: ByteStreamTransport>(
         over transport: T,
         subprotocol: String? = nil,
         configuration: WebSocketConfiguration = WebSocketConfiguration(),
+        compression: PerMessageDeflate.Parameters? = nil,
         shutdown: ShutdownSignal? = nil,
         handler: @escaping @Sendable (WebSocket) async throws -> Void
     ) async {
-        let socket = WebSocket(subprotocol: subprotocol, connectionInfo: transport.info, configuration: configuration)
+        var deflater: PerMessageDeflate.Deflater?
+        var inflater: PerMessageDeflate.Inflater?
+        if let compression {
+            deflater = PerMessageDeflate.Deflater(compression)
+            inflater = PerMessageDeflate.Inflater(compression)
+            guard deflater != nil, inflater != nil else {
+                // zlib could not allocate its state: refuse the session with 1011.
+                var frame = ByteBuffer()
+                WSFrameWriter.appendFrame(opcode: .close, payload: WSFrameWriter.closePayload(code: .internalServerError),
+                                          into: &frame)
+                try? await transport.send(frame, endOfStream: true)
+                await transport.close(.normal)
+                return
+            }
+        }
+        let socket = WebSocket(subprotocol: subprotocol, connectionInfo: transport.info, configuration: configuration,
+                               compression: compression, deflater: deflater, inflater: inflater)
         await withTaskGroup(of: Role.self) { group in
             group.addTask { await socket.readLoop(transport); return .reader }
             group.addTask { await socket.writeLoop(transport); return .writer }
@@ -344,12 +384,29 @@ public final class WebSocket: Sendable {
 
     func writeLoop<T: ByteStreamTransport>(_ transport: T) async {
         var frame = ByteBuffer(capacity: 256)
+        var compressed = ByteBuffer()
         var closeSent = false
         for await item in outbound {
             // Nothing follows a Close (RFC 6455 §5.5.1); late frames are dropped.
             if closeSent { continue }
             closeSent = item.opcode == .close
             frame.clear()
+            if let deflater, !item.opcode.isControl,
+               let length = deflater.compress(item.payload, into: &compressed) {
+                // permessage-deflate: one frame with RSV1, the deflate data without its tail.
+                WSFrameWriter.appendHeader(reservedBits: 0x40, opcode: item.opcode, payloadLength: length, into: &frame)
+                frame.append(ByteView(offset: compressed.readerIndex, length: length), from: compressed)
+                do {
+                    try await transport.send(frame, endOfStream: item.endOfStream)
+                } catch {
+                    await abandonWrites(transport)
+                    return
+                }
+                // Do not keep a large message's buffers for the rest of the connection.
+                if compressed.capacity > 256 * 1024 { compressed = ByteBuffer() }
+                if frame.capacity > 256 * 1024 { frame = ByteBuffer(capacity: 256) }
+                continue
+            }
             WSFrameWriter.appendHeader(opcode: item.opcode, payloadLength: item.payload.readableBytes, into: &frame)
             do {
                 if item.payload.readableBytes <= 16 * 1024 {
@@ -360,13 +417,18 @@ public final class WebSocket: Sendable {
                     try await transport.send(item.payload, endOfStream: item.endOfStream)
                 }
             } catch {
-                // The peer is gone: unblock the reader and drop the rest.
-                outbound.finish()
-                while outbound.tryNext() != nil {}
-                await transport.close(.abort)
+                await abandonWrites(transport)
                 return
             }
+            if frame.capacity > 256 * 1024 { frame = ByteBuffer(capacity: 256) }
         }
+    }
+
+    /// The peer is gone: unblock the reader and drop the rest.
+    func abandonWrites<T: ByteStreamTransport>(_ transport: T) async {
+        outbound.finish()
+        while outbound.tryNext() != nil {}
+        await transport.close(.abort)
     }
 
     func closeTimer<T: ByteStreamTransport>(_ transport: T) async {

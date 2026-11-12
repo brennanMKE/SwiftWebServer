@@ -72,9 +72,10 @@ struct FrameReader {
     var header: WSFrameHeader?
     var sawEndOfStream = false
 
-    init(_ transport: InMemoryTransport, prefix: ByteBuffer = ByteBuffer()) {
+    init(_ transport: InMemoryTransport, prefix: ByteBuffer = ByteBuffer(), allowedReservedBits: UInt8 = 0) {
         self.transport = transport
         input = prefix
+        parser = WSFrameParser(configuration: .init(allowedReservedBits: allowedReservedBits, expectsMaskedFrames: false))
     }
 
     /// The next frame, or `nil` at end of stream.

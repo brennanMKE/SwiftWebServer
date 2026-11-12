@@ -13,6 +13,7 @@ func registerAllBenchmarks() {
     registerStaticFilesBenchmarks()   // M4.2: StaticFilesBench.swift
     registerCompressionBenchmarks()   // M6: CompressionBench.swift (#0091)
     registerRouterBenchmarks()   // M6: RouterBench.swift
+    registerWebSocketBenchmarks()   // M15: WebSocketBench.swift (#0110)
     registerSelfTimedSuites()
 }
 

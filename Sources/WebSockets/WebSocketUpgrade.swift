@@ -56,6 +56,9 @@ public struct WebSocketRequest: Sendable {
 ///   check it against your own origins to stop cross-site WebSocket hijacking).
 /// - ``subprotocol`` picks one of the offered subprotocols (or `nil` for none); a choice the
 ///   client did not offer is ignored.
+/// - With ``WebSocketConfiguration/compression`` set, a permessage-deflate offer in
+///   `Sec-WebSocket-Extensions` is accepted (RFC 7692, ``PerMessageDeflate``) and answered in
+///   the response's `Sec-WebSocket-Extensions`.
 /// - Requests on other paths go to the next handler untouched.
 ///
 /// The session itself only needs a ``ByteStreamTransport``, so the same handler can run
@@ -110,27 +113,45 @@ public struct WebSocketUpgrade: HTTPMiddleware {
             pick(info).flatMap { info.offeredSubprotocols.contains($0) ? $0 : nil }
         }
 
+        let agreement = negotiateCompression(request)
+
         var headers = HTTPFields()
         headers.append(.upgrade, "websocket")
         headers.append(.connection, "Upgrade")
         headers.append(.secWebSocketAccept, string: accept)
         if let chosen { headers.append(.secWebSocketProtocol, string: chosen) }
+        if let agreement { headers.append(.secWebSocketExtensions, string: agreement.responseValue) }
         let configuration = configuration
         let handler = handler
+        let compression = agreement?.parameters
         return HTTPResponse(status: .switchingProtocols, headers: headers, body: .tunnel { transport, tunnel in
-            await Self.serve(transport, subprotocol: chosen, configuration: configuration,
+            await Self.serve(transport, subprotocol: chosen, configuration: configuration, compression: compression,
                              shutdown: tunnel.shutdown) { socket in
                 try await handler(socket, info)
             }
         })
     }
 
+    /// The permessage-deflate agreement for `request`'s `Sec-WebSocket-Extensions` offers, when
+    /// ``WebSocketConfiguration/compression`` enables the extension.
+    func negotiateCompression(_ request: HTTPRequest) -> PerMessageDeflate.Agreement? {
+        guard let compression = configuration.compression else { return nil }
+        var offers = ""
+        for value in request.headers.values(for: .secWebSocketExtensions) {
+            if !offers.isEmpty { offers += "," }
+            offers += request.string(of: value)
+        }
+        guard !offers.isEmpty else { return nil }
+        return PerMessageDeflate.negotiate(offers: offers, configuration: compression)
+    }
+
     /// Opens the existential so the session is specialized on the transport type.
     static func serve<T: ByteStreamTransport>(
-        _ transport: T, subprotocol: String?, configuration: WebSocketConfiguration, shutdown: ShutdownSignal,
+        _ transport: T, subprotocol: String?, configuration: WebSocketConfiguration,
+        compression: PerMessageDeflate.Parameters?, shutdown: ShutdownSignal,
         handler: @escaping @Sendable (WebSocket) async throws -> Void
     ) async {
         await WebSocket.run(over: transport, subprotocol: subprotocol, configuration: configuration,
-                            shutdown: shutdown, handler: handler)
+                            compression: compression, shutdown: shutdown, handler: handler)
     }
 }
