@@ -17,6 +17,12 @@
     "linger": 2
   },
   "drainTimeout": 10,
+  "http2": {
+    "enabled": true,
+    "cleartext": false,
+    "maxConcurrentStreams": 100,
+    "initialWindowSize": 65535
+  },
   "transport": "bsd",
   "defaultMimeType": "application/octet-stream",
   "mimeTypes": {},

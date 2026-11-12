@@ -268,6 +268,65 @@ import Testing
         if let key { #expect(failure?.description.contains("\"\(key)\"") == true, "\(failure?.description ?? "")") }
     }
 
+    // MARK: HTTP/2 (#0119)
+
+    @Test func http2IsOnForTLSWithCleartextOffByDefault() throws {
+        let http2 = try #require(try parse("{}").settings.http2)
+        #expect(http2 == ServerSettings.HTTP2Settings())
+        #expect(!http2.cleartext)
+        #expect(http2.maxConcurrentStreams == 100)
+        #expect(http2.initialWindowSize == 65_535)
+        #expect(http2.maxRequestBodySize == nil)
+        #expect(http2.abuseLimits == ServerSettings.AbuseLimitOverrides())
+    }
+
+    @Test func http2KeysApply() throws {
+        #expect(try parse(#"{"http2": false}"#).settings.http2 == nil)
+        #expect(try parse(#"{"http2": null}"#).settings.http2 == nil)
+        #expect(try parse(#"{"http2": {"enabled": false, "cleartext": true}}"#).settings.http2 == nil)
+        #expect(try parse(#"{"http2": true}"#).settings.http2 == ServerSettings.HTTP2Settings())
+        let file = try parse(#"""
+            {"http2": {"cleartext": true, "maxConcurrentStreams": 250, "initialWindowSize": 1048576,
+             "maxRequestBodySize": 4096, "colour": 1,
+             "abuseLimits": {"window": 5, "maxResetStreamsPerWindow": 50, "maxControlFramesPerWindow": null,
+                             "smallDataFrameSize": 128, "windowStallTimeout": null, "maxStreamsPerConnection": 10}}}
+            """#)
+        let http2 = try #require(file.settings.http2)
+        #expect(http2.cleartext)
+        #expect(http2.maxConcurrentStreams == 250)
+        #expect(http2.initialWindowSize == 1_048_576)
+        #expect(http2.maxRequestBodySize == 4096)
+        #expect(http2.abuseLimits.window == .seconds(5))
+        #expect(http2.abuseLimits.maxResetStreamsPerWindow == .some(50))
+        #expect(http2.abuseLimits.maxControlFramesPerWindow == .some(nil), "null turns the limit off")
+        #expect(http2.abuseLimits.maxEmptyFramesPerWindow == nil, "unset keeps the default")
+        #expect(http2.abuseLimits.smallDataFrameSize == 128)
+        #expect(http2.abuseLimits.windowStallTimeout == .some(nil))
+        #expect(http2.abuseLimits.maxStreamsPerConnection == .some(10))
+        #expect(file.warnings == ["config file test.json: unknown key \"http2.colour\" ignored"])
+    }
+
+    @Test(arguments: [
+        (#"{"http2": 1}"#, "http2"),
+        (#"{"http2": "on"}"#, "http2"),
+        (#"{"http2": {"enabled": "yes"}}"#, "http2.enabled"),
+        (#"{"http2": {"cleartext": 1}}"#, "http2.cleartext"),
+        (#"{"http2": {"maxConcurrentStreams": -1}}"#, "http2.maxConcurrentStreams"),
+        (#"{"http2": {"maxConcurrentStreams": 65537}}"#, "http2.maxConcurrentStreams"),
+        (#"{"http2": {"initialWindowSize": 2147483648}}"#, "http2.initialWindowSize"),
+        (#"{"http2": {"maxRequestBodySize": "1M"}}"#, "http2.maxRequestBodySize"),
+        (#"{"http2": {"abuseLimits": []}}"#, "http2.abuseLimits"),
+        (#"{"http2": {"abuseLimits": {"window": 0}}}"#, "http2.abuseLimits.window"),
+        (#"{"http2": {"abuseLimits": {"maxResetStreamsPerWindow": -5}}}"#, "http2.abuseLimits.maxResetStreamsPerWindow"),
+        (#"{"http2": {"abuseLimits": {"maxStreamsPerConnection": 0}}}"#, "http2.abuseLimits.maxStreamsPerConnection"),
+        (#"{"http2": {"abuseLimits": {"windowStallTimeout": "30s"}}}"#, "http2.abuseLimits.windowStallTimeout"),
+    ] as [(String, String?)])
+    func http2ErrorsNameTheKey(json: String, key: String?) {
+        let failure = error(json)
+        #expect(failure?.key == key, "\(json): \(failure?.description ?? "no error")")
+        if let key { #expect(failure?.description.contains("\"\(key)\"") == true, "\(failure?.description ?? "")") }
+    }
+
     /// Whole-settings checks run after command-line overrides.
     @Test func validateChecksHTTP3NeedsTLSAndDistinctTCPPorts() throws {
         var settings = ServerSettings()

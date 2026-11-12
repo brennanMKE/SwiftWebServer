@@ -188,6 +188,8 @@ struct Parser {
                 settings.tls = try tls(value, key)
             case "http3":
                 settings.http3 = try http3(value, key)
+            case "http2":
+                settings.http2 = try http2(value, key)
             case "compression":
                 settings.compression = try compression(value, key)
             case "enableCompression":
@@ -294,6 +296,72 @@ struct Parser {
             }
         }
         return enabled ? settings : nil
+    }
+
+    /// `"http2": {"enabled": true, "cleartext": false, "maxConcurrentStreams": 100,
+    /// "initialWindowSize": 65535, "maxRequestBodySize": 10485760, "abuseLimits": {…}}`; `true`
+    /// alone is the defaults; `false`, `null` or `"enabled": false` serves HTTP/1.1 only (#0119).
+    mutating func http2(_ value: Any, _ key: String) throws(ConfigFileError) -> ServerSettings.HTTP2Settings? {
+        if value is NSNull { return nil }
+        if Self.isBool(value) { return try bool(value, key) ? ServerSettings.HTTP2Settings() : nil }
+        let object = try dictionary(value, key, expectation: "must be true, false or an object")
+        var enabled = true
+        var result = ServerSettings.HTTP2Settings()
+        for name in object.keys.sorted() {
+            let path = "\(key).\(name)"
+            let element = object[name]!
+            switch name {
+            case "enabled":
+                enabled = try bool(element, path)
+            case "cleartext":
+                result.cleartext = try bool(element, path)
+            case "maxConcurrentStreams":
+                result.maxConcurrentStreams = try integer(element, path, in: 0...ServerSettings.HTTP2Settings.maxSupportedConcurrentStreams)
+            case "initialWindowSize":
+                result.initialWindowSize = try integer(element, path, in: 0...ServerSettings.HTTP2Settings.maxWindowSize)
+            case "maxRequestBodySize":
+                result.maxRequestBodySize = element is NSNull ? nil : try integer(element, path, in: 0...Int.max)
+            case "abuseLimits":
+                result.abuseLimits = try abuseLimits(element, path)
+            default:
+                warn("unknown key \"\(path)\" ignored")
+            }
+        }
+        return enabled ? result : nil
+    }
+
+    /// `http2.abuseLimits`: counts are integers (`null` turns a limit off), times are seconds.
+    mutating func abuseLimits(_ value: Any, _ key: String) throws(ConfigFileError) -> ServerSettings.AbuseLimitOverrides {
+        let object = try dictionary(value, key)
+        var result = ServerSettings.AbuseLimitOverrides()
+        let maxCount = Int(Int32.max)
+        for name in object.keys.sorted() {
+            let path = "\(key).\(name)"
+            let element = object[name]!
+            func count(minimum: Int = 0) throws(ConfigFileError) -> Int? {
+                element is NSNull ? nil : try integer(element, path, in: minimum...maxCount)
+            }
+            switch name {
+            case "window":
+                guard let window = try seconds(element, path), window > .zero else {
+                    throw fail(path, "must be a positive number of seconds")
+                }
+                result.window = window
+            case "maxResetStreamsPerWindow": result.maxResetStreamsPerWindow = .some(try count())
+            case "maxControlFramesPerWindow": result.maxControlFramesPerWindow = .some(try count())
+            case "maxEmptyFramesPerWindow": result.maxEmptyFramesPerWindow = .some(try count())
+            case "maxWindowUpdatesPerWindow": result.maxWindowUpdatesPerWindow = .some(try count())
+            case "maxSmallDataFramesPerWindow": result.maxSmallDataFramesPerWindow = .some(try count())
+            case "maxStreamsPerConnection": result.maxStreamsPerConnection = .some(try count(minimum: 1))
+            case "smallDataFrameSize":
+                result.smallDataFrameSize = try integer(element, path, in: 0...maxCount)
+            case "windowStallTimeout":
+                result.windowStallTimeout = .some(try seconds(element, path))
+            default:
+                warn("unknown key \"\(path)\" ignored")
+            }
+        }
+        return result
     }
 
     /// `"compression": {"enabled": true, "encodings": ["br", "gzip", "deflate"], "minimumSize": 1024,

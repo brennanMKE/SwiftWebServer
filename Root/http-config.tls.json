@@ -7,6 +7,12 @@
     "password": "sws-test-password",
     "port": 8443
   },
+  "http2": {
+    "enabled": true,
+    "cleartext": false,
+    "maxConcurrentStreams": 100,
+    "initialWindowSize": 65535
+  },
   "http3": {
     "enabled": true,
     "altSvcMaxAge": 86400
