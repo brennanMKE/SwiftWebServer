@@ -24,24 +24,9 @@ public struct ReverseProxy: HTTPMiddleware {
         guard let match = match(path: decoded, host: clientHost) else {
             return try await next.handle(request, context: context)
         }
-        let mount = match.mount
-        guard let target = mount.config.upstreams.first else {
-            return HTTPResponse(status: .badGateway)
-        }
-        let upstreamRequest = makeUpstreamRequest(request, decodedPath: decoded, mount: mount,
-                                                  target: target, clientHost: clientHost, context: context)
-        let response: UpstreamResponse
-        do {
-            response = try await client.send(upstreamRequest, body: request.body, to: target)
-        } catch let error as UpstreamError {
-            return HTTPResponse(status: error == .timeout ? .gatewayTimeout : .badGateway)
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            return HTTPResponse(status: .badGateway)
-        }
-        return mapResponse(response, mount: mount, target: target, clientHost: clientHost,
-                           secure: context.connection.isSecure)
+        // #0122: upstream choice, timeouts, retries and health are in ReverseProxy+Forwarding.
+        return try await forward(request, decodedPath: decoded, mount: match.mount,
+                                 clientHost: clientHost, context: context)
     }
 
     // MARK: Matching
@@ -122,9 +107,12 @@ struct CompiledMount: Sendable {
     /// The mount path without a trailing slash; empty for "/".
     let prefix: String
     let hosts: [String]
+    /// Round-robin choice and health of `config.upstreams` (#0122).
+    let balancer: UpstreamBalancer
 
     init(_ config: ProxyMount) {
         self.config = config
+        self.balancer = UpstreamBalancer(count: config.upstreams.count, policy: config.policy.health)
         var prefix = config.path
         while prefix.hasSuffix("/") { prefix.removeLast() }
         if !prefix.isEmpty, !prefix.hasPrefix("/") { prefix = "/" + prefix }

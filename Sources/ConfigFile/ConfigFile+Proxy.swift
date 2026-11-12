@@ -7,15 +7,19 @@ public import Proxy
 extension ServerSettings {
     /// One mount of the `proxy` key: the ``ProxyMount`` fields plus settings stored for later.
     public struct ProxySettings: Sendable, Equatable {
-        /// Upstream timeouts, stored for the upstream client (#0120). `nil` uses its default.
+        /// Upstream timeouts (#0122). `nil` uses the ``UpstreamTimeouts`` default (no limit for
+        /// `total`).
         public struct Timeouts: Sendable, Equatable {
             public var connect: Duration?
             public var response: Duration?
             public var idle: Duration?
-            public init(connect: Duration? = nil, response: Duration? = nil, idle: Duration? = nil) {
+            public var total: Duration?
+            public init(connect: Duration? = nil, response: Duration? = nil, idle: Duration? = nil,
+                        total: Duration? = nil) {
                 self.connect = connect
                 self.response = response
                 self.idle = idle
+                self.total = total
             }
         }
 
@@ -28,14 +32,30 @@ extension ServerSettings {
         public var rewriteLocation = true
         public var websocket = false
         public var timeouts = Timeouts()
+        /// Extra attempts after a connect failure, idempotent methods only (#0122).
+        public var retries = 1
+        /// Passive and active upstream health (#0122).
+        public var health = UpstreamHealthPolicy()
 
         public init() {}
 
+        /// Timeouts, retries and health for the `ReverseProxy` component.
+        public var policy: UpstreamPolicy {
+            let defaults = UpstreamTimeouts()
+            let limits = UpstreamTimeouts(connect: timeouts.connect ?? defaults.connect,
+                                          response: timeouts.response ?? defaults.response,
+                                          idle: timeouts.idle ?? defaults.idle,
+                                          total: timeouts.total)
+            return UpstreamPolicy(timeouts: limits, retries: retries, health: health)
+        }
+
         /// The mount for the `ReverseProxy` component.
         public var mount: ProxyMount {
-            ProxyMount(path: path, hosts: hosts, upstreams: upstreams, stripPrefix: stripPrefix,
-                       preserveHost: preserveHost, forwardedHeaders: forwardedHeaders,
-                       rewriteLocation: rewriteLocation, websocket: websocket)
+            var mount = ProxyMount(path: path, hosts: hosts, upstreams: upstreams, stripPrefix: stripPrefix,
+                                   preserveHost: preserveHost, forwardedHeaders: forwardedHeaders,
+                                   rewriteLocation: rewriteLocation, websocket: websocket)
+            mount.policy = policy
+            return mount
         }
     }
 
@@ -46,8 +66,9 @@ extension ServerSettings {
 extension Parser {
     /// `"proxy": [{"path": "/api", "upstream": "http://127.0.0.1:9000", "stripPrefix": false,
     /// "preserveHost": false, "forwardedHeaders": "x-forwarded", "rewriteLocation": true,
-    /// "websocket": false, "timeouts": {"connect": 2, "response": 30, "idle": 60}}]`; a single
-    /// object is accepted too.
+    /// "websocket": false, "timeouts": {"connect": 2, "response": 30, "idle": 60, "total": 120},
+    /// "retries": 1, "health": {"failures": 3, "cooldown": 10, "path": "/health", "interval": 10}}]`;
+    /// a single object is accepted too.
     mutating func proxy(_ value: Any, _ key: String) throws(ConfigFileError) -> [ServerSettings.ProxySettings] {
         let elements: [Any]
         if let array = value as? [Any] { elements = array } else { elements = [try dictionary(value, key, expectation: "must be an object or an array of objects")] }
@@ -107,9 +128,12 @@ extension Parser {
                         case "connect": mount.timeouts.connect = seconds
                         case "response": mount.timeouts.response = seconds
                         case "idle": mount.timeouts.idle = seconds
+                        case "total": mount.timeouts.total = seconds
                         default: warn("unknown key \"\(timeoutField)\" ignored")
                         }
                     }
+                case "retries": mount.retries = try integer(item, field, in: 0...10)
+                case "health": mount.health = try health(item, field)
                 default:
                     warn("unknown key \"\(field)\" ignored")
                 }
@@ -125,6 +149,32 @@ extension Parser {
             result.append(mount)
         }
         return result
+    }
+
+    /// `{"failures": 3, "cooldown": 10, "path": "/health", "interval": 10}` (#0122): passive
+    /// tracking marks an upstream down for `cooldown` seconds after `failures` consecutive
+    /// failures (`0` turns it off); with `path`, an active `GET` every `interval` seconds.
+    mutating func health(_ value: Any, _ key: String) throws(ConfigFileError) -> UpstreamHealthPolicy {
+        let object = try dictionary(value, key)
+        var policy = UpstreamHealthPolicy()
+        for name in object.keys.sorted() {
+            let field = "\(key).\(name)"
+            let item = object[name]!
+            switch name {
+            case "failures": policy.maxFailures = try integer(item, field, in: 0...1000)
+            case "cooldown":
+                policy.cooldown = try seconds(item, field, zeroMeansOff: false) ?? .zero
+            case "path":
+                let path = try string(item, field)
+                guard path.hasPrefix("/") else { throw fail(field, "must start with \"/\"") }
+                policy.checkPath = path
+            case "interval":
+                guard let interval = try seconds(item, field) else { throw fail(field, "must be a positive number of seconds") }
+                policy.checkInterval = interval
+            default: warn("unknown key \"\(field)\" ignored")
+            }
+        }
+        return policy
     }
 
     /// `http://HOST:PORT[/base]` or `unix:/path/to.sock`.

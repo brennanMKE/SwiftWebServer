@@ -11,12 +11,25 @@ final class UpstreamConnection: @unchecked Sendable {
 
     init(transport: BSDSocketTransport) { self.transport = transport }
 
-    /// Reads more bytes into `pending`. Returns false at end of stream.
-    func fill() async throws -> Bool {
+    /// Reads more bytes into `pending`. Returns false at end of stream. Throws
+    /// `UpstreamError.timeout` when nothing arrives within `limit` (#0122); the cancelled
+    /// receive closes the transport.
+    func fill(limit: Duration? = nil) async throws -> Bool {
         if eof { return false }
-        var buffer = ByteBuffer(capacity: 16 * 1024)
-        let n = try await transport.receive(into: &buffer, maxLength: 16 * 1024)
-        if n == 0 { eof = true; return false }
+        let buffer: ByteBuffer
+        if let limit {
+            let transport = transport
+            buffer = try await withUpstreamTimeout(limit) {
+                var b = ByteBuffer(capacity: 16 * 1024)
+                _ = try await transport.receive(into: &b, maxLength: 16 * 1024)
+                return b
+            }
+        } else {
+            var b = ByteBuffer(capacity: 16 * 1024)
+            _ = try await transport.receive(into: &b, maxLength: 16 * 1024)
+            buffer = b
+        }
+        if buffer.readableBytes == 0 { eof = true; return false }
         buffer.withUnsafeReadableBytes { pending.append(contentsOf: $0) }
         return true
     }
@@ -39,9 +52,18 @@ public final class UpstreamHTTP1Client: UpstreamClient {
     public let configuration: Configuration
     private let idle = Mutex<[UpstreamAddress: [UpstreamConnection]]>([:])
     private let opened = Atomic<Int>(0)
+    /// Test seam: runs before every connect (loopback cannot black-hole a SYN on macOS, so
+    /// tests delay here to exercise the connect timeout).
+    let beforeConnect: (@Sendable () async throws -> Void)?
 
     public init(configuration: Configuration = Configuration()) {
         self.configuration = configuration
+        self.beforeConnect = nil
+    }
+
+    init(configuration: Configuration = Configuration(), beforeConnect: @escaping @Sendable () async throws -> Void) {
+        self.configuration = configuration
+        self.beforeConnect = beforeConnect
     }
 
     /// Number of connections this client has opened (for tests and metrics).
@@ -85,8 +107,16 @@ public final class UpstreamHTTP1Client: UpstreamClient {
         if !accepted { await connection.close() }
     }
 
+    private func connect(_ address: UpstreamAddress, limit: Duration?) async throws -> UpstreamConnection {
+        guard let limit else { return try await connect(address) }
+        return try await withUpstreamTimeout(limit, error: .connectTimeout, discard: { await $0.close() }) {
+            try await self.connect(address)
+        }
+    }
+
     private func connect(_ address: UpstreamAddress) async throws -> UpstreamConnection {
         do {
+            try await beforeConnect?()
             switch address {
             case .tcp(let host, let port):
                 let t = try await BSDSocketTransport.connect(host: host, port: port)
@@ -108,9 +138,8 @@ public final class UpstreamHTTP1Client: UpstreamClient {
 
     static func serializeHead(_ request: UpstreamRequest, target: UpstreamTarget, framing: UpstreamBodyFraming) -> ByteBuffer {
         var buffer = ByteBuffer(capacity: 512)
-        var path = target.basePath
-        if path.hasSuffix("/"), request.target.hasPrefix("/") { path.removeLast() }
-        path += request.target
+        // `request.target` is final: the proxy already prepended `target.basePath` (#0122).
+        let path = request.target
         buffer.append(contentsOf: "\(request.method) \(path) HTTP/1.1\r\nhost: \(request.host)\r\n".utf8)
         let h = request.headers
         for i in 0..<h.count {
@@ -131,25 +160,38 @@ public final class UpstreamHTTP1Client: UpstreamClient {
     }
 
     public func send(_ request: UpstreamRequest, body: HTTPRequestBody, to target: UpstreamTarget) async throws -> UpstreamResponse {
-        // A pooled connection may have been closed by the upstream; retry once on a fresh one
-        // only when nothing of the request body has been consumed (bodiless requests).
-        if !body.isEmpty || body.knownLength.map({ $0 > 0 }) == true {
-            let connection: UpstreamConnection
-            if let pooled = checkout(target.address) { connection = pooled } else { connection = try await connect(target.address) }
-            return try await exchange(request, body: body, target: target, connection: connection)
-        }
-        if let pooled = checkout(target.address) {
-            do {
-                return try await exchange(request, body: body, target: target, connection: pooled)
-            } catch UpstreamError.closedEarly {
-                // Stale keep-alive connection; fall through to a fresh one.
-            }
-        }
-        return try await exchange(request, body: body, target: target, connection: connect(target.address))
+        try await send(request, body: body, to: target, options: UpstreamSendOptions())
     }
 
+    public func send(_ request: UpstreamRequest, body: HTTPRequestBody, to target: UpstreamTarget,
+                     options: UpstreamSendOptions) async throws -> UpstreamResponse {
+        let timeouts = options.timeouts
+        let deadline = options.deadline ?? timeouts.total.map { ContinuousClock.now + $0 }
+        // A pooled connection may have been closed by the upstream. Resend once on a fresh one
+        // only for an idempotent method with no request body, and only when the pooled
+        // connection failed before a single response byte arrived (#0122).
+        let bodiless = body.isEmpty || body.knownLength == 0
+        let mayRetry = options.retriesStaleConnection && request.method.isIdempotent && bodiless
+        if let pooled = checkout(target.address) {
+            do {
+                return try await exchange(request, body: body, target: target, connection: pooled,
+                                          timeouts: timeouts, deadline: deadline, pooled: true)
+            } catch is StaleConnection {
+                guard mayRetry else { throw UpstreamError.closedEarly }
+            }
+        }
+        let limit = try UpstreamTimeouts.limit(timeouts.connect, deadline: deadline, error: .connectTimeout)
+        let fresh = try await connect(target.address, limit: limit)
+        return try await exchange(request, body: body, target: target, connection: fresh,
+                                  timeouts: timeouts, deadline: deadline, pooled: false)
+    }
+
+    /// A pooled connection failed before any response byte arrived.
+    struct StaleConnection: Error {}
+
     private func exchange(_ request: UpstreamRequest, body: HTTPRequestBody, target: UpstreamTarget,
-                          connection: UpstreamConnection) async throws -> UpstreamResponse {
+                          connection: UpstreamConnection, timeouts: UpstreamTimeouts,
+                          deadline: ContinuousClock.Instant?, pooled: Bool) async throws -> UpstreamResponse {
         let framing: UpstreamBodyFraming
         if let n = body.knownLength {
             framing = n == 0 ? .none : .length(n)
@@ -177,9 +219,12 @@ public final class UpstreamHTTP1Client: UpstreamClient {
                     try await connection.transport.send(ByteBuffer("0\r\n\r\n"), endOfStream: false)
                 }
             }
-            // Read the head, skipping interim 1xx responses.
+            // Read the head, skipping interim 1xx responses, within the response timeout
+            // (measured from the end of the request) and the total deadline.
+            let headDeadline = timeouts.response.map { ContinuousClock.now + $0 }
             let parser = UpstreamResponseParser(limits: configuration.parserLimits)
             var head: UpstreamResponseHead
+            var received = false
             while true {
                 if let (h, used) = try parser.parseHead(connection.pending, requestMethod: request.method) {
                     connection.pending.removeFirst(used)
@@ -187,20 +232,34 @@ public final class UpstreamHTTP1Client: UpstreamClient {
                     head = h
                     break
                 }
-                guard try await connection.fill() else { throw UpstreamError.closedEarly }
+                let limit = try UpstreamTimeouts.limit(
+                    UpstreamTimeouts.limit(nil, deadline: headDeadline), deadline: deadline)
+                guard try await connection.fill(limit: limit) else {
+                    if pooled && !received { throw StaleConnection() }
+                    throw UpstreamError.closedEarly
+                }
+                received = true
             }
-            return makeResponse(head, connection: connection, address: target.address)
+            return makeResponse(head, connection: connection, address: target.address,
+                                idle: timeouts.idle, deadline: deadline)
         } catch {
             await connection.close()
+            if error is StaleConnection { throw error }
             if let e = error as? UpstreamError { throw e }
             if error is CancellationError { throw UpstreamError.cancelled }
-            if error is TransportError { throw UpstreamError.closedEarly }
+            if error is TransportError {
+                // A reset or broken pipe on a reused connection before any response byte.
+                if pooled && connection.pending.isEmpty && !connection.eof { throw StaleConnection() }
+                throw UpstreamError.closedEarly
+            }
             throw error
         }
     }
 
-    private func makeResponse(_ head: UpstreamResponseHead, connection: UpstreamConnection, address: UpstreamAddress) -> UpstreamResponse {
-        let reader = BodyReader(framing: head.framing, connection: connection, reusable: !head.closeAfter) { [self] conn, reuse in
+    private func makeResponse(_ head: UpstreamResponseHead, connection: UpstreamConnection, address: UpstreamAddress,
+                              idle: Duration?, deadline: ContinuousClock.Instant?) -> UpstreamResponse {
+        let reader = BodyReader(framing: head.framing, connection: connection, reusable: !head.closeAfter,
+                                idle: idle, deadline: deadline) { [self] conn, reuse in
             if reuse { await self.checkin(conn, address) } else { await conn.close() }
         }
         let knownLength: Int? = switch head.framing {
@@ -228,9 +287,15 @@ actor BodyReader {
     private var connection: UpstreamConnection?
     private let reusable: Bool
     private let release: @Sendable (UpstreamConnection, Bool) async -> Void
+    /// Limit between two body reads, and the end of the whole exchange (#0122).
+    private let idle: Duration?
+    private let deadline: ContinuousClock.Instant?
 
     init(framing: UpstreamBodyFraming, connection: UpstreamConnection, reusable: Bool,
+         idle: Duration? = nil, deadline: ContinuousClock.Instant? = nil,
          release: @escaping @Sendable (UpstreamConnection, Bool) async -> Void) {
+        self.idle = idle
+        self.deadline = deadline
         switch framing {
         case .none: state = .done
         case .length(let n): state = .length(n)
@@ -259,7 +324,7 @@ actor BodyReader {
                     return nil
                 case .length(let remaining):
                     if c.pending.isEmpty {
-                        guard try await c.fill() else { throw UpstreamError.closedEarly }
+                        guard try await c.fill(limit: UpstreamTimeouts.limit(idle, deadline: deadline)) else { throw UpstreamError.closedEarly }
                     }
                     let take = min(remaining, c.pending.count)
                     let out = ByteBuffer(bytes: c.pending[0..<take])
@@ -269,14 +334,14 @@ actor BodyReader {
                     return out
                 case .close:
                     if c.pending.isEmpty {
-                        guard try await c.fill() else { await finish(reuse: false); return nil }
+                        guard try await c.fill(limit: UpstreamTimeouts.limit(idle, deadline: deadline)) else { await finish(reuse: false); return nil }
                     }
                     let out = ByteBuffer(bytes: c.pending)
                     c.pending.removeAll(keepingCapacity: true)
                     return out
                 case .chunked(var decoder):
                     if c.pending.isEmpty {
-                        guard try await c.fill() else { throw UpstreamError.closedEarly }
+                        guard try await c.fill(limit: UpstreamTimeouts.limit(idle, deadline: deadline)) else { throw UpstreamError.closedEarly }
                     }
                     let step = ByteBuffer(bytes: c.pending).withReadableSpan { decoder.decode($0) }
                     state = .chunked(decoder)
@@ -287,7 +352,7 @@ actor BodyReader {
                         if out.readableBytes > 0 { return out }
                     case .needMoreBytes:
                         c.pending.removeFirst(step.consumed)
-                        guard try await c.fill() else { throw UpstreamError.closedEarly }
+                        guard try await c.fill(limit: UpstreamTimeouts.limit(idle, deadline: deadline)) else { throw UpstreamError.closedEarly }
                     case .end:
                         c.pending.removeFirst(step.consumed)
                         state = .done
