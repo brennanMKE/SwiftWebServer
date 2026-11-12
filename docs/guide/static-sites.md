@@ -86,8 +86,11 @@ default (`<h1>404 Not Found</h1>`), or your own files:
   error JSON, for example) are never touched. The status and fields (such as `Allow` on `405`)
   are kept.
 - Error pages sit outside auth and the proxy, so a `401`, `502` or `504` gets a page too.
-- With `hosts`, error page files still resolve against the top-level `root`, so that
-  directory must exist.
+- With `hosts`, each site looks for the file in its own root first, then in the top-level
+  `root`, so every site can have its own `errors/404.html` and share the rest. A file in
+  neither stops startup. The top-level `root` need not exist when the sites have the files;
+  a response no site answers (`421` for an unknown host) uses the top-level file if there is
+  one, else the generated page.
 
 ## Compression
 
@@ -133,8 +136,9 @@ Several sites on one listener, chosen by `Host` (HTTP/1.1) or `:authority` (HTTP
 
 - A request for an unknown host goes to the `default` site, or gets `421 Misdirected Request`
   without one.
-- With `hosts`, the top-level `root` is not served; the other file keys (`index`, `mimeTypes`,
-  `blockList`, `caching`, `compression`, `errorPages`) apply to every site.
+- With `hosts`, the top-level `root` is not served and need not exist; the other file keys
+  (`index`, `mimeTypes`, `blockList`, `caching`, `compression`, `errorPages`) apply to every
+  site. `errorPages` files resolve per site (see [Error pages](#error-pages)).
 - With TLS, all names are served with the one identity in `tls.identity`, so use a certificate
   that covers every name (SAN or wildcard). There is no per-host certificate (SNI) selection.
 

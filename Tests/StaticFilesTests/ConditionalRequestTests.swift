@@ -392,6 +392,29 @@ private let later = "Tue, 14 Nov 2023 22:13:21 GMT"
         }
     }
 
+    /// #0129: several roots, first match wins; missing roots are skipped.
+    @Test func pagesFromSeveralRoots() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        try fixture.write("errors/404.html", "site 404")
+        try fixture.write("errors/404.html", "server 404", in: fixture.base)
+        try fixture.write("errors/500.html", "server 500", in: fixture.base)
+        let missingRoot = fixture.base.appending(path: "does-not-exist").path
+        let pages = try ErrorPages(roots: [missingRoot, fixture.root.path, fixture.base.path],
+                                   pages: [404: "errors/404.html", 500: "errors/500.html"])
+        #expect(try await run(pages, HTTPResponse(status: .notFound)).bodyText == "site 404")
+        #expect(try await run(pages, HTTPResponse(status: .internalServerError)).bodyText == "server 500")
+        #expect(throws: ErrorPages.InitError.pageUnavailable(status: 502, errno: ENOENT)) {
+            try ErrorPages(roots: [fixture.root.path, fixture.base.path], pages: [502: "errors/502.html"])
+        }
+        // requireAll: false leaves a status without a file to the generated page.
+        let lenient = try ErrorPages(roots: [fixture.root.path], pages: [500: "errors/500.html"], requireAll: false)
+        #expect(try await run(lenient, HTTPResponse(status: .internalServerError)).bodyText.contains("500 Internal Server Error"))
+        #expect(throws: ErrorPages.InitError.rootUnavailable(errno: ENOENT)) {
+            try ErrorPages(roots: [missingRoot], pages: [404: "errors/404.html"])
+        }
+    }
+
     /// StaticFiles behind ErrorPages: refusals get pages, files and 304s do not.
     @Test func withStaticFiles() async throws {
         let fixture = try Fixture()

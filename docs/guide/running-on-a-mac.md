@@ -83,7 +83,7 @@ server-sent events.
 | `blockList` | array of strings | `["http-config.json", ".git", ".DS_Store"]` | Path components answered `403` anywhere in the path, case-insensitively |
 | `blockDotfiles` | bool | `true` | `403` for any component starting with `.`, except `.well-known` |
 | `caching` | bool or object | `{"enabled": true, "maxAge": 3600}` | `Cache-Control: public, max-age=N` on files and `304`s; `false` or `"enabled": false` sends none |
-| `errorPages` | bool or object | `true` | `true`: generated HTML pages for bodiless `4xx`/`5xx`; `false`: none; `{"404": "errors/404.html"}`: files relative to `root` (other statuses keep the generated page) |
+| `errorPages` | bool or object | `true` | `true`: generated HTML pages for bodiless `4xx`/`5xx`; `false`: none; `{"404": "errors/404.html"}`: files relative to `root` (other statuses keep the generated page); with `hosts`, each site's root first, then `root` |
 | `compression` | bool or object | off | See [Compression](#compression) |
 | `enableETags` | – | – | Legacy, no effect (ETags are always sent); accepted with a warning |
 | `enableCompression` | bool | – | Legacy; `true` is `"compression": true` (ignored when `compression` is set) |
