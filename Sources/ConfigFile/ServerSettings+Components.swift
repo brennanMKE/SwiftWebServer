@@ -7,6 +7,7 @@ public import HTTP1
 public import HTTPCore
 public import HTTPServer
 public import StaticFiles
+import Compression
 
 // Settings to the server's configuration values and middleware chain (docs/ROADMAP.md §5.2).
 // Components are registered with the middleware builder only when enabled, so a disabled
@@ -35,6 +36,13 @@ extension ServerSettings {
         configuration.defaultMIMEType = defaultMimeType
         configuration.mimeTypes = mimeTypes
         configuration.maxAge = maxAge
+        if let compression, compression.precompress || compression.sidecars {
+            var precompression = compression.configuration
+            // Sidecars only: nothing is compressed by the cache itself.
+            if !compression.precompress { precompression.minimumSize = .max }
+            configuration.compression = precompression
+            configuration.precompressedSidecars = compression.sidecars
+        }
         return configuration
     }
 
@@ -71,7 +79,10 @@ extension ServerSettings {
         // `StaticFiles` is both a handler and a middleware; as the last element it must be the
         // handler, so it goes in as an opaque `some HTTPHandler`.
         let terminal = Self.handler(files)
+        // #0091: outermost, so generated error pages are compressed too.
+        let compressor = compression.map { Compression(configuration: $0.configuration) }
         return MiddlewareBuilder.build {
+            if let compressor { compressor }
             if let pages { pages }
             terminal
         }

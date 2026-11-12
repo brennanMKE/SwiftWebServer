@@ -3,6 +3,7 @@ import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #endif
+import Compression
 public import HTTPCore
 
 /// Serves files under a root directory (#0084, docs/ROADMAP.md §5.2).
@@ -24,6 +25,10 @@ public import HTTPCore
 ///   `If-Unmodified-Since`, `If-None-Match`, `If-Modified-Since`, then `If-Range`. A `304`
 ///   carries `ETag`, `Last-Modified` and `Cache-Control` and no body; a failed `If-Match` or
 ///   `If-Unmodified-Since` answers `412`. Dates compare in whole seconds (#0017).
+/// - With ``StaticFilesConfiguration/compression`` (#0091), `br` and `gzip` variants are
+///   rendered once per cached file (or read from `.br`/`.gz` sidecars) and chosen per request
+///   from `Accept-Encoding`; preconditions are then evaluated against the variant's suffixed
+///   `ETag`.
 ///
 /// ## Hot path
 ///
@@ -51,6 +56,7 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
         let customMIMETypes: [(ext: [UInt8], type: [UInt8])]
         let cacheControl: [UInt8]?
         let smallFileLimit: Int
+        let precompression: Precompression?
 
         init(resolver: PathResolver, configuration: StaticFilesConfiguration) {
             self.resolver = resolver
@@ -62,6 +68,9 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
             customMIMETypes = configuration.mimeTypes.map { (Array($0.key.utf8).map(ASCII.lowercased), Array($0.value.utf8)) }
             cacheControl = configuration.effectiveCacheControl.map { Array($0.utf8) }
             smallFileLimit = configuration.smallFileLimit
+            precompression = configuration.compression.map {
+                Precompression($0, sidecars: configuration.precompressedSidecars)
+            }
         }
     }
 
@@ -109,6 +118,21 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
         case .file(let file): entry = file
         case .response(let response): return response
         case .notFound: return nil
+        }
+        // Precompressed variants (#0091): negotiated per request, rendered once; equal weights
+        // get the smallest variant. A Range request is answered from the unencoded file.
+        if !entry.variants.isEmpty, request.headers.contains(.acceptEncoding),
+           !(isGet && request.headers.contains(.range)),
+           let variant = entry.selectVariant(AcceptEncoding.weights(request.headers)) {
+            if ConditionalRequest.hasPreconditions(request.headers) {
+                switch ConditionalRequest.evaluate(method: request.method, fields: request.headers,
+                                                   etag: variant.etag, lastModified: entry.lastModifiedSeconds) {
+                case .proceed: break
+                case .notModified: return variant.notModified
+                case .preconditionFailed: return Self.preconditionFailed
+                }
+            }
+            return variant.response
         }
         if ConditionalRequest.hasPreconditions(request.headers) {
             switch ConditionalRequest.evaluate(method: request.method, fields: request.headers,
@@ -178,7 +202,8 @@ public struct StaticFiles: HTTPHandler, HTTPMiddleware {
             do {
                 let file = try contentType.withUnsafeBufferPointer { type throws(CachedFile.OpenError) in
                     try CachedFile(key: key, path: path, contentType: type.span,
-                                   cacheControl: core.cacheControl, smallFileLimit: core.smallFileLimit)
+                                   cacheControl: core.cacheControl, smallFileLimit: core.smallFileLimit,
+                                   precompression: core.precompression)
                 }
                 return .file(file)
             } catch .forbidden {
