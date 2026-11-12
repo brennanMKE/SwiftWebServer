@@ -82,6 +82,15 @@ final class TinyUpstream: Sendable {
             switch path {
             case "/chunked":
                 response = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n"
+            case "/close":
+                _ = try? await conn.send(ByteBuffer(bytes: Array("HTTP/1.1 200 OK\r\n\r\nuntil-eof".utf8)), endOfStream: true)
+                return
+            case "/truncated":
+                _ = try? await conn.send(ByteBuffer(bytes: Array("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc".utf8)), endOfStream: true)
+                return
+            case "/bad":
+                _ = try? await conn.send(ByteBuffer(bytes: Array("HTTP/1.1 2 OK\r\n\r\n".utf8)), endOfStream: true)
+                return
             case "/echo":
                 response = "HTTP/1.1 200 OK\r\ncontent-length: \(body.count)\r\n\r\n" + String(decoding: body, as: UTF8.self)
             default:
@@ -196,6 +205,29 @@ func collect(_ body: UpstreamResponseBody) async throws -> String {
         let r2 = try await client.send(request(.post, "/echo", port: upstream.port), body: body2, to: target)
         #expect(try await collect(r2.body) == "abcde")
         #expect(client.connectionsOpened == 1)
+        await client.shutdown()
+        await upstream.stop()
+    }
+}
+
+@Suite(.serialized) struct UpstreamHTTP1ClientFailureTests {
+    @Test(.timeLimit(.minutes(1))) func closeDelimitedTruncatedAndMalformed() async throws {
+        let upstream = try await TinyUpstream()
+        let client = UpstreamHTTP1Client()
+        let target = UpstreamTarget(address: .tcp(host: "127.0.0.1", port: upstream.port))
+        func req(_ p: String) -> UpstreamRequest {
+            UpstreamRequest(method: .get, target: p, host: "127.0.0.1", headers: HTTPFields())
+        }
+        let r = try await client.send(req("/close"), body: .empty, to: target)
+        #expect(try await collect(r.body) == "until-eof")
+        #expect(client.idleCount(for: target.address) == 0)
+
+        let t = try await client.send(req("/truncated"), body: .empty, to: target)
+        await #expect(throws: UpstreamError.closedEarly) { _ = try await collect(t.body) }
+        #expect(client.idleCount(for: target.address) == 0)
+
+        await #expect(throws: UpstreamError.self) { _ = try await client.send(req("/bad"), body: .empty, to: target) }
+        #expect(client.idleCount(for: target.address) == 0)
         await client.shutdown()
         await upstream.stop()
     }
