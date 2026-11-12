@@ -75,11 +75,23 @@ public enum UpstreamError: Error, Sendable, Equatable {
     case malformedResponse(String)
     case closedEarly
     case cancelled
+    /// The connect timeout passed before the connection was established (#0122): `504`.
+    case connectTimeout
 }
 
 /// Sends requests to upstreams. Implemented by the pooled HTTP/1.1 client (#0120).
 public protocol UpstreamClient: Sendable {
     func send(_ request: UpstreamRequest, body: HTTPRequestBody, to target: UpstreamTarget) async throws -> UpstreamResponse
+    /// Sends with per-mount timeouts and retry permission (#0122). The default ignores `options`.
+    func send(_ request: UpstreamRequest, body: HTTPRequestBody, to target: UpstreamTarget,
+              options: UpstreamSendOptions) async throws -> UpstreamResponse
+}
+
+extension UpstreamClient {
+    public func send(_ request: UpstreamRequest, body: HTTPRequestBody, to target: UpstreamTarget,
+                     options: UpstreamSendOptions) async throws -> UpstreamResponse {
+        try await send(request, body: body, to: target)
+    }
 }
 
 /// One proxied mount (#0121), as configured (#0124).
@@ -95,6 +107,8 @@ public struct ProxyMount: Sendable {
     public var forwardedHeaders: ForwardedHeaders
     public var rewriteLocation: Bool
     public var websocket: Bool
+    /// Timeouts, retries and upstream health (#0122).
+    public var policy: UpstreamPolicy = UpstreamPolicy()
     public init(path: String, hosts: [String] = [], upstreams: [UpstreamTarget],
                 stripPrefix: Bool = false, preserveHost: Bool = false,
                 forwardedHeaders: ForwardedHeaders = .xForwarded,
