@@ -275,6 +275,10 @@ extension InMemoryMultiplexedTransport {
 /// already have QUIC semantics (#0101).
 extension InMemoryMultiplexedTransport.Stream: ResettableStream {}
 
+/// ``InMemoryMultiplexedTransport/raiseMaxStreams(bidirectional:unidirectional:)`` is the
+/// stream-credit API HTTP/3 uses (#0102).
+extension InMemoryMultiplexedTransport: StreamCreditGranting {}
+
 extension InMemoryMultiplexedTransport {
     /// One endpoint of a QUIC-like stream: a ``ByteStreamTransport`` with an RFC 9000 stream ID.
     public final class Stream: ByteStreamTransport, StreamIdentified, Sendable {

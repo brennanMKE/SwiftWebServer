@@ -160,6 +160,27 @@ Pure Swift target `HPACK` with no Foundation:
 | Queued outbound control frames | 1,000 | Defends PING/SETTINGS floods |
 | Idle connection | `keepAliveTimeout` | Graceful `GOAWAY(NO_ERROR)` |
 
+### HTTP/3 default limits (#0102)
+
+`H3Configuration` and `H3Timeouts` in the `HTTP3` target. Every failure's code comes from the
+`H3Failure` table.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `maxConcurrentRequestStreams` | 100 | QUIC MAX_STREAMS raised to this and by one per finished request (`StreamCreditGranting`); beyond it `H3_REQUEST_REJECTED` |
+| `maxFieldSectionSize` (`SETTINGS_MAX_FIELD_SECTION_SIZE`) | 16,384 | `431` when the pseudo-header fields are valid, else `H3_MESSAGE_ERROR`; a response head over the peer's limit becomes a bare `500` |
+| `maxEncodedFieldSectionLength` | 65,536 | Largest HEADERS frame (the only frame buffered whole); connection error `H3_EXCESSIVE_LOAD` |
+| `maxRequestBodySize` | 10 MiB | `413` (declared length before the handler; undeclared when it grows past) |
+| `maxUnreadBodySize` | 64 KiB | Unread body discarded after the response; then STOP_SENDING `H3_NO_ERROR` |
+| `bodyQueueCapacity` | 4 chunks | Read-ahead between the stream and the handler |
+| `timeouts.header` | 10 s | No complete HEADERS: `H3_REQUEST_REJECTED` |
+| `timeouts.idle` | 30 s | No open request: GOAWAY, then CONNECTION_CLOSE `H3_NO_ERROR` |
+| `timeouts.body` | 30 s | Handler waits for body bytes: `408` |
+| `timeouts.unreadBody` | 2 s | Discarding unread body: STOP_SENDING `H3_NO_ERROR` |
+| `timeouts.drain` | off | After the final GOAWAY; off leaves it to the server's drain deadline |
+| `timeouts.goawayGrace` | off | When set, a first GOAWAY with 2^62-4, the final one after this |
+| `timeouts.closeLinger` | 1 s | After the drain, before CONNECTION_CLOSE (ends early when the peer closes) |
+
 ## Configuration additions
 
 ```json

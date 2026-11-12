@@ -6,8 +6,12 @@ import HeaderCompression
 public enum H3HeadError: Error, Sendable, Equatable {
     /// The message is malformed (RFC 9114 §4.1.2): stream error `H3_MESSAGE_ERROR`.
     case malformed(PseudoHeaderValidator.Violation)
-    /// The decoded field section exceeds `SETTINGS_MAX_FIELD_SECTION_SIZE`: answered `431`.
+    /// The decoded field section exceeds `SETTINGS_MAX_FIELD_SECTION_SIZE` after valid
+    /// pseudo-header fields: answered `431`.
     case fieldSectionTooLarge
+    /// The decoded field section exceeds `SETTINGS_MAX_FIELD_SECTION_SIZE` before its
+    /// pseudo-header fields made a valid request: stream error `H3_MESSAGE_ERROR`.
+    case unservableFieldSection(PseudoHeaderValidator.Violation)
     /// QPACK could not decode the section: connection error with this `QPACK_*` code.
     case qpack(QPACKError)
 
@@ -36,7 +40,12 @@ public enum H3RequestHeadDecoder {
             try decoder.decode(section, into: &sink)
         } catch {
             if let violation = sink.violation { throw .malformed(violation) }
-            if error.reason == .fieldSectionTooLarge { throw .fieldSectionTooLarge }
+            if error.reason == .fieldSectionTooLarge {
+                // `431` only for a request whose pseudo-header fields (which come first) were
+                // all decoded and valid; otherwise there is no request to answer (#0102).
+                if let violation = sink.validator.finish() { throw .unservableFieldSection(violation) }
+                throw .fieldSectionTooLarge
+            }
             throw .qpack(error)
         }
         if let violation = sink.violation ?? sink.validator.finish() { throw .malformed(violation) }
@@ -178,6 +187,9 @@ public struct H3ResponseHeadEncoder: Sendable {
     let qpack = QPACKEncoder()
     var section: [UInt8] = []
     var name: [UInt8] = []
+    /// The size of the last encoded field section as RFC 9114 §4.2.2 counts it (name + value
+    /// + 32 per field), to compare with the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE`.
+    public private(set) var fieldSectionSize = 0
 
     public init() {}
 
@@ -186,6 +198,7 @@ public struct H3ResponseHeadEncoder: Sendable {
         status: HTTPStatus, headers: HTTPFields, contentLength: Int?, into buffer: inout ByteBuffer
     ) {
         section.removeAll(keepingCapacity: true)
+        fieldSectionSize = 0
         qpack.encodePrefix(into: &section)
         var code: (UInt8, UInt8, UInt8) = (
             UInt8(ascii: "0") &+ UInt8(status.code / 100 % 10),
@@ -215,6 +228,7 @@ public struct H3ResponseHeadEncoder: Sendable {
                         for j in span.indices { name.append(ASCII.lowercased(span[j])) }
                     }
                 }
+                fieldSectionSize &+= name.count &+ field.valueView.length &+ 32
                 arena.withSpan(of: field.valueView) { value in
                     value.withUnsafeBytes { value in
                         name.withUnsafeBytes { name in
@@ -242,6 +256,7 @@ public struct H3ResponseHeadEncoder: Sendable {
     }
 
     mutating func encodeLiteral(_ name: StaticString, value: UnsafeRawBufferPointer) {
+        fieldSectionSize &+= name.utf8CodeUnitCount &+ value.count &+ 32
         name.withUTF8Buffer { name in
             qpack.encodeField(name: UnsafeRawBufferPointer(name), value: value, into: &section)
         }

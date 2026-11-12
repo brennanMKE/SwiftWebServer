@@ -171,7 +171,12 @@ struct H3RequestReader {
             _ = machine.handle(.requestHead(contentLength: contentLength))
             return .head(request)
         } catch {
-            machine.markFailed()
+            if error == .fieldSectionTooLarge {
+                // Answered `431`: the stream stays readable so the body can be drained.
+                _ = machine.handle(.requestHead(contentLength: nil))
+            } else {
+                machine.markFailed()
+            }
             return .headError(error)
         }
     }

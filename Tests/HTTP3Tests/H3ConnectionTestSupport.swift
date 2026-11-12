@@ -16,9 +16,10 @@ func withH3Server<H: HTTPHandler, R: Sendable>(
     handler: H,
     configuration: H3Configuration = H3Configuration(),
     shutdown: ShutdownSignal = ShutdownSignal(),
+    serverTransport: InMemoryMultiplexedTransport.Configuration = InMemoryMultiplexedTransport.Configuration(),
     _ body: (InMemoryMultiplexedTransport, InMemoryMultiplexedTransport) async throws -> R
 ) async throws -> R {
-    let (client, server) = InMemoryMultiplexedTransport.makePair()
+    let (client, server) = InMemoryMultiplexedTransport.makePair(server: serverTransport)
     return try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask {
             await HTTP3(configuration: configuration).run(
