@@ -38,7 +38,8 @@ not part of the executable yet.
   protocols) and a QUIC listener serving HTTP/3, by default on the TLS port number over UDP.
   The identity is a PKCS#12 file loaded in memory only. One connection limit and one graceful
   drain cover every listener; on SIGTERM HTTP/3 connections get `GOAWAY` and finish their
-  requests.
+  requests. HTTPS responses carry `Alt-Svc: h3=":PORT"; ma=SECONDS` so clients discover
+  HTTP/3; cleartext and HTTP/3 responses do not.
 
 ## Running
 

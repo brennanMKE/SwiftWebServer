@@ -88,6 +88,63 @@ import Testing
         #expect(try await child.waitForExit(timeout: .seconds(15)) == 0, "\(child.stderr)")
     }
 
+    /// The `alt-svc` header values in a `curl -i`/`-I` head.
+    func altSvc(_ output: String) -> [String] {
+        output.split(separator: "\r\n").filter { $0.lowercased().hasPrefix("alt-svc: ") }.map { String($0.dropFirst(9)) }
+    }
+
+    /// #0103: HTTPS responses advertise HTTP/3 on the UDP port with the configured max age;
+    /// cleartext and HTTP/3 responses do not. Homebrew curl with an alt-svc cache uses HTTP/1.1
+    /// first and HTTP/3 for the second request.
+    @Test(.timeLimit(.minutes(1)), .enabled(if: hasH3Curl))
+    func altSvcOnHTTPSOnlyAndCurlUpgradesToHTTP3() async throws {
+        let fixture = try ParityTests.Fixture(config: try Self.tlsConfig(http3: #"{"altSvcMaxAge": 600}"#))
+        let child = try ParityTests.launch(["--config", fixture.configPath, "--port", "0"])
+        defer { child.kill() }
+        let ports = try await Self.ports(child, expecting: 3)
+        let https = try #require(ports.https)
+        let h3 = try #require(ports.h3)
+
+        var output = try await curl(["-k", "-i", "https://127.0.0.1:\(https)/"])
+        #expect(altSvc(output.stdout) == ["h3=\":\(h3)\"; ma=600"], "\(output.stdout)")
+        output = try await curl(["-k", "-I", "https://127.0.0.1:\(https)/missing"])
+        #expect(altSvc(output.stdout) == ["h3=\":\(h3)\"; ma=600"], "error pages too: \(output.stdout)")
+        output = try await curl(["-i", "http://127.0.0.1:\(ports.http)/"])
+        #expect(output.stdout.hasPrefix("HTTP/1.1 200"), "\(output.stdout)")
+        #expect(altSvc(output.stdout).isEmpty, "never on cleartext")
+        output = try await curl(["-k", "-i", "--http3-only", "https://127.0.0.1:\(h3)/"], h3: true)
+        #expect(output.stdout.hasPrefix("HTTP/3 200"), "\(output.stdout)")
+        #expect(altSvc(output.stdout).isEmpty, "never on HTTP/3 itself")
+
+        // curl --alt-svc: the first request learns the alternative, the second uses it.
+        let cache = fixture.root.appending(path: "altsvc.txt").path
+        var versions: [String] = []
+        for _ in 0..<2 {
+            output = try await curl(["-k", "--alt-svc", cache, "-o", "/dev/null", "-w", "%{http_version}",
+                                     "https://127.0.0.1:\(https)/"], h3: true)
+            versions.append(output.stdout)
+        }
+        #expect(versions == ["1.1", "3"], "\(output.stderr)")
+
+        child.signal(SIGTERM)
+        #expect(try await child.waitForExit(timeout: .seconds(15)) == 0, "\(child.stderr)")
+    }
+
+    /// Without `http3` there is no `Alt-Svc`, even over TLS.
+    @Test(.timeLimit(.minutes(1)))
+    func noAltSvcWithoutHTTP3() async throws {
+        let fixture = try ParityTests.Fixture(config: try Self.tlsConfig(http3: nil))
+        let child = try ParityTests.launch(["--config", fixture.configPath, "--port", "0"])
+        defer { child.kill() }
+        let ports = try await Self.ports(child, expecting: 2)
+        #expect(ports.h3 == nil)
+        let output = try await curl(["-k", "-i", "https://127.0.0.1:\(try #require(ports.https))/"])
+        #expect(output.stdout.hasPrefix("HTTP/1.1 200"), "\(output.stdout)")
+        #expect(altSvc(output.stdout).isEmpty)
+        child.signal(SIGTERM)
+        #expect(try await child.waitForExit(timeout: .seconds(15)) == 0, "\(child.stderr)")
+    }
+
     /// `http3.port` set apart from the TLS port.
     @Test(.timeLimit(.minutes(1)), .enabled(if: hasH3Curl))
     func http3OnItsOwnPort() async throws {

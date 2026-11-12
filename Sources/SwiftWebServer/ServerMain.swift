@@ -144,6 +144,20 @@ enum ServerMain {
             }
             let listeners = try makeListeners(settings, environment: environment)
             printError("\(name): serving \(settings.resolvedRoot)")
+            #if HTTP3
+            if let http3 = settings.http3 {
+                // #0103: HTTPS responses advertise HTTP/3. Registered only with HTTP/3, so the
+                // chain has no Alt-Svc step otherwise; rendered once the UDP port is bound.
+                let altSvc = AltSvc(maxAge: http3.altSvcMaxAge)
+                let chain = MiddlewareBuilder.build {
+                    altSvc
+                    handler
+                }
+                return await serve(settings, listeners: listeners, handler: chain) { addresses, names in
+                    if let index = names.firstIndex(of: "h3") { altSvc.advertise(port: addresses[index].port) }
+                }
+            }
+            #endif
             return await serve(settings, listeners: listeners, handler: handler)
         } catch {
             printError("\(name): \(error)")
@@ -201,7 +215,12 @@ enum ServerMain {
         return listeners
     }
 
-    static func serve<H: HTTPHandler>(_ settings: ServerSettings, listeners: [ServerListener], handler: H) async -> Int32 {
+    /// Runs the server until a signal stops it. `onBound` runs once every listener is bound,
+    /// before the `listening` lines are printed, with the addresses and listener names.
+    static func serve<H: HTTPHandler>(
+        _ settings: ServerSettings, listeners: [ServerListener], handler: H,
+        onBound: @escaping @Sendable ([TransportAddress], [String]) -> Void = { _, _ in }
+    ) async -> Int32 {
         let server = Server(configuration: settings.serverConfiguration, listeners: listeners,
                             protocols: [HTTP1(configuration: settings.http1Configuration)],
                             handler: handler)
@@ -229,6 +248,7 @@ enum ServerMain {
                 group.addTask {
                     let addresses = try await server.waitUntilRunning()
                     let names = server.listenerStatistics.map(\.name)
+                    onBound(addresses, names)
                     for (index, address) in addresses.enumerated() {
                         // The cleartext line stays "listening HOST:PORT" (scripts parse it).
                         let suffix = index == 0 || index >= names.count ? "" : " (\(names[index]))"
