@@ -283,7 +283,7 @@ Bugs come first so the HTTP/2 work lands on a tested, stoppable server.
 - **Unit (Swift Testing):** HPACK vectors, frame round-trips, and table-driven state machine tests (frames in → actions out, no concurrency).
 - **Connection tests:** an in-memory `Transport` pair drives `HTTP2Connection` byte-for-byte without sockets. This covers stream interleaving, cancellation, flow-control stalls, and GOAWAY.
 - **Integration:** start the server on an ephemeral port inside a test and run `curl --http2-prior-knowledge`, `curl --http2 -k`, and `curl --http1.1`. The system curl (8.7.1 with nghttp2) supports all three.
-- **Conformance:** [h2spec](https://github.com/summerwind/h2spec) (`brew install h2spec`) via a `run-h2spec.sh` script.
+- **Conformance:** [h2spec](https://github.com/summerwind/h2spec) (`brew install h2spec`) via `scripts/h2spec.sh` against `sws-bench serve --h2-only`. h2spec 2.6.0 passes 146/146 (strict 147/147) over cleartext and TLS (#0061; `docs/benchmarks/M13-h2.md`).
 - **Load:** `h2load` from nghttp2 (`brew install nghttp2`).
 - **Browsers:** a manual Safari, Chrome, and Firefox check over TLS with a locally trusted certificate.
 
