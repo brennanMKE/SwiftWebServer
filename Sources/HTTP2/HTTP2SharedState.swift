@@ -76,6 +76,8 @@ struct HTTP2Wakeups: Sendable {
     var resetBodies: [HTTP2BodyChannel] = []
     /// PING waiters and whether their ACK arrived.
     var pings: [(CheckedContinuation<Bool, Never>, Bool)] = []
+    /// Handler tasks of streams that were reset.
+    var cancelledTasks: [HTTP2StreamTask] = []
 
     init() {}
 
@@ -83,7 +85,9 @@ struct HTTP2Wakeups: Sendable {
         writer?.resume()
         for waiter in waiters.values { waiter.resume() }
         for (waiter, acknowledged) in pings { waiter.resume(returning: acknowledged) }
+        // The body fails first, so a handler reading it sees why rather than a cancellation.
         for body in resetBodies { body.fail(TransportError.connectionReset) }
+        for task in cancelledTasks { task.cancel() }
     }
 }
 
@@ -115,6 +119,8 @@ struct HTTP2SharedState: Sendable {
     /// (#0048). The reader adds and completes them; a reset or the end of the handler removes
     /// them.
     var bodies: [UInt32: HTTP2BodyChannel] = [:]
+    /// The handler task of every dispatched stream, until it ends (#0051): a reset cancels it.
+    var tasks: [UInt32: HTTP2StreamTask] = [:]
     /// Tasks waiting for the ACK of our PING, by opaque data (#0050).
     var pingWaiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
     /// The opaque data of the last PING sent.
@@ -137,9 +143,11 @@ struct HTTP2SharedState: Sendable {
     /// settings and dispatches streams; stream writers learn whether to send).
     mutating func handle(_ event: HTTP2Connection.Event, wakeups: inout HTTP2Wakeups) -> HTTP2Connection.Action {
         let action = machine.handle(event)
-        if case .rstStream(let id, _) = event, let body = bodies.removeValue(forKey: id.rawValue) {
-            // The peer reset the stream: its body ends and what is buffered is credited.
-            wakeups.resetBodies.append(body)
+        if case .rstStream(let id, _) = event {
+            // The peer reset the stream: its body ends (what is buffered is credited) and its
+            // handler is cancelled.
+            if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
+            if let task = tasks[id.rawValue] { wakeups.cancelledTasks.append(task) }
         }
         switch action {
         case .none, .applyLocalSettings, .send, .sendData, .waitForWindow, .drop, .acceptTrailers:
@@ -199,7 +207,9 @@ struct HTTP2SharedState: Sendable {
             wakeWriter(&wakeups)
 
         case .resetStream(let id, let code, let increment):
+            // The stream is over: its body ends and its handler, if still running, is cancelled.
             if let body = bodies.removeValue(forKey: id.rawValue) { wakeups.resetBodies.append(body) }
+            if let task = tasks[id.rawValue] { wakeups.cancelledTasks.append(task) }
             HTTP2FrameEncoder.encodeRSTStream(streamID: id, code, into: &outbound.ordered)
             if let increment {
                 HTTP2FrameEncoder.encodeWindowUpdate(streamID: .connection, increment: increment, into: &outbound.priority)
@@ -346,6 +356,7 @@ struct HTTP2SharedState: Sendable {
         activeStreams -= 1
         // DATA that still arrives has no reader: the reader credits it at once.
         bodies.removeValue(forKey: streamID.rawValue)
+        tasks.removeValue(forKey: streamID.rawValue)
         if isOpen { _ = handle(.responseFinished(streamID: streamID), wakeups: &wakeups) }
         if draining && activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
     }

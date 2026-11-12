@@ -83,9 +83,21 @@ import Darwin
 /// HEADERS are parsed, length-checked and otherwise ignored (SETTINGS_NO_RFC7540_PRIORITIES is
 /// 1); a stream that depends on itself is a stream `PROTOCOL_ERROR`.
 ///
+/// ## Resets and cancellation (#0051)
+///
+/// Each stream task runs its handler as the only child of a small group, so the connection can
+/// cancel one stream (``HTTP2StreamTask``). A RST_STREAM from the peer, or a reset the server
+/// sends (a malformed body, a flow-control violation), ends the request body (buffered DATA
+/// is dropped and its connection credit returned) and cancels the handler, which sees
+/// `CancellationError`; flow-control waits end with it. A handler that is cancelled or throws
+/// `CancellationError` resets its stream with `CANCEL`, and a body that fails after HEADERS
+/// with `INTERNAL_ERROR`; nothing is sent on a stream that is already closed. RST_STREAM on an
+/// idle stream is a connection `PROTOCOL_ERROR`. ``HTTP2ConnectionDriver/liveStreamTasks``
+/// counts the stream tasks running, for leak tests.
+///
 /// ## Not yet
 ///
-/// Per-stream cancellation on RST_STREAM (#0051), the PING round-trip on shutdown and idle
+/// The PING round-trip on shutdown and idle
 /// timeouts (#0052), the full inbound window policy (#0053), fair window waiting (#0054),
 /// extended CONNECT (#0067: `.tunnel` answers `501`).
 public struct HTTP2: ConnectionProtocol {
@@ -120,6 +132,8 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     let context: ConnectionContext
     let configuration: HTTP2Configuration
     let state: Mutex<HTTP2SharedState>
+    /// Stream tasks running (``liveStreamTasks``).
+    let liveStreams = Atomic<Int>(0)
 
     init(transport: Transport, handler: Handler, context: ConnectionContext, configuration: HTTP2Configuration) {
         self.transport = transport
@@ -334,8 +348,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// What the reader does after handling one parser event.
     enum ReadStep {
         case proceed
-        /// Serve a request on a new stream task; `body` feeds its request body.
-        case serve(HTTP2StreamID, HTTPRequest, HTTPRequestStorage, body: HTTP2BodyChannel?)
+        /// Serve a request on a new stream task; `body` feeds its request body, and `task`
+        /// cancels it.
+        case serve(HTTP2StreamID, HTTPRequest, HTTPRequestStorage, body: HTTP2BodyChannel?, task: HTTP2StreamTask)
         /// A connection error was answered (or the peer is gone): stop reading.
         case stop
     }
@@ -394,8 +409,8 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                     break
                 case .stop:
                     return
-                case .serve(let id, let request, let storage, let body):
-                    streams.addTask { await self.serve(id, request: request, storage: storage, body: body) }
+                case .serve(let id, let request, let storage, let body, let task):
+                    streams.addTask { await self.runStream(id, request: request, storage: storage, body: body, task: task) }
                 }
             }
             buffer.clear()
@@ -645,27 +660,68 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             streamEnded(id)
             return .proceed
         }
-        guard !block.endStream else { return .serve(id, head.request, storage, body: nil) }
-        let body = HTTP2BodyChannel(
-            streamID: id, declaredLength: head.contentLength, window: streamReceiveWindow, credit: self)
-        state.withLock { $0.bodies[id.rawValue] = body }
+        let task = HTTP2StreamTask()
         var request = head.request
-        request.body = HTTPRequestBody(source: body, request: body.requestID, length: head.contentLength)
-        return .serve(id, request, storage, body: body)
+        var body: HTTP2BodyChannel?
+        if !block.endStream {
+            let channel = HTTP2BodyChannel(
+                streamID: id, declaredLength: head.contentLength, window: streamReceiveWindow, credit: self)
+            request.body = HTTPRequestBody(source: channel, request: channel.requestID, length: head.contentLength)
+            body = channel
+        }
+        // Registered before any later frame on the stream is read, so a reset finds them.
+        state.withLock { shared in
+            shared.tasks[id.rawValue] = task
+            if let body { shared.bodies[id.rawValue] = body }
+        }
+        return .serve(id, request, storage, body: body, task: task)
     }
 
     // MARK: Streams
 
+    /// The number of stream tasks running (a debug counter for leak tests: it must return to
+    /// zero once every stream ended, however it ended).
+    var liveStreamTasks: Int { liveStreams.load(ordering: .relaxed) }
+
+    /// One stream's task: runs ``serve(_:request:storage:body:)`` as the only child of a group
+    /// that ``HTTP2StreamTask/cancel()`` cancels when the stream is reset (#0051).
+    func runStream(
+        _ id: HTTP2StreamID, request: HTTPRequest, storage: HTTPRequestStorage, body: HTTP2BodyChannel?,
+        task: HTTP2StreamTask
+    ) async {
+        liveStreams.add(1, ordering: .relaxed)
+        await withDiscardingTaskGroup { group in
+            group.addTask {
+                await self.serve(id, request: request, storage: storage, body: body)
+                task.finish()
+            }
+            await task.wait()
+            if task.isCancelled { group.cancelAll() }
+        }
+        streamEnded(id)
+        liveStreams.subtract(1, ordering: .relaxed)
+    }
+
     /// Runs the handler for one request and writes its response.
+    ///
+    /// Cancellation (a reset of the stream, or of the connection) reaches the handler as
+    /// `CancellationError`. A handler that ends because of it, or throws `CancellationError`, and
+    /// a response cut short by it, reset the stream with `CANCEL`; the state machine drops the
+    /// reset when the stream is already closed (the peer reset it, or the server did).
     func serve(_ id: HTTP2StreamID, request: HTTPRequest, storage: HTTPRequestStorage, body: HTTP2BodyChannel?) async {
         let isHead = request.method == .head
         var requestContext = context.requestContext
         if context.recordsRequestStartTime { requestContext.startTime = .now() }
         var response: HTTPResponse?
+        var cancelled = false
         do {
             response = try await handler.handle(request, context: requestContext)
         } catch {
-            if !Task.isCancelled { response = HTTPResponse(status: .internalServerError) }
+            if Task.isCancelled || error is CancellationError {
+                cancelled = true
+            } else {
+                response = HTTPResponse(status: .internalServerError)
+            }
         }
         storage.endRequest()
         // Body bytes the handler did not read are discarded and credited.
@@ -673,7 +729,9 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         if let response, !Task.isCancelled {
             await write(response, isHead: isHead, on: id)
         }
-        streamEnded(id)
+        // Dropping the response here closes a `.file` body's descriptor.
+        response = nil
+        if cancelled || Task.isCancelled { handle(.sendReset(streamID: id, .cancel)) }
     }
 
     /// A dispatched stream is done: reset it if the peer is still sending, and finish a
@@ -728,8 +786,11 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
                 guard try await sendData(ByteBuffer(), endStream: true, on: id) else { return }
             }
         } catch {
-            // The body failed after HEADERS: the response cannot be completed (#0049).
-            if !Task.isCancelled { handle(.sendReset(streamID: id, .internalError)) }
+            // The body failed after HEADERS: the response cannot be completed (#0049). A
+            // cancelled stream is reset with CANCEL by `serve`.
+            if !Task.isCancelled && !(error is CancellationError) {
+                handle(.sendReset(streamID: id, .internalError))
+            }
         }
     }
 

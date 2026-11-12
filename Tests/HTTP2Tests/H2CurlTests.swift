@@ -194,4 +194,46 @@ struct H2CurlTests {
             #expect(handler.inFlight.withLock { $0.peak } > 1)
         }
     }
+    // MARK: Resets (#0051)
+
+    /// Streams an endless body slowly; counts the writers still running.
+    final class EndlessHandler: HTTPHandler {
+        let running = Mutex((now: 0, started: 0))
+
+        func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse {
+            if request.string(of: request.path) == "/quick" { return HTTPResponse(body: .bytes(ByteBuffer("quick"))) }
+            return HTTPResponse(body: .stream(length: nil) { [self] writer in
+                running.withLock {
+                    $0.now += 1
+                    $0.started += 1
+                }
+                defer { running.withLock { $0.now -= 1 } }
+                while true {
+                    try await writer.write(ByteBuffer(bytes: Array(repeating: 0x61, count: 8_192)))
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+            })
+        }
+    }
+
+    /// curl gives up mid-download (`--max-time`): the server cancels the stream's writer and
+    /// keeps serving.
+    @Test func curlTimeoutMidDownloadCleansUp() async throws {
+        let handler = EndlessHandler()
+        try await Self.withServer(tls: false, handler: handler) { port, _ in
+            let (status, output) = try await Self.curl([
+                "-sS", "--http2-prior-knowledge", "--max-time", "1", "-o", "/dev/null",
+                "http://127.0.0.1:\(port)/endless", "http://127.0.0.1:\(port)/endless"])
+            #expect(status == 28, "\(output)")  // CURLE_OPERATION_TIMEDOUT
+            #expect(handler.running.withLock { $0.started } >= 1)
+            let deadline = ContinuousClock.now + .seconds(5)
+            while handler.running.withLock({ $0.now }) > 0 && ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(handler.running.withLock { $0.now } == 0)
+            let (status2, output2) = try await Self.curl([
+                "-sS", "--http2-prior-knowledge", "--max-time", "10", "http://127.0.0.1:\(port)/quick"])
+            #expect(status2 == 0 && output2 == "quick", "\(output2)")
+        }
+    }
 }
