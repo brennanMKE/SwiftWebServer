@@ -46,7 +46,7 @@ let libraries: [Library] = [
     // Optional components
     Library("StaticFiles", dependencies: ["HTTPCore", "Compression"], testDependencies: ["HTTP1"]),
     Library("Compression", dependencies: ["HTTPCore"], testDependencies: ["HTTP1", "HTTPServer", "HTTPTestSupport", "NetworkTransport", "StaticFiles"]),
-    Library("VirtualHosts", dependencies: ["HTTPCore"], testDependencies: ["StaticFiles"]),
+    Library("VirtualHosts", dependencies: ["HTTPCore"], testDependencies: ["StaticFiles", "Router", "Auth", "AccessLog", "Compression", "WebSockets", "HTTPServer", "HTTP1", "NetworkTransport"]),
     Library("Auth", dependencies: ["HTTPCore"], testDependencies: ["Router"]),
     Library("AccessLog", dependencies: ["HTTPCore"], testDependencies: ["HTTP1", "HTTPServer", "HTTPTestSupport"]),
     Library("Router", dependencies: ["HTTPCore"]),
