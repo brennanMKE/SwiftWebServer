@@ -47,4 +47,29 @@ HTTP/3 orders only sends that wait for the connection's send budget
 streams belongs to Network.framework, which offers no per-stream priority API to this server.
 The budget's ordering is covered by `Tests/HTTP3Tests/H3PriorityTests.swift`
 (`budgetServesUrgentWaitersFirst`, `budgetInterleavesIncrementalStreams`,
-`budgetKeepsAShareForLowPriority`); no wire-level QUIC measurement was taken here.
+`budgetKeepsAShareForLowPriority`).
+
+### Measured over Network.framework QUIC
+
+`Tests/HTTP3Tests/H3QUICPriorityTests.swift`: real QUIC on 127.0.0.1 (port 0, in-memory test
+identity), two streamed 8 MiB downloads (64 KiB writes), `/low` `u=7` requested before
+`/high` `u=0`, the client reading both streams concurrently. Debug build, load average
+5.23 / 6.22 / 7.46.
+
+```bash
+scripts/guarded.sh -t 180 -- swift test -j 2 --filter H3QUICPriorityTests
+```
+
+| Send budget | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| 64 KiB (contended) | `/high` 77.4 ms, `/low` 77.5 ms | `/low` 69.2 ms, `/high` 69.4 ms | `/low` 64.3 ms, `/high` 64.5 ms |
+| 4 MiB (default) | `/high` 56.4 ms, `/low` 56.9 ms | `/high` 54.3 ms, `/low` 54.8 ms | `/low` 48.4 ms, `/high` 48.4 ms |
+
+**Network.framework gives no usable control.** Both downloads finish within half a
+millisecond of each other in every run, in either order, whatever the budget: a send
+completes once Network.framework has buffered it, so the budget is rarely what holds a
+stream back, and the QUIC stack then interleaves the streams' packets itself. The send-budget
+ordering is a hint that matters only when the budget is truly exhausted (a client that stops
+reading, #0104); it does not make an urgent HTTP/3 response finish first on an uncongested
+link. Doing better would need per-stream priority in Network.framework's QUIC, which
+`NWProtocolQUIC` does not expose, or pacing response sends ourselves.
