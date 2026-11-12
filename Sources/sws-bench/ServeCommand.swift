@@ -7,6 +7,7 @@ import HTTPCore
 import HTTPServer
 import NetworkTransport
 import StaticFiles
+import WebSockets
 
 /// `sws-bench serve`: a bench and test harness for the new stack (#0079). The shipped server is
 /// the `SwiftWebServer` executable (#0086); this one adds built-in echo and hello handlers.
@@ -28,6 +29,7 @@ enum ServeCommand {
                                [--max-body-size N] [--root DIR]
                                [--tls [--identity FILE] [--password PW]]
                                [--access-log PATH|-] [--access-log-format F] [--metrics]
+                               [--websocket-echo PATH]
 
           --config FILE        http-config.json (README "Configuration"); "host", "port",
                                "transport", "maxConnections", "drainTimeout", "maxBodySize"
@@ -51,6 +53,8 @@ enum ServeCommand {
                                `-` writes to stdout (#0090)
           --access-log-format F  common (default), combined or json
           --metrics            serve request metrics at GET /metrics (Prometheus text)
+          --websocket-echo PATH  accept WebSocket handshakes on PATH (RFC 6455, #0108) and
+                               echo every message back; other paths are served as usual
 
         Serves HTTP/1.1 (keep-alive, pipelining). POST echoes the request body, PUT answers
         with the body's length, anything else gets 200 text/plain. With --root, every request
@@ -77,6 +81,8 @@ enum ServeCommand {
         var accessLog: String?
         var accessLogFormat = AccessLogFormat.common
         var metrics = false
+        /// Request path of the WebSocket echo endpoint.
+        var websocketEcho: String?
     }
 
     struct ConfigError: Error, CustomStringConvertible {
@@ -85,7 +91,7 @@ enum ServeCommand {
 
     static func run(_ argv: [String]) async throws -> Int32 {
         if argv.contains("--h3") { return try await H3ServeCommand.run(argv.filter { $0 != "--h3" }) }
-        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "transport", "max-connections", "drain-timeout", "body-size", "max-body-size", "root", "access-log", "access-log-format", "identity", "password"])
+        var args = try Arguments(argv, valueOptions: ["config", "host", "port", "transport", "max-connections", "drain-timeout", "body-size", "max-body-size", "root", "access-log", "access-log-format", "identity", "password", "websocket-echo"])
         if args.flag("help") == true { print(usage); return 0 }
         let configPath = args.string("config")
         let host = args.string("host")
@@ -102,6 +108,7 @@ enum ServeCommand {
         let accessLog = args.string("access-log")
         let accessLogFormat = args.string("access-log-format")
         let metrics = args.flag("metrics") ?? false
+        let websocketEcho = args.string("websocket-echo")
         try args.checkAllConsumed()
 
         var settings = Settings()
@@ -156,6 +163,13 @@ enum ServeCommand {
             }
         }
         settings.metrics = metrics
+        if let websocketEcho {
+            guard websocketEcho.hasPrefix("/") else {
+                printError("sws-bench serve: --websocket-echo takes a path starting with /")
+                return 2
+            }
+            settings.websocketEcho = websocketEcho
+        }
         return await serve(settings)
     }
 
@@ -232,12 +246,29 @@ enum ServeCommand {
                 printError("sws-bench serve: cannot serve root \(root): \(error)")
                 return 1
             }
+            return await serveWithWebSocketEcho(settings, configuration: configuration, listener: listener,
+                                                protocols: protocols, handler: files)
+        }
+        return await serveWithWebSocketEcho(settings, configuration: configuration, listener: listener, protocols: protocols,
+                                            handler: ServeHandler(hello: HelloHandler(bodySize: settings.bodySize),
+                                                                  maxBodySize: settings.maxBodySize))
+    }
+
+    /// Puts the WebSocket echo endpoint in front of `handler` when `--websocket-echo` asks for
+    /// it; otherwise the chain has no WebSocket code at all.
+    static func serveWithWebSocketEcho<L: TransportListener, H: HTTPHandler>(
+        _ settings: Settings, configuration: ServerConfiguration, listener: L, protocols: [any ConnectionProtocol],
+        handler: H
+    ) async -> Int32 {
+        guard let path = settings.websocketEcho else {
             return await serve(settings, configuration: configuration, listener: listener, protocols: protocols,
-                               handler: files)
+                               handler: handler)
+        }
+        let echo = WebSocketUpgrade(path: path) { socket, _ in
+            for await message in socket.messages { try await socket.send(message) }
         }
         return await serve(settings, configuration: configuration, listener: listener, protocols: protocols,
-                           handler: ServeHandler(hello: HelloHandler(bodySize: settings.bodySize),
-                                                 maxBodySize: settings.maxBodySize))
+                           handler: MiddlewareChain(middleware: echo, next: handler))
     }
 
     /// Serves `handler`, behind the access log and the metrics endpoint when asked for. Each
