@@ -150,9 +150,22 @@ import Darwin
 /// and slow preface are bounded by the header block limits, `maxQueuedControlFrames` and
 /// `settingsTimeout`.
 ///
-/// ## Not yet
+/// ## Extended CONNECT (RFC 8441, #0067)
 ///
-/// Extended CONNECT (#0067: `.tunnel` answers `501`).
+/// When the handler chain holds an `ExtendedConnectProvider` (the WebSocket component) or
+/// ``HTTP2Configuration/enableConnectProtocol`` is set, our SETTINGS carry
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`; otherwise a request with `:protocol` is malformed
+/// (`RST_STREAM(PROTOCOL_ERROR)`). An extended CONNECT (`:method CONNECT`, `:protocol`,
+/// `:scheme`, `:path`, `:authority`) reaches the handler like any request, with
+/// ``HTTPCore/HTTPRequest/connectProtocol`` set; its DATA is not bounded by
+/// ``HTTP2Configuration/maxRequestBodySize``. A `2xx` response with a `.tunnel` body sends its
+/// HEADERS without END_STREAM and hands the closure the stream as a ``ByteStreamTransport``
+/// (``HTTP2TunnelTransport``): DATA in and out under flow control, END_STREAM as end of
+/// stream, an abortive close as `RST_STREAM(CANCEL)`. A peer reset fails the tunnel's receive
+/// and sends with `TransportError.connectionReset` instead of cancelling it. A plain CONNECT
+/// (`:authority` only) goes to the handler like any request; a CONNECT with `:scheme` or
+/// `:path` but no `:protocol` is malformed. A `.tunnel` body for any other request is
+/// answered `501`.
 public struct HTTP2: ConnectionProtocol {
     public var configuration: HTTP2Configuration
 
@@ -172,6 +185,12 @@ public struct HTTP2: ConnectionProtocol {
         if !t.info.isSecure && !configuration.cleartext {
             await t.close(.protocolError)
             return
+        }
+        var configuration = configuration
+        if !configuration.enableConnectProtocol
+            && !MiddlewareChainInspector.extendedConnectProtocols(in: handler).isEmpty {
+            // A component serves extended CONNECT (WebSockets, RFC 8441): advertise it.
+            configuration.enableConnectProtocol = true
         }
         let driver = HTTP2ConnectionDriver(transport: t, handler: handler, context: context, configuration: configuration)
         await driver.run()
@@ -900,6 +919,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     ) throws(HTTP2Error) -> ReadStep {
         let storage = HTTPRequestStorage(bufferCapacity: Swift.max(block.size * 2, 256), fieldCapacity: 16)
         var sink = HTTP2RequestFieldSink(storage: storage, maxListSize: configuration.maxHeaderListSize)
+        sink.allowsExtendedConnect = configuration.enableConnectProtocol
         try assembler.decode(block, fragment: fragment, with: &decoder, into: &sink)
         // A stream that depends on itself (the deprecated PRIORITY flag, RFC 9113 §5.3.1) is a
         // stream PROTOCOL_ERROR; otherwise the priority fields are ignored.
@@ -920,14 +940,17 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             streamEnded(id)
             return .proceed
         }
-        if let declared = head.contentLength, declared > configuration.maxRequestBodySize {
+        // An extended CONNECT's DATA is a tunnel's byte stream, not a body to bound (#0067).
+        let isExtendedConnect = head.request.isExtendedConnect
+        let bodyLimit = isExtendedConnect ? Int.max : configuration.maxRequestBodySize
+        if let declared = head.contentLength, declared > bodyLimit {
             return reject(id, .contentTooLarge, storage: storage, task: task)
         }
         var request = head.request
         var body: HTTP2BodyChannel?
         if !block.endStream {
             let channel = HTTP2BodyChannel(
-                streamID: id, declaredLength: head.contentLength, maxSize: configuration.maxRequestBodySize, credit: self)
+                streamID: id, declaredLength: head.contentLength, maxSize: bodyLimit, credit: self)
             request.body = HTTPRequestBody(source: channel, request: channel.requestID, length: head.contentLength)
             body = channel
         }
@@ -995,8 +1018,10 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         var response: HTTPResponse?
         var cancelled = false
         var isHead = false
+        var isExtendedConnect = false
         if let request {
             isHead = request.method == .head
+            isExtendedConnect = request.isExtendedConnect
             var requestContext = context.requestContext
             if context.recordsRequestStartTime { requestContext.startTime = .now() }
             do {
@@ -1014,6 +1039,13 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             response = HTTPResponse(status: rejection ?? .internalServerError)
         }
         storage.endRequest()
+        if isExtendedConnect, !Task.isCancelled, let tunnelResponse = response,
+           case .tunnel(let tunnel) = tunnelResponse.body, (200..<300).contains(tunnelResponse.status.code) {
+            response = nil
+            await runTunnel(tunnelResponse, tunnel, on: id, body: body)
+            body?.expire()
+            return
+        }
         // Body bytes the handler did not read are discarded and credited.
         body?.expire()
         if let response, !Task.isCancelled {
@@ -1022,6 +1054,30 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         // Dropping the response here closes a `.file` body's descriptor.
         response = nil
         if cancelled || Task.isCancelled { handle(.sendReset(streamID: id, .cancel)) }
+    }
+
+    /// Answers an extended CONNECT with `response`'s HEADERS (no END_STREAM) and runs its
+    /// tunnel over the stream (RFC 8441 §5); see ``HTTP2`` "Extended CONNECT".
+    func runTunnel(
+        _ response: HTTPResponse, _ tunnel: @Sendable (any ByteStreamTransport, TunnelContext) async -> Void,
+        on id: HTTP2StreamID, body: HTTP2BodyChannel?
+    ) async {
+        state.withLock { _ = $0.tunnels.insert(id.rawValue) }
+        let status = response.status
+        let headers = response.headers
+        let head = await enqueue { shared, ticket, wakeups in
+            shared.sendHeaders(streamID: id, status: status, headers: headers, contentLength: nil,
+                               endStream: false, ticket: ticket, wakeups: &wakeups)
+        }
+        // Dropped (the stream was reset), or replaced by a bare 500 that ended the stream.
+        guard let head, !head.endStream else {
+            if Task.isCancelled { handle(.sendReset(streamID: id, .cancel)) }
+            return
+        }
+        let transport = HTTP2TunnelTransport(driver: self, streamID: id, channel: body)
+        await tunnel(transport, TunnelContext(shutdown: context.shutdown))
+        _ = await transport.finish()
+        if Task.isCancelled { handle(.sendReset(streamID: id, .cancel)) }
     }
 
     /// A dispatched stream is done: reset it if the peer is still sending, and finish a

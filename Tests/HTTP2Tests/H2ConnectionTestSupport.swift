@@ -250,13 +250,13 @@ struct HelloHandler: HTTPHandler {
 
 /// The client end of an in-memory HTTP/2 connection.
 struct H2Client {
-    let transport: InMemoryTransport
+    let transport: any ByteStreamTransport
     var reader = H2FrameReader()
     var consumed = 0
     var requests = RequestEncoder()
     var decoder = HPACKDecoder(maxHeaderListSize: 1 << 20)
 
-    init(_ transport: InMemoryTransport) {
+    init(_ transport: any ByteStreamTransport) {
         self.transport = transport
     }
 
