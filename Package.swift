@@ -80,7 +80,8 @@ for library in libraries {
 targets += [
     .executableTarget(
         name: "SwiftWebServer",
-        dependencies: ["ConfigFile", "HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport"],
+        dependencies: ["ConfigFile", "HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport",
+                       .target(name: "HTTP3", condition: .when(traits: ["HTTP3"]))],
         swiftSettings: modernSwiftSettings),
     .executableTarget(
         name: "SWSBench",
@@ -93,7 +94,7 @@ targets += [
         swiftSettings: modernSwiftSettings),
     .testTarget(
         name: "IntegrationTests",
-        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HTTPTestSupport"],
+        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HTTPTestSupport", "HTTP3"],
         swiftSettings: modernSwiftSettings),
 ]
 

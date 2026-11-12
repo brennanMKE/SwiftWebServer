@@ -49,10 +49,20 @@ import Synchronization
 /// every connection, and the server waits up to ``ServerConfiguration/drainTimeout`` for
 /// connections to finish before cancelling them. A shutdown before or during startup is never
 /// lost (#0005). Startup failures, such as a port in use, throw out of `run()` (#0004).
-public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Sendable {
+///
+/// ## Several kinds of listener
+///
+/// `Server<SomeListener, Handler>` serves listeners of one byte-stream type. A
+/// `Server<ServerListener, Handler>` (built from ``ServerListener`` values) serves any mix:
+/// cleartext and TLS byte streams through the registry, and QUIC connections through a
+/// ``MultiplexedConnectionProtocol`` such as HTTP/3 (#0089). Listeners bind in order; if one
+/// fails, those already bound are closed and `run()` throws. Every listener shares the
+/// connection limit, the drain and the ``ShutdownSignal``, so a shutdown also sends HTTP/3
+/// GOAWAY. ``listenerStatistics`` has per-listener counts.
+public final class Server<Listener, Handler: HTTPHandler>: Sendable {
     public let configuration: ServerConfiguration
     public let protocols: ProtocolRegistry
-    let listeners: [Listener]
+    let listeners: [ServerListener]
     let handler: Handler
     /// Background components: the `components:` argument, then those found in the chain.
     let components: [any ServerComponent]
@@ -86,25 +96,20 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         var refused = 0
         var peakOpen = 0
         var runCalled = false
+        var perListener: [ListenerStatistics] = []
     }
 
     let state = Mutex(State())
 
-    /// - Parameters:
-    ///   - configuration: captured once; validated by `run()`.
-    ///   - listeners: where connections come from. `run()` binds them.
-    ///   - protocols: the protocols connections may speak, in priority order.
-    ///   - components: background components to run besides those found in `handler`.
-    ///   - handler: answers requests; a builder chain with one element.
-    public init(
-        configuration: ServerConfiguration = ServerConfiguration(),
-        listeners: [Listener],
+    init(
+        configuration: ServerConfiguration,
+        entries: [ServerListener],
         protocols: [any ConnectionProtocol],
-        components: [any ServerComponent] = [],
+        components: [any ServerComponent],
         handler: Handler
     ) {
         self.configuration = configuration
-        self.listeners = listeners
+        self.listeners = entries
         self.protocols = ProtocolRegistry(protocols, sniffTimeout: configuration.sniffTimeout)
         self.handler = handler
         self.components = components + MiddlewareChainInspector.serverComponents(in: handler)
@@ -112,24 +117,9 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         self.connectionObservers = ConnectionObservers(
             components.compactMap { $0 as? any ConnectionObserver }
                 + MiddlewareChainInspector.connectionObservers(in: handler))
-    }
-
-    /// - Parameters:
-    ///   - configuration: captured once; validated by `run()`.
-    ///   - listeners: where connections come from. `run()` binds them.
-    ///   - protocols: the protocols connections may speak, in priority order.
-    ///   - components: background components to run besides those found in the chain.
-    ///   - chain: the middlewares, in the order they see requests, optionally ending in a
-    ///     handler (``NotFoundHandler`` otherwise). See ``MiddlewareBuilder``.
-    public convenience init(
-        configuration: ServerConfiguration = ServerConfiguration(),
-        listeners: [Listener],
-        protocols: [any ConnectionProtocol],
-        components: [any ServerComponent] = [],
-        @MiddlewareBuilder _ chain: () -> Handler
-    ) {
-        self.init(configuration: configuration, listeners: listeners, protocols: protocols,
-                  components: components, handler: chain())
+        state.withLock { state in
+            state.perListener = entries.map { ListenerStatistics(name: $0.name, kind: $0.kind) }
+        }
     }
 
     // MARK: Observation
@@ -151,6 +141,10 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
 
     /// The most connections open at once.
     public var peakConnectionCount: Int { state.withLock { $0.peakOpen } }
+
+    /// Per-listener counts, in listener order (#0089). The connection limit is shared, so the
+    /// `open` counts add up to ``openConnectionCount``.
+    public var listenerStatistics: [ListenerStatistics] { state.withLock { $0.perListener } }
 
     /// Suspends until the server is running and returns the bound addresses. Throws the
     /// startup error if startup fails, or `CancellationError` if the server stops first.
@@ -228,7 +222,8 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
 
         do {
             try configuration.validate()
-            guard !protocols.protocols.isEmpty else { throw ServerError.noProtocols }
+            let needsRegistry = listeners.contains { $0.kind == .byteStream }
+            guard !needsRegistry || !protocols.protocols.isEmpty else { throw ServerError.noProtocols }
         } catch {
             _ = state.withLock { $0.lifecycle.handle(.listenerFailed) }
             failStartup(error)
@@ -236,10 +231,12 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         }
 
         var addresses: [TransportAddress] = []
-        var bound: [Listener] = []
+        var bound: [ServerListener.Bound] = []
         do {
-            for listener in listeners {
+            let registryTokens = protocols.alpnTokens
+            for entry in listeners {
                 if shutdownSignal.isTriggered { break }
+                let listener = try entry.storage.resolve(boundAddresses: addresses, registryTokens: registryTokens)
                 bound.append(listener)
                 addresses.append(try await listener.listen())
             }
@@ -256,7 +253,10 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
 
         let ready = state.withLock { state -> ServerLifecycle.Action in
             let action = state.lifecycle.handle(.listenerReady)
-            if action == .acceptConnections { state.addresses = addresses }
+            if action == .acceptConnections {
+                state.addresses = addresses
+                for index in addresses.indices { state.perListener[index].address = addresses[index] }
+            }
             return action
         }
         guard ready == .acceptConnections else {
@@ -270,7 +270,7 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         }
         for waiter in waiters { waiter.resume(returning: addresses) }
 
-        await serve(addresses: addresses)
+        await serve(addresses: addresses, listeners: bound)
 
         if let error = state.withLock({ $0.runError }) { throw error }
     }
@@ -290,8 +290,8 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
 
     /// The running phase: accept on every listener until shutdown, drain, then cancel what is
     /// left at the deadline.
-    private func serve(addresses: [TransportAddress]) async {
-        guard !components.isEmpty else { return await serveConnections() }
+    private func serve(addresses: [TransportAddress], listeners: [ServerListener.Bound]) async {
+        guard !components.isEmpty else { return await serveConnections(listeners) }
         let handle = ServerHandle(localAddresses: addresses, draining: shutdownSignal) { [weak self] in
             self?.requestShutdown()
         }
@@ -299,7 +299,7 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
             for component in components {
                 group.addTask { await self.runComponent(component, handle: handle) }
             }
-            await serveConnections()
+            await serveConnections(listeners)
             // The connections are gone: stop the components (they may flush first).
             group.cancelAll()
         }
@@ -314,11 +314,16 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         }
     }
 
-    private func serveConnections() async {
+    private func serveConnections(_ listeners: [ServerListener.Bound]) async {
         state.withLock { $0.activeAcceptLoops = listeners.count }
         await withDiscardingTaskGroup { group in
-            for listener in listeners {
-                group.addTask { await self.acceptLoop(listener) }
+            for (index, listener) in listeners.enumerated() {
+                switch listener {
+                case .byteStream(let listener):
+                    group.addTask { await self.acceptByteStreams(listener, index: index) }
+                case .multiplexed(let listener, let proto):
+                    group.addTask { await self.acceptMultiplexed(listener, protocol: proto, index: index) }
+                }
             }
 
             await shutdownSignal.wait()
@@ -364,9 +369,37 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
 
     // MARK: Accept
 
-    private func acceptLoop(_ listener: Listener) async {
+    private func acceptByteStreams<L: TransportListener>(_ listener: L, index: Int) async {
+        await acceptLoop(listener.connections, index: index,
+                         refuse: { transport in await transport.close(.shutdown) },
+                         serve: { transport in await self.serveConnection(transport) })
+    }
+
+    private func acceptMultiplexed<L: MultiplexedTransportListener, P: MultiplexedConnectionProtocol>(
+        _ listener: L, protocol proto: P, index: Int
+    ) async {
+        await acceptLoop(listener.connections, index: index,
+                         refuse: { connection in await listener.refuse(connection) },
+                         serve: { connection in
+                             var context = ConnectionContext(info: listener.connectionInfo(connection),
+                                                             shutdown: self.shutdownSignal,
+                                                             recordsRequestStartTime: self.recordsRequestStartTime)
+                             let observers = self.connectionObservers
+                             if !observers.isEmpty { observers.connectionWillStart(&context) }
+                             await proto.run(connection, handler: self.handler, context: context)
+                             if !observers.isEmpty { observers.connectionDidEnd(context) }
+                         })
+    }
+
+    /// Takes connections from one listener and serves each in a child task, within the
+    /// shared connection limit.
+    private func acceptLoop<Connections: AsyncSequence>(
+        _ sequence: Connections, index: Int,
+        refuse: @escaping @Sendable (Connections.Element) async -> Void,
+        serve: @escaping @Sendable (Connections.Element) async -> Void
+    ) async where Connections.Element: Sendable, Connections.Failure == any Error {
         await withDiscardingTaskGroup { connections in
-            var iterator = listener.connections.makeAsyncIterator()
+            var iterator = sequence.makeAsyncIterator()
             accepting: while true {
                 let reserved: Bool
                 switch configuration.connectionLimitPolicy {
@@ -378,7 +411,7 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
                     reserved = false
                 }
 
-                let next: Listener.Transport?
+                let next: Connections.Element?
                 do {
                     next = try await iterator.next()
                 } catch {
@@ -386,7 +419,7 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
                     if !(error is CancellationError) { failedWhileRunning(error) }
                     break accepting
                 }
-                guard let transport = next else {
+                guard let connection = next else {
                     if reserved { releaseSlot(reservation: true) }
                     break accepting
                 }
@@ -398,22 +431,25 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
                     } else {
                         guard state.open < configuration.maxConnections else {
                             state.refused += 1
+                            state.perListener[index].refused += 1
                             return false
                         }
                         state.open += 1
                     }
                     state.accepted += 1
+                    state.perListener[index].accepted += 1
+                    state.perListener[index].open += 1
                     state.peakOpen = max(state.peakOpen, state.open - state.reserved)
                     return true
                 }
                 guard admitted else {
                     if reserved { releaseSlot(reservation: true) }
-                    await transport.close(.shutdown)
+                    await refuse(connection)
                     continue
                 }
                 connections.addTask {
-                    await self.serveConnection(transport)
-                    self.releaseSlot()
+                    await serve(connection)
+                    self.releaseSlot(listener: index)
                 }
             }
         }
@@ -426,7 +462,7 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
         checkDrained()
     }
 
-    private func serveConnection(_ transport: Listener.Transport) async {
+    private func serveConnection<T: ByteStreamTransport>(_ transport: T) async {
         var context = ConnectionContext(info: transport.info, shutdown: shutdownSignal,
                                         recordsRequestStartTime: recordsRequestStartTime)
         if !connectionObservers.isEmpty { connectionObservers.connectionWillStart(&context) }
@@ -474,10 +510,11 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
 
     /// Frees a slot (a connection closed, or a reservation went unused) and hands it to a
     /// waiting accept loop as a reservation.
-    private func releaseSlot(reservation: Bool = false) {
+    private func releaseSlot(reservation: Bool = false, listener index: Int? = nil) {
         let waiter = state.withLock { state -> CheckedContinuation<Bool, Never>? in
             state.open -= 1
             if reservation { state.reserved -= 1 }
+            if let index { state.perListener[index].open -= 1 }
             guard state.lifecycle.isRunning, let id = state.capacityWaiters.keys.first else { return nil }
             state.open += 1
             state.reserved += 1
@@ -503,5 +540,78 @@ public final class Server<Listener: TransportListener, Handler: HTTPHandler>: Se
             return state.lifecycle.handle(.lastConnectionClosed)
         }
         if action == .finish { drained.trigger() }
+    }
+}
+
+// MARK: - Initializers
+
+extension Server where Listener: TransportListener {
+    /// - Parameters:
+    ///   - configuration: captured once; validated by `run()`.
+    ///   - listeners: where connections come from. `run()` binds them.
+    ///   - protocols: the protocols connections may speak, in priority order.
+    ///   - components: background components to run besides those found in `handler`.
+    ///   - handler: answers requests; a builder chain with one element.
+    public convenience init(
+        configuration: ServerConfiguration = ServerConfiguration(),
+        listeners: [Listener],
+        protocols: [any ConnectionProtocol],
+        components: [any ServerComponent] = [],
+        handler: Handler
+    ) {
+        self.init(configuration: configuration, entries: listeners.map { .byteStream($0) },
+                  protocols: protocols, components: components, handler: handler)
+    }
+
+    /// - Parameters:
+    ///   - configuration: captured once; validated by `run()`.
+    ///   - listeners: where connections come from. `run()` binds them.
+    ///   - protocols: the protocols connections may speak, in priority order.
+    ///   - components: background components to run besides those found in the chain.
+    ///   - chain: the middlewares, in the order they see requests, optionally ending in a
+    ///     handler (``NotFoundHandler`` otherwise). See ``MiddlewareBuilder``.
+    public convenience init(
+        configuration: ServerConfiguration = ServerConfiguration(),
+        listeners: [Listener],
+        protocols: [any ConnectionProtocol],
+        components: [any ServerComponent] = [],
+        @MiddlewareBuilder _ chain: () -> Handler
+    ) {
+        self.init(configuration: configuration, listeners: listeners, protocols: protocols,
+                  components: components, handler: chain())
+    }
+}
+
+extension Server where Listener == ServerListener {
+    /// A server over several kinds of listener (#0089). See ``ServerListener``.
+    ///
+    /// - Parameters:
+    ///   - configuration: captured once; validated by `run()`.
+    ///   - listeners: where connections come from, bound in order by `run()`.
+    ///   - protocols: the byte-stream protocols, in priority order. Multiplexed listeners
+    ///     name their own protocol, so this may be empty when every listener is multiplexed.
+    ///   - components: background components to run besides those found in `handler`.
+    ///   - handler: answers requests from every listener.
+    public convenience init(
+        configuration: ServerConfiguration = ServerConfiguration(),
+        listeners: [ServerListener],
+        protocols: [any ConnectionProtocol],
+        components: [any ServerComponent] = [],
+        handler: Handler
+    ) {
+        self.init(configuration: configuration, entries: listeners,
+                  protocols: protocols, components: components, handler: handler)
+    }
+
+    /// A server over several kinds of listener, with a middleware chain (#0089).
+    public convenience init(
+        configuration: ServerConfiguration = ServerConfiguration(),
+        listeners: [ServerListener],
+        protocols: [any ConnectionProtocol],
+        components: [any ServerComponent] = [],
+        @MiddlewareBuilder _ chain: () -> Handler
+    ) {
+        self.init(configuration: configuration, listeners: listeners, protocols: protocols,
+                  components: components, handler: chain())
     }
 }

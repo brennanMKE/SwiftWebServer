@@ -159,3 +159,35 @@ public protocol TransportListener: Sendable {
     /// Only called after ``listen()`` has returned or thrown.
     func close() async
 }
+
+/// A source of accepted multiplexed connections (a QUIC listener): the
+/// ``MultiplexedTransport`` counterpart of ``TransportListener`` (#0089).
+/// `NetworkTransport.QUICListener` is the production adapter.
+///
+/// A server serves each connection with a ``MultiplexedConnectionProtocol`` (HTTP/3). The
+/// connection counts as one connection against the server's limit, however many streams it
+/// carries.
+public protocol MultiplexedTransportListener: Sendable {
+    /// An accepted connection.
+    associatedtype Connection: MultiplexedTransport where Connection.Stream: ResettableStream
+    /// Accepted connections, demand-driven like ``TransportListener/connections``. Iteration
+    /// ends after ``close()``.
+    associatedtype Connections: AsyncSequence<Connection, any Error>
+
+    /// Binds and starts listening; returns the bound address. Throws when binding fails.
+    func listen() async throws -> TransportAddress
+
+    /// Accepted connections. One consumer at a time.
+    var connections: Connections { get }
+
+    /// Stops accepting, closes connections not yet taken, and ends ``connections``.
+    /// Idempotent. Only called after ``listen()`` has returned or thrown.
+    func close() async
+
+    /// Addresses and security properties of an accepted connection.
+    func connectionInfo(_ connection: Connection) -> ConnectionInfo
+
+    /// Closes a connection the server will not serve (over the connection limit, or
+    /// arriving while the server drains).
+    func refuse(_ connection: Connection) async
+}

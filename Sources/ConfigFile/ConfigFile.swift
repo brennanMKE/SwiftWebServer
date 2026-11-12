@@ -17,9 +17,10 @@ public struct ConfigFileError: Error, Sendable, Equatable, CustomStringConvertib
 /// - Every key is optional; missing keys keep their default (or the `defaults` passed in).
 /// - Unknown keys do not fail: each adds a line to ``warnings``.
 /// - A value of the wrong type or out of range throws ``ConfigFileError`` naming the key.
-/// - Keys reserved for components that are not built yet (`tls`, `accessLog`) and legacy
+/// - Keys reserved for components that are not built yet (`accessLog`) and legacy
 ///   keys that no longer do anything (`enableETags`, `enableCompression`) are accepted with a
-///   warning, so the TLS and AccessLog work can claim them without breaking old files.
+///   warning, so the AccessLog work can claim it without breaking old files.
+/// - `tls` and `http3` (#0089) add the TLS and HTTP/3 listeners; HTTP/3 needs TLS.
 ///
 /// Foundation is used here: the file is read once at startup, never on the request path.
 public struct ConfigFile: Sendable {
@@ -29,7 +30,7 @@ public struct ConfigFile: Sendable {
     public var warnings: [String]
     /// The top-level keys present in the file.
     public var keys: Set<String>
-    /// Values of reserved keys (`tls`, `accessLog`), as JSON objects, for the components that
+    /// Values of reserved keys (`accessLog`), as JSON objects, for the components that
     /// will read them.
     public var reserved: [String: ReservedValue]
 
@@ -40,7 +41,7 @@ public struct ConfigFile: Sendable {
     }
 
     /// Keys whose components are not built yet; accepted and passed through.
-    public static let reservedKeys: Set<String> = ["tls", "accessLog"]
+    public static let reservedKeys: Set<String> = ["accessLog"]
     /// Legacy keys that have no effect any more.
     public static let ignoredLegacyKeys: [String: String] = [
         "enableETags": "ETags are always sent (metadata-based, no hashing)",
@@ -74,6 +75,9 @@ public struct ConfigFile: Sendable {
         }
         var parser = Parser(source: source, settings: defaults)
         try parser.apply(dictionary)
+        if parser.settings.http3 != nil, parser.settings.tls == nil {
+            throw parser.fail("http3", "needs \"tls\": HTTP/3 uses the TLS identity")
+        }
         return ConfigFile(settings: parser.settings, warnings: parser.warnings,
                           keys: Set(dictionary.keys), reserved: parser.reserved)
     }
@@ -176,6 +180,10 @@ struct Parser {
                 settings.transport = transport
             case "errorPages":
                 settings.errorPages = try errorPages(value, key)
+            case "tls":
+                settings.tls = try tls(value, key)
+            case "http3":
+                settings.http3 = try http3(value, key)
             case _ where ConfigFile.reservedKeys.contains(key):
                 reserved[key] = ConfigFile.ReservedValue(json: Self.json(value))
                 warn("\"\(key)\" is reserved for a component that is not available yet; ignored")
@@ -206,6 +214,74 @@ struct Parser {
             }
         }
         settings.maxAge = enabled ? maxAge : nil
+    }
+
+    /// `"tls": {"identity": "server.p12", "password": "…" | "passwordEnv": "VAR", "port": 8443}`;
+    /// `false`, `null` or `"enabled": false` turns it off.
+    mutating func tls(_ value: Any, _ key: String) throws(ConfigFileError) -> ServerSettings.TLSSettings? {
+        if value is NSNull { return nil }
+        if Self.isBool(value) {
+            guard try !bool(value, key) else { throw fail(key, "must be an object with \"identity\" and \"password\" or \"passwordEnv\"") }
+            return nil
+        }
+        let object = try dictionary(value, key)
+        var enabled = true
+        var identity: String?
+        var password: ServerSettings.TLSSettings.Password?
+        var port: UInt16 = 8443
+        for name in object.keys.sorted() {
+            let path = "\(key).\(name)"
+            let element = object[name]!
+            switch name {
+            case "enabled":
+                enabled = try bool(element, path)
+            case "identity":
+                let text = try string(element, path)
+                guard !text.isEmpty else { throw fail(path, "must not be empty") }
+                identity = text
+            case "password":
+                if object["passwordEnv"] != nil { throw fail(key, "must have \"password\" or \"passwordEnv\", not both") }
+                password = .literal(try string(element, path))
+            case "passwordEnv":
+                let text = try string(element, path)
+                guard !text.isEmpty else { throw fail(path, "must name an environment variable") }
+                password = .environment(text)
+            case "port":
+                port = UInt16(try integer(element, path, in: 0...65535))
+            default:
+                warn("unknown key \"\(path)\" ignored")
+            }
+        }
+        guard enabled else { return nil }
+        guard let identity else { throw fail("\(key).identity", "must be set to a PKCS#12 file") }
+        guard let password else { throw fail("\(key).password", "or \"\(key).passwordEnv\" must be set") }
+        return ServerSettings.TLSSettings(identity: identity, password: password, port: port)
+    }
+
+    /// `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`; `true` alone is
+    /// HTTP/3 on the TLS port; `false`, `null` or `"enabled": false` turns it off.
+    mutating func http3(_ value: Any, _ key: String) throws(ConfigFileError) -> ServerSettings.HTTP3Settings? {
+        if value is NSNull { return nil }
+        if Self.isBool(value) { return try bool(value, key) ? ServerSettings.HTTP3Settings() : nil }
+        let object = try dictionary(value, key, expectation: "must be true, false or an object")
+        var enabled = true
+        var settings = ServerSettings.HTTP3Settings()
+        for name in object.keys.sorted() {
+            let path = "\(key).\(name)"
+            let element = object[name]!
+            switch name {
+            case "enabled":
+                enabled = try bool(element, path)
+            case "port":
+                // null: the TLS port number.
+                settings.port = element is NSNull ? nil : UInt16(try integer(element, path, in: 0...65535))
+            case "altSvcMaxAge":
+                settings.altSvcMaxAge = try integer(element, path, in: 0...Int(Int32.max))
+            default:
+                warn("unknown key \"\(path)\" ignored")
+            }
+        }
+        return enabled ? settings : nil
     }
 
     mutating func timeouts(_ value: Any, _ key: String) throws(ConfigFileError) {
