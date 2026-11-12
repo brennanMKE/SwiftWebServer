@@ -22,7 +22,7 @@ JSON file, or compose its components into your own Swift server.
 | Sites | Virtual hosts with wildcards; custom or generated error pages |
 | Security | TLS from a PKCS#12 file loaded in memory (no keychain); Basic (PBKDF2), HS256 JWT and bearer-token auth with failure limiting; HTTP/2 abuse limits |
 | Dynamic content | Reverse proxy to local apps over TCP or Unix sockets (pooling, timeouts, retries, health checks, WebSocket tunnelling); in-process `Router` and `WebSocketUpgrade` for Swift handlers |
-| Operations | Access log (Common, Combined, JSON) and Prometheus metrics; connection limits and timeouts; graceful drain on SIGINT/SIGTERM |
+| Operations | Access log (Common, Combined, JSON) and Prometheus metrics; connection limits and timeouts; graceful drain on SIGINT/SIGTERM; SIGHUP reloads the config and reopens the access log |
 
 ## Quick start
 
@@ -34,7 +34,10 @@ curl http://127.0.0.1:8080/
 
 Serve any directory: `.build/release/SwiftWebServer --root ~/Sites/example --port 8080`. The
 server binds `127.0.0.1` unless you set `"host": "0.0.0.0"`, and prints `listening HOST:PORT`
-once ready. Ctrl-C (or SIGTERM) drains open connections and exits.
+once ready. Ctrl-C (or SIGTERM) drains open connections and exits. SIGHUP reloads
+`http-config.json` without dropping requests and reopens the access log (for rotation); see
+[Running on a Mac](docs/guide/running-on-a-mac.md#shutdown-restart-and-reload) for which keys
+need a restart.
 
 HTTPS, HTTP/2 and HTTP/3 locally:
 

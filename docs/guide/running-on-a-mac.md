@@ -308,9 +308,22 @@ launchctl bootout gui/$(id -u)/com.example.swiftwebserver         # stop and unl
 The access log is outermost in the chain, so it records the final status of every response
 (error pages, auth rejections, proxied responses). Lines are buffered per connection and
 written by a background task; if the writer falls behind, lines are dropped (counted), never
-delayed. A graceful stop writes everything buffered. The server does not rotate files; use
-`newsyslog` (`/etc/newsyslog.d/`, admin) or restart after moving the file. `metrics` is served
-to anyone who can reach the server; protect it with `auth` if that matters.
+delayed. A graceful stop writes everything buffered. `metrics` is served to anyone who can
+reach the server; protect it with `auth` if that matters.
+
+**Rotation.** The server does not rotate files itself. Move the file aside, then send SIGHUP:
+the log is reopened by its path, so the next lines go to a new file and the moved one is
+complete once the connections open before the signal have closed (each finishes its buffered
+lines into it).
+
+```bash
+mv logs/access.log logs/access.log.1
+kill -HUP "$(pgrep -f 'SwiftWebServer --config /path/to/http-config.json')"
+```
+
+`newsyslog` signals a process through a pid file, which the server does not write; run the two
+commands above from a LaunchAgent with `StartCalendarInterval` instead (or have your own
+wrapper write a pid file).
 
 ## Shutdown, restart and reload
 
@@ -319,10 +332,23 @@ to anyone who can reach the server; protect it with `auth` if that matters.
   to `drainTimeout` seconds, then the rest are cancelled; the access log flushes and the
   process exits 0. A second signal during the drain is harmless. `scripts/sigterm.sh` sends
   SIGTERM to whatever listens on `PORT` (default 8080).
-- **There is no live reload.** The config file, TLS identity and auth credential files are
-  read once at startup. To apply changes, restart (`launchctl kickstart -k …`). SIGHUP is not
-  handled, so it terminates the process immediately (its default action) without a drain; use
-  SIGTERM.
+- **SIGHUP reloads** `http-config.json` (the same file and command-line overrides as at
+  startup) and reopens the access log file. The new configuration is parsed, validated and
+  built first; on success new requests use it, while requests already running finish on the
+  old one (the old chain, its proxy pools and its log writer are retired once the connections
+  opened before the reload have closed). On failure (bad JSON, an unknown key's error, a root
+  or error page that cannot be opened, an auth file that cannot be read) stderr says
+  `reload failed, keeping the running configuration: …` and nothing changes except the log
+  reopen. Success prints `reloaded the configuration`.
+
+  | Reloaded by SIGHUP | Needs a restart (a change is reported and ignored) |
+  |---|---|
+  | `root`, `index`, `mimeTypes`, `defaultMimeType`, `blockList`, `blockDotfiles`, `caching`, `errorPages`, `compression`, `hosts`, `auth` (and its credential files), `proxy` and `hosts[].proxy`, `accessLog` (path, format, metrics, flush interval) | `host`, `port`, `transport`, `tls` (including the identity file), `http2`, `http3`, `maxConnections`, `drainTimeout`, `timeouts`, `maxBodySize` |
+
+  A restart-only change prints `warning: reload: port changed; needs a restart, ignored`; the
+  rest of the file still reloads. Access log metrics start from zero after a reload (the new
+  chain has its own counters). To apply restart-only keys, restart
+  (`launchctl kickstart -k …`, which sends SIGTERM and drains).
 - Static file *contents* need no restart: cached entries are re-checked with `stat` at most
   once per second.
 
@@ -331,7 +357,7 @@ to anyone who can reach the server; protect it with `auth` if that matters.
 - Release build, installed at a stable path; firewall decision made for that path.
 - `"host": "0.0.0.0"`, `port` 80, `tls.port` 443, `http3` on (UDP 443 open).
 - `passwordEnv` rather than an inline `password`; `.p12` mode `0600`.
-- `accessLog` to a file, rotated; `metrics` behind `auth` or off.
+- `accessLog` to a file, rotated (move it, then SIGHUP); `metrics` behind `auth` or off.
 - `maxConnections`, `maxBodySize` and `timeouts` sized for your traffic; the defaults are
   conservative.
 - LaunchAgent (or LaunchDaemon) with `ExitTimeOut` above `drainTimeout`; renewal hook restarts.

@@ -40,7 +40,8 @@ enum ServerMain {
         Relative paths in the config file resolve against the file's directory. HTTPS,
         HTTP/2 and HTTP/3 are configured with the "tls", "http2" and "http3" keys. Prints "listening HOST:PORT"
         on stdout once bound (then "listening HOST:PORT (https)" and "(h3)" lines for the
-        other listeners). SIGINT/SIGTERM shut down gracefully.
+        other listeners). SIGINT/SIGTERM shut down gracefully. SIGHUP reopens the access log and
+        reloads the configuration (listener, protocol and limit keys need a restart).
         """
 
     static func main() async {
@@ -138,7 +139,13 @@ enum ServerMain {
         do {
             let settings = try settings(options, environment: environment)
             try settings.validate()
-            let handler = try settings.makeHandler(environment: environment)
+            // #0127: SIGHUP rebuilds the chain from the config file and swaps it in.
+            let handler = ReloadableHandler(try settings.makeHandler(environment: environment))
+            let reload: @Sendable () -> Void = {
+                Self.reload(handler, startup: settings, options: options, environment: environment) { next throws(ConfigFileError) in
+                    try next.makeHandler(environment: environment)
+                }
+            }
             let configuration = settings.serverConfiguration
             do {
                 try configuration.validate()
@@ -164,15 +171,43 @@ enum ServerMain {
                     altSvc
                     handler
                 }
-                return await serve(settings, listeners: listeners, protocols: protocols, handler: chain) { addresses, names in
+                return await serve(settings, listeners: listeners, protocols: protocols, handler: chain, reload: reload) { addresses, names in
                     if let index = names.firstIndex(of: "h3") { altSvc.advertise(port: addresses[index].port) }
                 }
             }
             #endif
-            return await serve(settings, listeners: listeners, protocols: protocols, handler: handler)
+            return await serve(settings, listeners: listeners, protocols: protocols, handler: handler, reload: reload)
         } catch {
             printError("\(name): \(error)")
             return 1
+        }
+    }
+
+    /// `SIGHUP` (#0127): reads the configuration again (same file and command-line overrides)
+    /// and swaps in a chain built from it for new requests. The access log files are reopened
+    /// by their paths either way, for log rotation. Listener, protocol and connection-limit
+    /// keys need a restart: a change to them is reported and ignored. A configuration that
+    /// does not load or build is reported and the running one stays.
+    static func reload<H: HTTPHandler>(
+        _ handler: ReloadableHandler<H>, startup: ServerSettings, options: Options, environment: [String: String],
+        build: (ServerSettings) throws(ConfigFileError) -> H
+    ) {
+        printError("\(name): signal \(SIGHUP), reloading the configuration")
+        do {
+            let next = try settings(options, environment: environment)
+            try next.validate()
+            let chain = try build(next)
+            // The old chains' remaining lines go to the reopened file too.
+            handler.reopenAccessLogs()
+            handler.replace(with: chain)
+            let ignored = next.restartOnlyChanges(comparedTo: startup)
+            if !ignored.isEmpty {
+                printError("\(name): warning: reload: \(ignored.joined(separator: ", ")) changed; needs a restart, ignored")
+            }
+            printError("\(name): reloaded the configuration")
+        } catch {
+            handler.reopenAccessLogs()
+            printError("\(name): reload failed, keeping the running configuration: \(error)")
         }
     }
 
@@ -232,6 +267,7 @@ enum ServerMain {
     /// before the `listening` lines are printed, with the addresses and listener names.
     static func serve<H: HTTPHandler>(
         _ settings: ServerSettings, listeners: [ServerListener], protocols: [any ConnectionProtocol], handler: H,
+        reload: (@Sendable () -> Void)? = nil,
         onBound: @escaping @Sendable ([TransportAddress], [String]) -> Void = { _, _ in }
     ) async -> Int32 {
         let server = Server(configuration: settings.serverConfiguration, listeners: listeners,
@@ -252,8 +288,19 @@ enum ServerMain {
             source.resume()
             return source
         }
+        // SIGHUP (#0127): reload on the same serial queue, so reloads never overlap. Ignored
+        // first, so the default action (terminate) never runs.
+        var hangup: (any DispatchSourceSignal)?
+        if let reload {
+            signal(SIGHUP, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: SIGHUP, queue: queue)
+            source.setEventHandler { if case .running = server.lifecycleState { reload() } }
+            source.resume()
+            hangup = source
+        }
         defer {
             for source in sources { source.cancel() }
+            hangup?.cancel()
         }
 
         do {

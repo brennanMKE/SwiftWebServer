@@ -1,4 +1,5 @@
 import AccessLog
+import ConfigFile
 import Foundation
 import HTTP1
 import HTTPCore
@@ -26,6 +27,8 @@ enum H1ConnBench {
           disabledif   `if disabled { NoOp() }` in front of the handler (the condition is read at
                        run time, so the component is compiled in but absent)
           starttime    the bare handler with `RequestContext.startTime` stamped per request
+          reloadable   the handler inside `ReloadableHandler` (#0127, SIGHUP reload): an atomic
+                       load and a context lookup per request, start time stamped
 
         and with the access log (#0090) in front of the handler, its writer running:
 
@@ -80,6 +83,8 @@ enum H1ConnBench {
             hello
         }
 
+        let reloadable = ReloadableHandler(hello)
+
         let logPath = FileManager.default.temporaryDirectory
             .appending(path: "sws-bench-h1conn-\(ProcessInfo.processInfo.processIdentifier).log").path
         defer { try? FileManager.default.removeItem(atPath: logPath) }
@@ -112,6 +117,7 @@ enum H1ConnBench {
             results.append(await measure(name: "h1conn.\(name) disabledif", requests: count, pipeline: pipeline, handler: disabledIf))
             results.append(await measure(name: "h1conn.\(name) starttime", requests: count, pipeline: pipeline, handler: hello,
                                          recordsStartTime: true))
+            results.append(await measure(name: "h1conn.\(name) reloadable", requests: count, pipeline: pipeline, handler: reloadable))
             results.append(await measure(name: "h1conn.\(name) log-metrics", requests: count, pipeline: pipeline, handler: withLogMetrics))
             results.append(await measure(name: "h1conn.\(name) log-null", requests: count, pipeline: pipeline, handler: withLogNull))
             results.append(await measure(name: "h1conn.\(name) log-json", requests: count, pipeline: pipeline, handler: withLogJSON))
@@ -138,6 +144,14 @@ enum H1ConnBench {
         results.append(await dispatch(name: "dispatch chain3", calls: calls, handler: chain3))
         results.append(await dispatch(name: "dispatch chain3inline", calls: calls, handler: chain3Inline))
         results.append(await dispatch(name: "dispatch disabledif", calls: calls, handler: disabledIf))
+        // On a connection opened with the current chain: one atomic load and a context lookup.
+        var reloadableConnection = ConnectionContext(info: benchConnectionInfo)
+        reloadable.connectionWillStart(&reloadableConnection)
+        results.append(await dispatch(name: "dispatch reloadable", calls: calls, handler: reloadable,
+                                      context: reloadableConnection.requestContext))
+        reloadable.connectionDidEnd(reloadableConnection)
+        // No connection context: the lock path a request takes on a connection older than a swap.
+        results.append(await dispatch(name: "dispatch reloadable-locked", calls: calls, handler: reloadable))
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
