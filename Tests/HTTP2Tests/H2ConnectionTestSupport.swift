@@ -92,7 +92,7 @@ struct H2FrameReader {
             case .goaway(let last, let code, let debug):
                 frames.append(.goaway(last: last.rawValue, code, debug: String(decoding: copy(debug), as: UTF8.self)))
             case .rstStream(let stream, let code): frames.append(.rstStream(stream: stream.rawValue, code))
-            case .priority, .pushPromise, .unknown, .streamError:
+            case .priority, .pushPromise, .unknown, .streamError, .priorityUpdate:
                 frames.append(.other("\(output.event)"))
             }
         }

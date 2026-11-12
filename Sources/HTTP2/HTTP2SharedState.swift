@@ -150,6 +150,17 @@ struct HTTP2SharedState: Sendable {
     let smallDataFrameSize: Int
     /// Whether waiters record when they started (``HTTP2AbuseLimits/windowStallTimeout``).
     let tracksWindowStalls: Bool
+    /// RFC 9218 priorities of the dispatched streams (#0065). See "Priorities" below.
+    var priorities: [UInt32: HTTPPriority] = [:]
+    /// PRIORITY_UPDATEs for streams the peer has not opened yet, applied when they open;
+    /// at most ``maxEarlyPriorities``.
+    var earlyPriorities: [UInt32: HTTPPriority] = [:]
+    let maxEarlyPriorities: Int
+    /// The stream that sent last: while it outranks every waiter, ``grantNext(_:writerProgress:)``
+    /// keeps the turn free for it until the writer takes a batch.
+    var lease: UInt32?
+    /// Turns given by priority since the last one given to the oldest waiter.
+    var priorityGrants = 0
 
     init(configuration: HTTP2Configuration) {
         machine = HTTP2Connection(configuration: configuration.connection)
@@ -162,6 +173,8 @@ struct HTTP2SharedState: Sendable {
         maxRunningStreams = configuration.maxConcurrentStreams * 2
         smallDataFrameSize = configuration.abuseLimits.smallDataFrameSize
         tracksWindowStalls = configuration.abuseLimits.windowStallTimeout != nil
+        maxEarlyPriorities = Swift.max(configuration.maxConcurrentStreams, 1)
+        priorities.reserveCapacity(configuration.maxConcurrentStreams)
         sendWaiters.reserveCapacity(configuration.maxConcurrentStreams)
         fairQueue.reserveCapacity(configuration.maxConcurrentStreams)
         streamWaiters.reserveCapacity(configuration.maxConcurrentStreams)
@@ -361,6 +374,10 @@ struct HTTP2SharedState: Sendable {
         let ends = endStream || tooLarge
         switch handle(.sendHeaders(streamID: streamID, endStream: ends), wakeups: &wakeups) {
         case .send:
+            // A handler's `priority` response field reprioritizes its stream (RFC 9218 §5).
+            if !ends, var priority = priorities[streamID.rawValue], priority.apply(from: headers) {
+                priorities[streamID.rawValue] = priority
+            }
             if tooLarge {
                 encoder.encode(
                     streamID: streamID, status: .internalServerError, headers: HTTPFields(), contentLength: nil,
@@ -393,6 +410,7 @@ struct HTTP2SharedState: Sendable {
                 outbound.ordered.append(ByteView(offset: bytes.readerIndex, length: length), from: bytes)
             }
             wakeWriter(&wakeups)
+            lease = ends ? nil : streamID.rawValue
             if length < bytes.readableBytes && length < smallDataFrameSize && length < machine.peerMaxFrameSize {
                 // A send window cut this frame short: a client that keeps its windows tiny
                 // makes the server send many small frames (slow read, #0056).
@@ -502,15 +520,80 @@ struct HTTP2SharedState: Sendable {
         sendWaiters[ticket] = waiter
     }
 
-    /// Gives the turn to the first queued writer that can proceed, if nobody has it.
-    mutating func grantNext(_ wakeups: inout HTTP2Wakeups) {
+    /// Gives the turn to the queued writer that can proceed and ranks first by RFC 9218
+    /// priority (#0065), if nobody has it.
+    ///
+    /// Lower urgency goes first. At equal urgency non-incremental streams go one at a time in
+    /// stream order, then incremental ones in queue order: a writer that sent rejoins at the
+    /// back, so they take turns frame by frame. While the stream that sent last (the
+    /// ``lease``) outranks every waiter, the turn stays free for it to come back, unless
+    /// `writerProgress` (the writer just took a batch: the transport moved). Every
+    /// ``fairShareInterval``th turn goes to the oldest waiter regardless of priority, so a
+    /// low-priority response still progresses under contention, slowly. With every stream
+    /// incremental at one urgency this is the plain round robin of #0054; streams at the
+    /// default priority (`u=3`, not incremental) now go one at a time, as RFC 9218 §4 asks.
+    mutating func grantNext(_ wakeups: inout HTTP2Wakeups, writerProgress: Bool = false) {
+        if writerProgress { lease = nil }
         guard granted == nil, !fairQueue.isEmpty, outbound.hasSpace else { return }
+        var oldest: UInt64?
+        var best: UInt64?
+        var bestKey: (UInt8, UInt8, UInt64) = (UInt8.max, UInt8.max, UInt64.max)
         for ticket in fairQueue {
-            guard let waiter = sendWaiters[ticket] else { continue }
-            if canProceed(needsWindow: waiter.needsWindow) {
-                granted = ticket
-                wake(ticket, &wakeups)
-                return
+            guard let waiter = sendWaiters[ticket], canProceed(needsWindow: waiter.needsWindow) else { continue }
+            if oldest == nil { oldest = ticket }
+            let key = schedulingKey(waiter.streamID)
+            if best == nil || key < bestKey {
+                best = ticket
+                bestKey = key
+            }
+        }
+        guard let oldest, var chosen = best else { return }
+        if let lease, sendWaiters[chosen]?.streamID != lease, priorities[lease] != nil,
+           schedulingKey(lease) < bestKey {
+            return
+        }
+        if chosen != oldest {
+            priorityGrants += 1
+            if priorityGrants >= Self.fairShareInterval { chosen = oldest }
+        }
+        if chosen == oldest { priorityGrants = 0 }
+        granted = chosen
+        wake(chosen, &wakeups)
+    }
+
+    /// One turn in this many goes to the oldest waiter, whatever its priority.
+    static let fairShareInterval = 16
+
+    // MARK: Priorities (RFC 9218, #0065)
+
+    func schedulingKey(_ stream: UInt32) -> (UInt8, UInt8, UInt64) {
+        (priorities[stream] ?? .default).schedulingKey(streamID: UInt64(stream))
+    }
+
+    /// A stream was dispatched with the priority its request signals; a PRIORITY_UPDATE that
+    /// arrived before it opened wins (RFC 9218 §7).
+    mutating func openPriority(_ id: HTTP2StreamID, _ requested: HTTPPriority) {
+        priorities[id.rawValue] = earlyPriorities.removeValue(forKey: id.rawValue) ?? requested
+        // Client streams open in increasing order: updates kept for lower ones (streams refused
+        // before dispatch) can no longer apply.
+        if !earlyPriorities.isEmpty {
+            for stream in earlyPriorities.keys where stream < id.rawValue { earlyPriorities.removeValue(forKey: stream) }
+        }
+    }
+
+    /// A PRIORITY_UPDATE: reprioritizes a running stream, is kept for a stream not opened yet
+    /// (up to ``maxEarlyPriorities``; more are ignored), and is ignored for a closed stream or
+    /// a server-initiated one. An invalid field value is ignored.
+    mutating func priorityUpdate(_ id: HTTP2StreamID, field: UnsafeRawBufferPointer, wakeups: inout HTTP2Wakeups) {
+        guard id.rawValue & 1 == 1 else { return }
+        var priority = HTTPPriority()
+        guard priority.apply(field) else { return }
+        if priorities[id.rawValue] != nil {
+            priorities[id.rawValue] = priority
+            grantNext(&wakeups)
+        } else if id.rawValue > machine.streams.highestClientStreamID.rawValue {
+            if earlyPriorities[id.rawValue] != nil || earlyPriorities.count < maxEarlyPriorities {
+                earlyPriorities[id.rawValue] = priority
             }
         }
     }
@@ -601,7 +684,7 @@ struct HTTP2SharedState: Sendable {
     /// Takes the next batch for the writer, or tells it to close or wait.
     mutating func nextWriterStep(wakeups: inout HTTP2Wakeups) -> WriterStep {
         if let batch = outbound.takeBatch() {
-            grantNext(&wakeups)  // Queue space for the next stream writer.
+            grantNext(&wakeups, writerProgress: true)  // Queue space for the next stream writer.
             return .send(batch)
         }
         if let reason = outbound.closeReason { return .close(reason) }
@@ -651,6 +734,11 @@ struct HTTP2SharedState: Sendable {
         bodies.removeValue(forKey: streamID.rawValue)
         tasks.removeValue(forKey: streamID.rawValue)
         tunnels.remove(streamID.rawValue)
+        priorities.removeValue(forKey: streamID.rawValue)
+        if lease == streamID.rawValue {
+            lease = nil
+            grantNext(&wakeups)
+        }
         if isOpen { _ = handle(.responseFinished(streamID: streamID), wakeups: &wakeups) }
         if draining && activeStreams == 0 { close(.shutdown, wakeups: &wakeups) }
     }
