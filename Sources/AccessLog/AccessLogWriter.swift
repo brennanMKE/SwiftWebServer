@@ -83,6 +83,11 @@ extension AccessLogCore {
             // `next()` returns nil once this task is cancelled and the queue is empty.
             while let batch = await queue.next() {
                 write(batch, to: sink)
+                while let more = queue.tryNext() { write(more, to: sink) }
+                // Let batches gather before waiting again: a busy server then wakes the writer
+                // about once per `writerCoalescing` instead of once per batch (a wake-up is
+                // paid on the request path that hands the batch over).
+                if (try? await Task.sleep(for: Self.writerCoalescing)) == nil { break }
             }
             group.cancelAll()
         }
@@ -91,17 +96,24 @@ extension AccessLogCore {
         // Lines handed over after this are dropped and counted.
         queue.finish()
         while let batch = await queue.next() { write(batch, to: sink) }
-        for batch in takeAll() { write(batch, to: sink) }
+        for batch in takeAll() {
+            counters.linesLogged.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
+            write(batch, to: sink)
+        }
     }
 
-    /// Writes one batch and counts it.
+    /// How long the writer lets batches gather after each burst.
+    static let writerCoalescing: Duration = .milliseconds(1)
+
+    /// Writes one batch, counts it and keeps its buffer for reuse.
     func write(_ batch: LogBatch, to sink: AccessLogSink) {
+        defer { recycle(batch.bytes) }
         if sink.write(batch.bytes) {
-            linesWritten.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
-            bytesWritten.wrappingAdd(UInt64(batch.bytes.readableBytes), ordering: .relaxed)
+            counters.linesWritten.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
+            counters.bytesWritten.wrappingAdd(UInt64(batch.bytes.readableBytes), ordering: .relaxed)
         } else {
-            writeErrors.wrappingAdd(1, ordering: .relaxed)
-            linesDropped.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
+            counters.writeErrors.wrappingAdd(1, ordering: .relaxed)
+            counters.linesDropped.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
         }
     }
 }

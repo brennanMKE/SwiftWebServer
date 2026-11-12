@@ -37,15 +37,17 @@ public enum AccessLogDestination: Sendable {
 public struct AccessLogOptions: Sendable {
     /// A connection hands its buffered lines to the writer once they reach this many bytes.
     public var batchSize: Int
-    /// Batches the writer may have queued. When the queue is full, a batch is dropped and
-    /// its lines are counted in ``AccessLogStatistics/linesDropped``: the request path never
-    /// waits for the writer.
+    /// Batches the writer may have queued (memory is only used while they wait: 1024 batches
+    /// of 8 KiB is at most 8 MiB). When the queue is full, a batch is dropped and its lines
+    /// are counted in ``AccessLogStatistics/linesDropped``: the request path never waits for
+    /// the writer. The writer drains the queue in bursts about once a millisecond, so the
+    /// queue must hold a millisecond or so of lines at the peak rate.
     public var queueCapacity: Int
     /// How often the writer collects lines that idle connections have buffered, so a line
     /// reaches the destination within about this long of its request.
     public var flushInterval: Duration
 
-    public init(batchSize: Int = 8 * 1024, queueCapacity: Int = 256, flushInterval: Duration = .seconds(1)) {
+    public init(batchSize: Int = 8 * 1024, queueCapacity: Int = 1024, flushInterval: Duration = .seconds(1)) {
         precondition(batchSize > 0, "AccessLogOptions.batchSize must be positive")
         precondition(queueCapacity > 0, "AccessLogOptions.queueCapacity must be positive")
         self.batchSize = batchSize
@@ -56,7 +58,8 @@ public struct AccessLogOptions: Sendable {
 
 /// Lines an ``AccessLog`` wrote and dropped since it was created.
 public struct AccessLogStatistics: Sendable, Hashable {
-    /// Lines formatted (on any connection).
+    /// Lines handed toward the writer (written, queued or dropped). Counted per batch, so
+    /// lines still buffered by a connection are not in it yet.
     public var linesLogged: UInt64
     /// Lines the writer wrote to the destination.
     public var linesWritten: UInt64

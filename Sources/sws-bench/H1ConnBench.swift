@@ -98,6 +98,7 @@ enum H1ConnBench {
         // The writers run beside the measurements, as a server runs them.
         let handle = ServerHandle(localAddresses: [], draining: ShutdownSignal()) {}
         var results: [Result] = []
+        let calls = max(requests * 10, 10_000)  // dispatch rows
         await withDiscardingTaskGroup { writers in
         for log in logs {
             writers.addTask { try? await log.run(server: handle) }
@@ -118,12 +119,20 @@ enum H1ConnBench {
             results.append(await measure(name: "h1conn.\(name) log-file-metrics", requests: count, pipeline: pipeline,
                                          handler: withLogFileMetrics))
         }
+        for (name, chain) in [("log-metrics", withLogMetrics), ("log-null", withLogNull), ("log-json", withLogJSON)] {
+            var connection = ConnectionContext(info: benchConnectionInfo, recordsRequestStartTime: true)
+            ConnectionObservers(chain: chain).connectionWillStart(&connection)
+            var context = connection.requestContext
+            context.startTime = .now()
+            results.append(await dispatch(name: "dispatch \(name)", calls: calls, handler: chain, context: context))
+        }
         writers.cancelAll()
         }
-        for log in logs where log.statistics.linesDropped > 0 {
-            printError("h1conn: an access log dropped \(log.statistics.linesDropped) of \(log.statistics.linesLogged) lines")
+        for (name, log) in zip(["log-metrics", "log-null", "log-json", "log-file", "log-file-metrics"], logs)
+        where log.statistics.linesDropped > 0 {
+            printError("h1conn: \(name) dropped \(log.statistics.linesDropped) of \(log.statistics.linesLogged) lines "
+                + "(the writer fell behind; the request path does not wait)")
         }
-        let calls = max(requests * 10, 10_000)
         results.append(await dispatch(name: "dispatch request", calls: calls, handler: hello))
         results.append(await dispatch(name: "dispatch empty", calls: calls, handler: empty))
         results.append(await dispatch(name: "dispatch chain3", calls: calls, handler: chain3))
@@ -186,11 +195,11 @@ enum H1ConnBench {
 
     /// ns and allocations per direct `handle` call (no connection, no clock read): the cost of
     /// the chain itself. Short and long runs as in ``measure(name:requests:pipeline:handler:)``.
-    static func dispatch<H: HTTPHandler>(name: String, calls: Int, handler: H) async -> Result {
+    static func dispatch<H: HTTPHandler>(name: String, calls: Int, handler: H,
+                                         context: RequestContext = RequestContext()) async -> Result {
         let storage = HTTPRequestStorage(bufferCapacity: 256, fieldCapacity: 8)
         storage.buffer.append("/")
         let request = HTTPRequest(method: .get, path: ByteView(offset: 0, length: 1), headers: storage.fieldsView)
-        let context = RequestContext()
         // Through an existential, as the protocol runners call it: unspecialized.
         let handler: any HTTPHandler = opaque(handler)
         func loop(_ n: Int) async -> (Duration, Int?) {

@@ -181,9 +181,10 @@ public enum AccessLogLineFormatter {
 
     // MARK: Lines
 
-    /// One request's fields, as views into the request (valid while the handler runs).
+    /// One request's recorded values besides the request itself (whose views stay valid while
+    /// the handler runs). The request is passed alongside, not stored, so formatting a line
+    /// retains nothing.
     public struct Fields {
-        public var request: HTTPRequest
         public var status: Int
         /// Response body bytes, or `nil` when unknown (a stream without a length).
         public var responseBytes: Int?
@@ -191,9 +192,8 @@ public enum AccessLogLineFormatter {
         public var referer: ByteView?
         public var userAgent: ByteView?
 
-        public init(request: HTTPRequest, status: Int, responseBytes: Int?, durationNanoseconds: UInt64?,
+        public init(status: Int, responseBytes: Int?, durationNanoseconds: UInt64?,
                     referer: ByteView?, userAgent: ByteView?) {
-            self.request = request
             self.status = status
             self.responseBytes = responseBytes
             self.durationNanoseconds = durationNanoseconds
@@ -201,31 +201,51 @@ public enum AccessLogLineFormatter {
             self.userAgent = userAgent
         }
 
-        /// The most bytes the line for these fields can take, with a `remote` of that length.
-        public func bound(format: AccessLogFormat, remoteLength: Int) -> Int {
+        /// The most bytes the line for `request` and these fields can take after a prefix of
+        /// `prefixLength` bytes.
+        public func bound(for request: HTTPRequest, format: AccessLogFormat, prefixLength: Int) -> Int {
             var variable = request.path.length + request.query.length
             if format != .common {
                 variable += (referer?.length ?? 0) + (userAgent?.length ?? 0)
             }
-            return AccessLogLineFormatter.fixedBound + remoteLength + AccessLogLineFormatter.expansion(format) * variable
+            return AccessLogLineFormatter.fixedBound + prefixLength + AccessLogLineFormatter.expansion(format) * variable
         }
     }
 
-    /// Writes one line (newline included). `remote` is the already-escaped peer address, `date`
-    /// the rendered date (``writeDate(_:format:to:)``) and `protocolName` `HTTP/1.1`, `HTTP/2.0`
-    /// or `HTTP/3.0`. The writer must have ``Fields/bound(format:remoteLength:)`` bytes free.
-    public static func writeLine(
-        _ fields: Fields, format: AccessLogFormat, remote: Span<UInt8>, date: Span<UInt8>,
-        protocolName: StaticString, to writer: inout ByteBuffer.Writer
-    ) {
-        let request = fields.request
+    /// Writes the part of a line that only changes once per second on a connection:
+    /// `<remote> - - [<date>] "` (Common, Combined) or
+    /// `{"time":"<date>","remote":"<remote>","protocol":"<protocol>","method":"` (JSON).
+    /// `remote` must already be escaped for the format.
+    public static func writePrefix(format: AccessLogFormat, remote: Span<UInt8>, seconds: Int64,
+                                   protocolName: StaticString, to writer: inout ByteBuffer.Writer) {
         switch format {
         case .common, .combined:
             writer.append(contentsOf: remote)
             writer.append(" - - [")
-            writer.append(contentsOf: date)
+            writeDate(seconds, format: format, to: &writer)
             writer.append("] \"")
-            writeMethod(request.method, to: &writer)
+        case .json:
+            writer.append("{\"time\":\"")
+            writeDate(seconds, format: format, to: &writer)
+            writer.append("\",\"remote\":\"")
+            writer.append(contentsOf: remote)
+            writer.append("\",\"protocol\":\"")
+            writer.append(protocolName)
+            writer.append("\",\"method\":\"")
+        }
+    }
+
+    /// Writes one line (newline included) after `prefix` (``writePrefix(format:remote:seconds:protocolName:to:)``).
+    /// `protocolName` is `HTTP/1.1`, `HTTP/2.0` or `HTTP/3.0`. The writer must have
+    /// ``Fields/bound(for:format:prefixLength:)`` bytes free.
+    public static func writeLine(
+        _ request: HTTPRequest, _ fields: Fields, format: AccessLogFormat, prefix: Span<UInt8>,
+        protocolName: StaticString, to writer: inout ByteBuffer.Writer
+    ) {
+        writer.append(contentsOf: prefix)
+        writeMethod(request.method, to: &writer)
+        switch format {
+        case .common, .combined:
             writer.append(UInt8(ascii: " "))
             request.withSpan(of: request.path) { appendCLFEscaped($0, to: &writer) }
             if !request.query.isEmpty {
@@ -235,12 +255,12 @@ public enum AccessLogLineFormatter {
             writer.append(UInt8(ascii: " "))
             writer.append(protocolName)
             writer.append(UInt8(ascii: "\""), UInt8(ascii: " "))
-            writer.append(decimal: max(fields.status, 0))
-            writer.append(UInt8(ascii: " "))
+            writeStatus(fields.status, to: &writer)
             if let bytes = fields.responseBytes, bytes > 0 {
+                writer.append(UInt8(ascii: " "))
                 writer.append(decimal: bytes)
             } else {
-                writer.append(UInt8(ascii: "-"))
+                writer.append(UInt8(ascii: " "), UInt8(ascii: "-"))
             }
             if format == .combined {
                 writer.append(" \"")
@@ -250,20 +270,12 @@ public enum AccessLogLineFormatter {
                 writer.append(UInt8(ascii: "\""))
             }
         case .json:
-            writer.append("{\"time\":\"")
-            writer.append(contentsOf: date)
-            writer.append("\",\"remote\":\"")
-            writer.append(contentsOf: remote)
-            writer.append("\",\"protocol\":\"")
-            writer.append(protocolName)
-            writer.append("\",\"method\":\"")
-            writeMethod(request.method, to: &writer)
             writer.append("\",\"path\":\"")
             request.withSpan(of: request.path) { appendJSONEscaped($0, to: &writer) }
             writer.append("\",\"query\":\"")
             request.withSpan(of: request.query) { appendJSONEscaped($0, to: &writer) }
             writer.append("\",\"status\":")
-            writer.append(decimal: max(fields.status, 0))
+            writeStatus(fields.status, to: &writer)
             writer.append(",\"bytes\":")
             if let bytes = fields.responseBytes {
                 writer.append(decimal: max(bytes, 0))
@@ -283,6 +295,17 @@ public enum AccessLogLineFormatter {
             writer.append(UInt8(ascii: "}"))
         }
         writer.append(UInt8(ascii: "\n"))
+    }
+
+    /// Three digits for the usual 100...999, decimal otherwise.
+    @inline(__always)
+    static func writeStatus(_ status: Int, to writer: inout ByteBuffer.Writer) {
+        if status >= 100 && status <= 999 {
+            writer.append(UInt8(truncatingIfNeeded: 0x30 &+ status / 100))
+            writer.append(twoDigits: status % 100)
+        } else {
+            writer.append(decimal: max(status, 0))
+        }
     }
 
     static func writeMethod(_ method: HTTPMethod, to writer: inout ByteBuffer.Writer) {

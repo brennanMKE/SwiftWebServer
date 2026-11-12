@@ -25,6 +25,10 @@ import Synchronization
 /// connection closes. A component that throws shuts the server down, and `run()` rethrows the
 /// error after draining.
 ///
+/// ``ConnectionObserver``s (per-connection state: an access log's buffer and counters) are
+/// found the same way; each connection is opened with them before its protocol runs and
+/// closed with them after its transport closed (#0090).
+///
 /// ## Task tree
 ///
 /// `run()` is the root: one child task per component, one per listener, and under each listener

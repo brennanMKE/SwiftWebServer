@@ -121,7 +121,7 @@ public final class AccessLogMetrics: Sendable {
         /// Open connections' shards.
         var live: [ObjectIdentifier: MetricShard] = [:]
         /// Access logs whose writer statistics are reported here.
-        var logs: [ObjectIdentifier: AccessLogCore] = [:]
+        var logs: [ObjectIdentifier: LogCounters] = [:]
     }
 
     let state = Mutex(State())
@@ -130,7 +130,7 @@ public final class AccessLogMetrics: Sendable {
 
     /// The totals so far: closed connections plus the current counts of open ones.
     public func snapshot() -> Snapshot {
-        let (snapshot, logs) = state.withLock { state -> (Snapshot, [AccessLogCore]) in
+        let (snapshot, logs) = state.withLock { state -> (Snapshot, [LogCounters]) in
             var snapshot = state.total
             for shard in state.live.values { snapshot.merge(shard) }
             return (snapshot, Array(state.logs.values))
@@ -172,7 +172,7 @@ public final class AccessLogMetrics: Sendable {
         state.withLock { $0.live[ObjectIdentifier(shard)] = shard }
     }
 
-    func attach(_ log: AccessLogCore) {
+    func attach(_ log: LogCounters) {
         state.withLock { $0.logs[ObjectIdentifier(log)] = log }
     }
 

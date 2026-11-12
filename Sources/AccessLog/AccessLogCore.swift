@@ -16,10 +16,12 @@ struct LogBatch: Sendable {
 struct LogBuffer: Sendable {
     var bytes = ByteBuffer()
     var lines = 0
-    /// The rendered date and the clock tick before which it is current (see `SystemWallClock`).
-    var date = ByteBuffer()
-    var dateSecond: Int64 = -1
-    var dateStableUntilTick: UInt64 = 0
+    /// The start of every line on this connection for the current second: the peer and the
+    /// date (and for JSON the protocol), rendered once per second so a line is a few appends.
+    var prefix = ByteBuffer()
+    var prefixSecond: Int64 = -1
+    /// The clock tick before which ``prefixSecond`` is current (see `SystemWallClock`).
+    var prefixStableUntilTick: UInt64 = 0
 
     /// Takes the buffered lines, leaving an empty buffer that allocates on its next line (an
     /// idle connection holds no buffer).
@@ -40,16 +42,27 @@ struct LogBuffer: Sendable {
 ///   requests and the writer's periodic collection take (uncontended on HTTP/1.1), and handed
 ///   to the writer in batches.
 /// - Metrics go to ``shard`` with relaxed atomic adds, no lock.
+///
+/// The request path reads only trivial stored values (no retains) besides the lock.
 final class AccessLogConnection: Sendable {
     let settings: LogSettings
     let shard = MetricShard()
     let log = Mutex(LogBuffer())
-    /// The peer address, escaped for the format; `-` when unknown.
+    let format: AccessLogFormat
+    let batchSize: Int
+    let bufferCapacity: Int
+    /// The peer address, escaped for the format; `-` when unknown. Read once per second.
     let remote: ByteBuffer
     let protocolName: StaticString
+    /// Where to find a recycled buffer for a new batch; `nil` for the core's shared state.
+    let spares: AccessLogCore?
 
-    init(settings: LogSettings, info: ConnectionInfo) {
+    init(settings: LogSettings, info: ConnectionInfo, spares: AccessLogCore?) {
         self.settings = settings
+        self.spares = spares
+        format = settings.format
+        batchSize = settings.batchSize
+        bufferCapacity = settings.bufferCapacity
         var remote = ByteBuffer()
         if let host = info.remoteAddress?.host, !host.isEmpty {
             let bytes = ByteBuffer(bytes: host.utf8)
@@ -75,26 +88,46 @@ final class AccessLogConnection: Sendable {
 
     /// Formats one line into the buffer; returns a full batch to hand to the writer.
     @inline(__always)
-    func append(_ fields: AccessLogLineFormatter.Fields, endTicks: UInt64) -> LogBatch? {
-        let settings = self.settings
-        let bound = fields.bound(format: settings.format, remoteLength: remote.readableBytes)
+    func append(_ request: HTTPRequest, _ fields: AccessLogLineFormatter.Fields, endTicks: UInt64) -> LogBatch? {
+        let format = self.format
+        let protocolName = self.protocolName
+        let batchSize = self.batchSize
         return log.withLock { state -> LogBatch? in
-            if endTicks >= state.dateStableUntilTick || state.date.isEmpty {
-                settings.refreshDate(&state)
+            if endTicks >= state.prefixStableUntilTick || state.prefix.isEmpty {
+                refreshPrefix(&state)
             }
+            let bound = fields.bound(for: request, format: format, prefixLength: state.prefix.readableBytes)
             if state.bytes.capacity == 0 {
-                state.bytes.reserveCapacity(minimumWritableBytes: Swift.max(settings.bufferCapacity, bound))
+                if let spare = spares?.spareBuffer() {
+                    state.bytes = spare
+                } else {
+                    state.bytes.reserveCapacity(minimumWritableBytes: Swift.max(bufferCapacity, bound))
+                }
             }
             state.bytes.withWriter(reservingCapacity: bound) { writer in
-                state.date.withReadableSpan { date in
-                    remote.withReadableSpan { remote in
-                        AccessLogLineFormatter.writeLine(fields, format: settings.format, remote: remote, date: date,
-                                                         protocolName: protocolName, to: &writer)
-                    }
+                state.prefix.withReadableSpan { prefix in
+                    AccessLogLineFormatter.writeLine(request, fields, format: format, prefix: prefix,
+                                                     protocolName: protocolName, to: &writer)
                 }
             }
             state.lines &+= 1
-            return state.bytes.readableBytes >= settings.batchSize ? state.take() : nil
+            return state.bytes.readableBytes >= batchSize ? state.take() : nil
+        }
+    }
+
+    /// Re-renders the line prefix when the second changed.
+    @inline(never)
+    func refreshPrefix(_ state: inout LogBuffer) {
+        let reading = settings.clock.read()
+        state.prefixStableUntilTick = reading.stableUntilTick
+        guard reading.seconds != state.prefixSecond || state.prefix.isEmpty else { return }
+        state.prefixSecond = reading.seconds
+        state.prefix.clear()
+        state.prefix.withWriter(reservingCapacity: remote.readableBytes + 128) { writer in
+            remote.withReadableSpan { remote in
+                AccessLogLineFormatter.writePrefix(format: format, remote: remote, seconds: reading.seconds,
+                                                   protocolName: protocolName, to: &writer)
+            }
         }
     }
 }
@@ -112,19 +145,6 @@ final class LogSettings: Sendable {
         self.format = format
         self.batchSize = batchSize
         self.bufferCapacity = batchSize + 1024
-    }
-
-    /// Re-renders the cached date when the second changed.
-    func refreshDate(_ state: inout LogBuffer) {
-        let reading = clock.read()
-        state.dateStableUntilTick = reading.stableUntilTick
-        guard reading.seconds != state.dateSecond || state.date.isEmpty else { return }
-        state.dateSecond = reading.seconds
-        state.date.clear()
-        let length = AccessLogLineFormatter.dateLength(format)
-        state.date.withWriter(reservingCapacity: length) { writer in
-            AccessLogLineFormatter.writeDate(reading.seconds, format: format, to: &writer)
-        }
     }
 }
 
@@ -148,11 +168,10 @@ final class AccessLogCore: Sendable {
     /// Open connections, so the writer can collect what idle ones have buffered.
     let live = Mutex<[ObjectIdentifier: AccessLogConnection]>([:])
 
-    let linesLogged = Atomic<UInt64>(0)
-    let linesWritten = Atomic<UInt64>(0)
-    let linesDropped = Atomic<UInt64>(0)
-    let bytesWritten = Atomic<UInt64>(0)
-    let writeErrors = Atomic<UInt64>(0)
+    let counters = LogCounters()
+    /// Written batches' buffers, reused by connections for their next batch so a batch costs
+    /// no `malloc`/`free` pair (the free would be on the writer's thread).
+    let spareBuffers = Mutex<[ByteBuffer]>([])
 
     init(format: AccessLogFormat, destination: AccessLogDestination?, metrics: AccessLogMetrics?,
          options: AccessLogOptions) {
@@ -162,7 +181,7 @@ final class AccessLogCore: Sendable {
         self.options = options
         self.metrics = metrics
         self.queue = BoundedAsyncQueue(capacity: options.queueCapacity)
-        self.sharedConnection = AccessLogConnection(settings: settings, info: ConnectionInfo())
+        self.sharedConnection = AccessLogConnection(settings: settings, info: ConnectionInfo(), spares: nil)
         #if canImport(Darwin)
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
@@ -173,7 +192,7 @@ final class AccessLogCore: Sendable {
         timebaseDenominator = 1
         #endif
         if let metrics {
-            metrics.attach(self)
+            metrics.attach(counters)
             metrics.attachShared(sharedConnection.shard)
         }
     }
@@ -182,13 +201,7 @@ final class AccessLogCore: Sendable {
 
     var logs: Bool { destination != nil }
 
-    var statistics: AccessLogStatistics {
-        AccessLogStatistics(linesLogged: linesLogged.load(ordering: .relaxed),
-                            linesWritten: linesWritten.load(ordering: .relaxed),
-                            linesDropped: linesDropped.load(ordering: .relaxed),
-                            bytesWritten: bytesWritten.load(ordering: .relaxed),
-                            writeErrors: writeErrors.load(ordering: .relaxed))
-    }
+    var statistics: AccessLogStatistics { counters.statistics }
 
     // MARK: Request path
 
@@ -221,24 +234,26 @@ final class AccessLogCore: Sendable {
             referer = request.headers.firstValue(for: .referer)
             userAgent = request.headers.firstValue(for: .userAgent)
         }
-        let fields = AccessLogLineFormatter.Fields(request: request, status: status, responseBytes: sentBytes,
+        let fields = AccessLogLineFormatter.Fields(status: status, responseBytes: sentBytes,
                                                    durationNanoseconds: duration, referer: referer,
                                                    userAgent: userAgent)
-        linesLogged.wrappingAdd(1, ordering: .relaxed)
-        if let batch = connection.append(fields, endTicks: end.ticks) { submit(batch) }
+        if let batch = connection.append(request, fields, endTicks: end.ticks) { submit(batch) }
     }
 
     /// Hands a batch to the writer, or drops and counts it if the queue is full. Never waits.
     func submit(_ batch: LogBatch) {
+        // Counted per batch, not per line: a global counter bumped by every request on every
+        // core would bounce its cache line between them.
+        counters.linesLogged.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
         if !queue.trySend(batch) {
-            linesDropped.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
+            counters.linesDropped.wrappingAdd(UInt64(batch.lines), ordering: .relaxed)
         }
     }
 
     // MARK: Connections
 
     func openConnection(_ info: ConnectionInfo) -> AccessLogConnection {
-        let connection = AccessLogConnection(settings: settings, info: info)
+        let connection = AccessLogConnection(settings: settings, info: info, spares: self)
         if logs { live.withLock { $0[ObjectIdentifier(connection)] = connection } }
         metrics?.open(connection.shard)
         return connection
@@ -263,6 +278,24 @@ final class AccessLogCore: Sendable {
         if let full { submit(full) }
     }
 
+    /// Spare buffers kept after a burst (about 0.6 MiB at the default batch size).
+    static let maximumSpareBuffers = 64
+
+    /// Keeps a written buffer for a connection's next batch.
+    func recycle(_ buffer: ByteBuffer) {
+        var buffer = buffer
+        guard buffer.capacity >= settings.bufferCapacity else { return }
+        buffer.clear(keepingCapacity: true)
+        spareBuffers.withLock { spares in
+            if spares.count < Self.maximumSpareBuffers { spares.append(buffer) }
+        }
+    }
+
+    /// A cleared buffer for a new batch: a recycled one when there is one.
+    func spareBuffer() -> ByteBuffer? {
+        spareBuffers.withLock { $0.popLast() }
+    }
+
     /// Hands every buffered line to the writer: the open connections' and the shared buffer.
     func collect() {
         for batch in takeAll() { submit(batch) }
@@ -277,6 +310,24 @@ final class AccessLogCore: Sendable {
         }
         if let batch = sharedConnection.log.withLock({ $0.take() }) { batches.append(batch) }
         return batches
+    }
+}
+
+/// An access log's writer statistics: shared with ``AccessLogMetrics`` (which reports them)
+/// without the metrics holding the log.
+final class LogCounters: Sendable {
+    let linesLogged = Atomic<UInt64>(0)
+    let linesWritten = Atomic<UInt64>(0)
+    let linesDropped = Atomic<UInt64>(0)
+    let bytesWritten = Atomic<UInt64>(0)
+    let writeErrors = Atomic<UInt64>(0)
+
+    var statistics: AccessLogStatistics {
+        AccessLogStatistics(linesLogged: linesLogged.load(ordering: .relaxed),
+                            linesWritten: linesWritten.load(ordering: .relaxed),
+                            linesDropped: linesDropped.load(ordering: .relaxed),
+                            bytesWritten: bytesWritten.load(ordering: .relaxed),
+                            writeErrors: writeErrors.load(ordering: .relaxed))
     }
 }
 

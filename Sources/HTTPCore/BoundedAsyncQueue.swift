@@ -239,6 +239,26 @@ public final class BoundedAsyncQueue<Element: Sendable>: Sendable, AsyncSequence
         }
     }
 
+    /// Removes the next buffered element without suspending, or returns `nil` when none is
+    /// buffered. For a consumer that drains in bursts (an access log writer, #0090). Same
+    /// single-consumer rule as ``next()``.
+    public func tryNext() -> Element? {
+        let taken: (Element, CheckedContinuation<Void, any Error>?)? = state.withLock { state in
+            guard state.count > 0 else { return nil }
+            let element = state.pop()
+            var resumed: CheckedContinuation<Void, any Error>?
+            if !state.producers.isEmpty {
+                let producer = state.producers.removeFirst()
+                state.push(producer.element)
+                resumed = producer.continuation
+            }
+            return (element, resumed)
+        }
+        guard let (element, producer) = taken else { return nil }
+        producer?.resume()
+        return element
+    }
+
     public struct AsyncIterator: AsyncIteratorProtocol {
         let queue: BoundedAsyncQueue
 
