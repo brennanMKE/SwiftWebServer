@@ -790,6 +790,16 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             gate = assembler.handle(.otherFrame(.windowUpdate, streamID: id))
             machineEvent = .windowUpdate(streamID: id, increment: increment)
             abuse = .windowUpdates
+        case .priorityUpdate(let id, let field):
+            // RFC 9218 §7.1 (#0065). Counted with the other control frames, so a flood of them
+            // closes the connection like a PING or SETTINGS flood.
+            if case .connectionError(let code) = assembler.handle(.otherFrame(.priorityUpdate, streamID: .connection)) {
+                handle(.connectionError(.connection(code, reason: "frame inside a header block")))
+                return .stop
+            }
+            if case .goaway = handle(.unknownFrame, counting: .controlFrames) { return .stop }
+            parser.withPayload(field, in: input) { value in priorityUpdate(id, field: value) }
+            return .proceed
         case .unknown(let header):
             gate = assembler.handle(.otherFrame(header.type, streamID: header.streamID))
             machineEvent = .unknownFrame
@@ -954,8 +964,12 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
             request.body = HTTPRequestBody(source: channel, request: channel.requestID, length: head.contentLength)
             body = channel
         }
+        // RFC 9218 (#0065): the `priority` request field, default `u=3`, not incremental.
+        var priority = HTTPPriority()
+        priority.apply(from: request.headers)
         // Registered before any later frame on the stream is read, so a reset finds them.
         let limitReached = state.withLock { shared -> Bool in
+            shared.openPriority(id, priority)
             shared.tasks[id.rawValue] = task
             if let body { shared.bodies[id.rawValue] = body }
             return shared.streamLimitReached
@@ -969,6 +983,7 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
     /// once the response ends (§8.1).
     func reject(_ id: HTTP2StreamID, _ status: HTTPStatus, storage: HTTPRequestStorage, task: HTTP2StreamTask) -> ReadStep {
         let limitReached = state.withLock { shared -> Bool in
+            shared.openPriority(id, HTTPPriority())
             shared.tasks[id.rawValue] = task
             return shared.streamLimitReached
         }
@@ -1078,6 +1093,13 @@ final class HTTP2ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPH
         await tunnel(transport, TunnelContext(shutdown: context.shutdown))
         _ = await transport.finish()
         if Task.isCancelled { handle(.sendReset(streamID: id, .cancel)) }
+    }
+
+    /// Applies a PRIORITY_UPDATE's field value to `id` (#0065).
+    func priorityUpdate(_ id: HTTP2StreamID, field: UnsafeRawBufferPointer) {
+        var wakeups = HTTP2Wakeups()
+        state.withLock { $0.priorityUpdate(id, field: field, wakeups: &wakeups) }
+        wakeups.resume()
     }
 
     /// A dispatched stream is done: reset it if the peer is still sending, and finish a

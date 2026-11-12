@@ -161,7 +161,7 @@ struct H3RequestReader {
                 section.removeAll(keepingCapacity: true)
                 parser.withPayload(location, in: input) { section.append(contentsOf: $0) }
                 step = .headers
-            case .pushPromise, .settings, .cancelPush, .goaway, .maxPushID:
+            case .pushPromise, .settings, .cancelPush, .goaway, .maxPushID, .priorityUpdate:
                 // The request-stream parser rejects these before reporting them.
                 throw .frameUnexpected
             }

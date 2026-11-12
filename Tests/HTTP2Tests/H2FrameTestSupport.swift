@@ -16,6 +16,7 @@ enum ParsedFrame: Hashable {
     case goaway(last: UInt32, HTTP2ErrorCode, [UInt8])
     case windowUpdate(stream: UInt32, UInt32)
     case continuation(stream: UInt32, endHeaders: Bool, [UInt8])
+    case priorityUpdate(prioritized: UInt32, [UInt8])
     case unknown(HTTP2FrameHeader)
     /// A stream error event: the stream and code.
     case streamError(stream: UInt32, HTTP2ErrorCode)
@@ -92,6 +93,8 @@ func parse(_ chunks: [[UInt8]], configuration: HTTP2FrameParser.Configuration = 
                 case .windowUpdate(let stream, let increment): append(.windowUpdate(stream: stream.rawValue, increment))
                 case .continuation(let stream, let endHeaders, let fragment):
                     append(.continuation(stream: stream.rawValue, endHeaders: endHeaders, copy(fragment, rest)))
+                case .priorityUpdate(let id, let field):
+                    append(.priorityUpdate(prioritized: id.rawValue, copy(field, rest)))
                 case .unknown(let header): append(.unknown(header))
                 case .streamError(let error):
                     precondition(!error.isConnectionError, "stream error events carry stream errors")

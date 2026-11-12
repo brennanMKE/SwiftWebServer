@@ -116,6 +116,9 @@ public struct HTTP2FrameParser: Sendable {
         case windowUpdate(streamID: HTTP2StreamID, increment: UInt32)
         /// A CONTINUATION frame.
         case continuation(streamID: HTTP2StreamID, endHeaders: Bool, fragment: PayloadLocation)
+        /// A PRIORITY_UPDATE frame (RFC 9218 §7.1) for `prioritizedStreamID` (never 0), with
+        /// its Priority Field Value.
+        case priorityUpdate(prioritizedStreamID: HTTP2StreamID, field: PayloadLocation)
         /// A frame of an unknown type. Its payload is skipped; receivers ignore it (§5.5).
         case unknown(HTTP2FrameHeader)
         /// A frame-level stream error (§5.4.2), always ``HTTP2Error/stream(_:_:reason:)``.
@@ -394,6 +397,11 @@ public struct HTTP2FrameParser: Sendable {
         case .continuation:
             if stream.isConnection { throw .connection(.protocolError, reason: "CONTINUATION on stream 0") }
 
+        case .priorityUpdate:
+            // RFC 9218 §7.1: only on stream 0, and at least the Prioritized Stream ID.
+            if !stream.isConnection { throw .connection(.protocolError, reason: "PRIORITY_UPDATE on a stream") }
+            guard length >= 4 else { throw .connection(.frameSizeError, reason: "PRIORITY_UPDATE shorter than 4") }
+
         default:
             state = length == 0 ? .header(filled: 0) : .skipping(remaining: length)
             return .unknown(header)
@@ -486,6 +494,13 @@ public struct HTTP2FrameParser: Sendable {
 
         case .continuation:
             return .continuation(streamID: stream, endHeaders: flags.contains(.endHeaders), fragment: location(0..<payload.count))
+
+        case .priorityUpdate:
+            let prioritized = HTTP2StreamID(wireValue: readUInt32(payload, at: 0))
+            if prioritized.isConnection {
+                throw .connection(.protocolError, reason: "PRIORITY_UPDATE for stream 0")
+            }
+            return .priorityUpdate(prioritizedStreamID: prioritized, field: location(4..<payload.count))
 
         default:
             preconditionFailure("only buffered frame types reach complete")

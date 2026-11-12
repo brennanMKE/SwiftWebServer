@@ -22,6 +22,8 @@ struct H2OutboundFlowTests {
         for i in 0..<streams {
             let stream = id(UInt32(2 * i + 1))
             _ = shared.handle(.headers(streamID: stream, endStream: true, trailers: false), wakeups: &wakeups)
+            // Incremental (RFC 9218, #0065): streams of one urgency take turns frame by frame.
+            shared.openPriority(stream, HTTPPriority(incremental: true))
             _ = shared.sendHeaders(streamID: stream, status: .ok, headers: HTTPFields(), contentLength: nil,
                                    endStream: false, wakeups: &wakeups)
         }
@@ -182,7 +184,8 @@ struct H2OutboundFlowTests {
     }
 
     /// A large and a small response share a closed connection window: once the small one
-    /// queues, the two take turns frame by frame.
+    /// queues, the two take turns frame by frame. Both ask for `priority: i` (#0065): at the
+    /// default, non-incremental, they would go one at a time.
     @Test func largeAndSmallStreamsProgressTogether() async throws {
         let large = ByteBuffer(bytes: Array(repeating: 1, count: 1 << 20))
         let small = ByteBuffer(bytes: Array(repeating: 3, count: 20_000))
@@ -191,14 +194,14 @@ struct H2OutboundFlowTests {
         }
         try await withH2Driver(handler: handler) { client, driver in
             try await client.handshake(HTTP2Settings(initialWindowSize: 1 << 20))
-            try await client.send(F.headers(1, block: client.requests.get("/large")))
+            try await client.send(F.headers(1, block: client.requests.get("/large", extra: [("priority", "i")])))
             // The large response uses up the 65,535-byte connection window.
             var largeBytes = 0
             while largeBytes < 65_535, let frame = try await client.nextFrame() {
                 if case .data(1, let bytes, _) = frame { largeBytes += bytes.count }
             }
             #expect(largeBytes == 65_535)
-            try await client.send(F.headers(3, block: client.requests.get("/small")))
+            try await client.send(F.headers(3, block: client.requests.get("/small", extra: [("priority", "i")])))
             // Wait until both writers queue for the connection window.
             for _ in 0..<400 where driver.state.withLock({ $0.fairQueue.count }) < 2 {
                 try await Task.sleep(for: .milliseconds(5))

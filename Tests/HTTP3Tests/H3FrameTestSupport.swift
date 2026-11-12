@@ -11,6 +11,7 @@ enum ParsedFrame: Equatable, CustomStringConvertible {
     case cancelPush(UInt64)
     case goaway(UInt64)
     case maxPushID(UInt64)
+    case priorityUpdate(push: Bool, UInt64, [UInt8])
     case error(HTTP3Error)
     /// The stream ended inside a frame (``H3FrameParser/finish()`` threw).
     case unfinished(HTTP3Error)
@@ -25,6 +26,7 @@ enum ParsedFrame: Equatable, CustomStringConvertible {
         case .cancelPush(let id): "cancelPush(\(id))"
         case .goaway(let id): "goaway(\(id))"
         case .maxPushID(let id): "maxPushID(\(id))"
+        case .priorityUpdate(let push, let id, let bytes): "priorityUpdate(push: \(push), \(id), \(bytes))"
         case .error(let error): "error(\(error.name))"
         case .unfinished(let error): "unfinished(\(error.name))"
         }
@@ -83,6 +85,8 @@ func parse(_ chunks: [[UInt8]], configuration: H3FrameParser.Configuration) -> P
                 case .cancelPush(let id): append(.cancelPush(id))
                 case .goaway(let id): append(.goaway(id))
                 case .maxPushID(let id): append(.maxPushID(id))
+                case .priorityUpdate(let push, let id, let location):
+                    append(.priorityUpdate(push: push, id, copy(location, rest)))
                 }
                 precondition(output.consumed > 0 || rest.isEmpty, "a reportable event must consume input")
                 offset += output.consumed

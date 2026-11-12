@@ -19,6 +19,8 @@ public struct HTTP2FrameType: RawRepresentable, Hashable, Sendable, CustomString
     public static let goaway = HTTP2FrameType(rawValue: 0x7)
     public static let windowUpdate = HTTP2FrameType(rawValue: 0x8)
     public static let continuation = HTTP2FrameType(rawValue: 0x9)
+    /// PRIORITY_UPDATE (RFC 9218 §7.1).
+    public static let priorityUpdate = HTTP2FrameType(rawValue: 0x10)
 
     /// Whether RFC 9113 defines this type.
     @inlinable public var isKnown: Bool { rawValue <= 0x9 }
@@ -35,6 +37,7 @@ public struct HTTP2FrameType: RawRepresentable, Hashable, Sendable, CustomString
         case 0x7: "GOAWAY"
         case 0x8: "WINDOW_UPDATE"
         case 0x9: "CONTINUATION"
+        case 0x10: "PRIORITY_UPDATE"
         default: "unknown(0x\(String(rawValue, radix: 16)))"
         }
     }

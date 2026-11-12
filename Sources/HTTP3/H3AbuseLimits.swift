@@ -136,13 +136,25 @@ public struct H3AbuseMonitor: Sendable {
 /// A connection-wide byte budget for response sends (``H3AbuseLimits/maxConnectionSendBuffer``):
 /// a send takes `min(bytes, capacity)` before it starts and gives it back when it completes,
 /// so sends stalled by a client that does not read hold at most `capacity` bytes in total, and
-/// later sends on the connection wait (first come, first served). Cancelling a waiting task
-/// ends its wait with `CancellationError`.
+/// later sends on the connection wait. Cancelling a waiting task ends its wait with
+/// `CancellationError`.
+///
+/// Waiting sends are served by RFC 9218 priority (#0107): lower urgency first; at equal
+/// urgency non-incremental streams in stream order, then incremental ones first come, first
+/// served (a stream's next send queues behind the others, so they take turns). Every
+/// ``fairShareInterval``th grant goes to the oldest waiter, so lower priorities still move.
+/// Sends without a priority count as the default (`u=3`). This only orders sends while the
+/// budget is exhausted: QUIC's own packet scheduling belongs to Network.framework.
 final class H3SendBudget: Sendable {
     struct Waiter {
         let id: UInt64
         let amount: Int
+        let priority: H3StreamPriority?
         let continuation: UnsafeContinuation<Void, any Error>
+
+        var schedulingKey: (UInt8, UInt8, UInt64) {
+            priority?.schedulingKey ?? HTTPPriority.default.schedulingKey(streamID: UInt64.max)
+        }
     }
 
     struct State {
@@ -150,7 +162,35 @@ final class H3SendBudget: Sendable {
         var waiters: [Waiter] = []
         var nextID: UInt64 = 0
         var highWater = 0
+        var priorityGrants = 0
+
+        /// The waiter to serve next (index into ``waiters``).
+        func next() -> Int? {
+            guard !waiters.isEmpty else { return nil }
+            // The oldest waiter's turn by fairness.
+            if priorityGrants + 1 >= H3SendBudget.fairShareInterval { return 0 }
+            var best = 0
+            var bestKey = waiters[0].schedulingKey
+            for index in 1..<waiters.count {
+                let key = waiters[index].schedulingKey
+                if key < bestKey {
+                    best = index
+                    bestKey = key
+                }
+            }
+            return best
+        }
+
+        /// Serves waiter `index`: takes it out and counts the turn.
+        mutating func grant(_ index: Int) -> Waiter {
+            priorityGrants = index == 0 ? 0 : priorityGrants + 1
+            available -= waiters[index].amount
+            return waiters.remove(at: index)
+        }
     }
+
+    /// One grant in this many goes to the oldest waiter, whatever its priority.
+    static let fairShareInterval = 16
 
     let capacity: Int
     private let state: Mutex<State>
@@ -168,7 +208,7 @@ final class H3SendBudget: Sendable {
     var waiting: Int { state.withLock { $0.waiters.count } }
 
     /// Takes `min(bytes, capacity)` (returned) once it is available.
-    func acquire(_ bytes: Int) async throws -> Int {
+    func acquire(_ bytes: Int, priority: H3StreamPriority? = nil) async throws -> Int {
         let amount = Swift.min(bytes, capacity)
         guard amount > 0 else { return 0 }
         let id: UInt64? = state.withLock { state in
@@ -190,7 +230,7 @@ final class H3SendBudget: Sendable {
                         state.highWater = Swift.max(state.highWater, capacity - state.available)
                         return .some(nil)
                     }
-                    state.waiters.append(Waiter(id: id, amount: amount, continuation: continuation))
+                    state.waiters.append(Waiter(id: id, amount: amount, priority: priority, continuation: continuation))
                     return nil
                 }
                 switch immediate {
@@ -216,10 +256,8 @@ final class H3SendBudget: Sendable {
         let ready = state.withLock { state -> [Waiter] in
             state.available += amount
             var ready: [Waiter] = []
-            while let first = state.waiters.first, first.amount <= state.available {
-                state.available -= first.amount
-                state.waiters.removeFirst()
-                ready.append(first)
+            while let index = state.next(), state.waiters[index].amount <= state.available {
+                ready.append(state.grant(index))
             }
             if !ready.isEmpty { state.highWater = Swift.max(state.highWater, capacity - state.available) }
             return ready
