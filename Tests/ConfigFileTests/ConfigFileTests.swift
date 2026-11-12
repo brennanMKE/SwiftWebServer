@@ -193,11 +193,12 @@ import Testing
         #expect(file.warnings.contains { $0.contains("unknown key \"caching.etag\"") })
     }
 
-    /// AccessLog (#0090) is not wired here yet; its key is kept.
-    @Test func reservedKeysPassThroughWithAWarning() throws {
+    /// `accessLog` was reserved until #0125 claimed it: no warning, no reserved value.
+    @Test func accessLogIsNoLongerReserved() throws {
         let file = try parse(#"{"accessLog": true}"#)
-        #expect(file.reserved["accessLog"]?.json == "true")
-        #expect(file.warnings.count == 1)
+        #expect(file.reserved.isEmpty)
+        #expect(file.warnings.isEmpty)
+        #expect(file.settings.accessLog == ServerSettings.AccessLogSettings())
     }
 
     // MARK: TLS and HTTP/3 (#0089)

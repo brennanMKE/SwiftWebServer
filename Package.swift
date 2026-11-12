@@ -51,7 +51,7 @@ let libraries: [Library] = [
     Library("AccessLog", dependencies: ["HTTPCore"], testDependencies: ["HTTP1", "HTTPServer", "HTTPTestSupport"]),
     Library("Router", dependencies: ["HTTPCore"]),
     Library("Proxy", dependencies: ["HTTPCore", "HTTP1", "NetworkTransport"], testDependencies: ["HTTPTestSupport", "WebSockets", "HTTPServer"]),
-    Library("ConfigFile", dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "StaticFiles", "Compression", "VirtualHosts", "Auth", "Proxy"]),
+    Library("ConfigFile", dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "StaticFiles", "Compression", "VirtualHosts", "Auth", "Proxy", "AccessLog"]),
     // Test support
     Library("HTTPTestSupport", dependencies: ["HTTPCore", "HTTP1"]),
 ]
