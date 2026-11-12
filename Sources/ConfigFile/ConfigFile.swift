@@ -182,6 +182,8 @@ struct Parser {
                 settings.errorPages = try errorPages(value, key)
             case "hosts":
                 settings.hosts = try hosts(value, key)
+            case "auth":
+                settings.auth = try auth(value, key)
             case "tls":
                 settings.tls = try tls(value, key)
             case "http3":

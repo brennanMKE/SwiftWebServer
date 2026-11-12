@@ -13,6 +13,7 @@ func registerAllBenchmarks() {
     registerStaticFilesBenchmarks()   // M4.2: StaticFilesBench.swift
     registerRouterBenchmarks()   // M6: RouterBench.swift
     registerVirtualHostsBenchmarks()   // M6: VirtualHostsBench.swift
+    registerAuthBenchmarks()   // M6: AuthBench.swift
     registerSelfTimedSuites()
 }
 

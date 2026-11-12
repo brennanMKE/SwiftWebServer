@@ -100,6 +100,11 @@ public struct ServerSettings: Sendable, Equatable {
     /// `"hosts": [{"names": ["a.test"], "root": "sites/a"}, {"default": true, "root": "Public"}]`.
     public var hosts: [HostSettings] = []
 
+    /// Authentication (#0093): Basic and bearer tokens for path prefixes. Empty (the default)
+    /// registers no `Authenticator`. In the file:
+    /// `"auth": [{"paths": ["/admin"], "realm": "Admin", "basic": {"file": "users.htpasswd"}}]`.
+    public var auth: [AuthSettings] = []
+
     /// The TLS listener's identity and port.
     public struct TLSSettings: Sendable, Equatable {
         /// Where the PKCS#12 password comes from.

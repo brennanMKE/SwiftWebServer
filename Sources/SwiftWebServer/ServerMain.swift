@@ -135,7 +135,7 @@ enum ServerMain {
         do {
             let settings = try settings(options, environment: environment)
             try settings.validate()
-            let handler = try settings.makeHandler()
+            let handler = try settings.makeHandler(environment: environment)
             let configuration = settings.serverConfiguration
             do {
                 try configuration.validate()

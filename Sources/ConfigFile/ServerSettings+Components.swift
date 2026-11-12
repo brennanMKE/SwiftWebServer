@@ -8,6 +8,7 @@ public import HTTPCore
 public import HTTPServer
 public import StaticFiles
 import VirtualHosts
+import Auth
 
 // Settings to the server's configuration values and middleware chain (docs/ROADMAP.md §5.2).
 // Components are registered with the middleware builder only when enabled, so a disabled
@@ -45,8 +46,10 @@ extension ServerSettings {
     /// cannot be used, with a message naming it.
     ///
     /// With ``hosts`` set, `VirtualHosts` takes the place of the single `StaticFiles` (#0092)
-    /// and ``root`` is not opened.
-    public func makeHandler() throws(ConfigFileError) -> some HTTPHandler {
+    /// and ``root`` is not opened. With ``auth`` set, an `Authenticator` (#0093) sits between
+    /// `ErrorPages` and the files; `environment` supplies `secretEnv`/`usersEnv` values.
+    public func makeHandler(environment: [String: String] = [:]) throws(ConfigFileError) -> some HTTPHandler {
+        let authenticator = try makeAuthenticator(environment: environment)
         let root = resolvedRoot
         // `StaticFiles` is both a handler and a middleware; as the last element it must be the
         // handler, so it goes in through `EitherHandler`.
@@ -80,6 +83,7 @@ extension ServerSettings {
         }
         return MiddlewareBuilder.build {
             if let pages { pages }
+            if let authenticator { authenticator }
             terminal
         }
     }
