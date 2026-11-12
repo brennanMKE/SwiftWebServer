@@ -1,6 +1,8 @@
 #!/bin/bash
 # Compare the new server against other HTTP servers on loopback:
-# nginx, Apache httpd, Caddy, lighttpd, h2o, and the legacy SwiftWebServer.
+# nginx, Apache httpd, Caddy, lighttpd and h2o. The legacy SwiftWebServer was
+# deleted at the M4 cut-over (#0086); its numbers stay in docs/benchmarks/M0-baseline.md
+# and the earlier compare-servers*.md records.
 #
 #   scripts/bench-compare.sh [duration_seconds] [output.md]
 #
@@ -153,16 +155,7 @@ EOF
 /opt/homebrew/bin/h2o -c "$WORK/h2o.conf" > "$WORK/logs/h2o.out" 2>&1 &
 PIDS+=($!)
 
-# --- legacy SwiftWebServer (closes every connection; close-mode rows only) ---
-swift build -c release -j 2 --product SwiftWebServer > /dev/null 2>&1 || { echo "legacy build failed"; exit 1; }
-LEGACY_PORT=$(free_port)
-mkdir -p "$WORK/legacy/Public"
-cp "$BODY" "$WORK/legacy/Public/index.html"
-sed -E "s/\"port\": *[0-9]+/\"port\": $LEGACY_PORT/" Root/http-config.json > "$WORK/legacy/http-config.json"
-env ROOT_PATH="$WORK/legacy" LISTEN_HOST=127.0.0.1 "$(swift build -c release --show-bin-path)/SwiftWebServer" > "$WORK/logs/legacy.log" 2>&1 &
-PIDS+=($!)
-
-ALL_PORTS="$SWS_PORT $NGINX_PORT $HTTPD_PORT $CADDY_PORT $LIGHTTPD_PORT $H2O_PORT $LEGACY_PORT"
+ALL_PORTS="$SWS_PORT $NGINX_PORT $HTTPD_PORT $CADDY_PORT $LIGHTTPD_PORT $H2O_PORT"
 for p in $ALL_PORTS; do wait_port "$p" || { tail -5 "$WORK"/logs/*; exit 1; }; done
 
 # Loopback-only check.
@@ -199,7 +192,6 @@ for mode in keepalive close; do
   for c in 16 64; do
     [ "$mode" = close ] && [ "$c" = 64 ] && continue
     SERVERS="new-server:$SWS_PORT nginx:$NGINX_PORT apache:$HTTPD_PORT caddy:$CADDY_PORT lighttpd:$LIGHTTPD_PORT h2o:$H2O_PORT"
-    [ "$mode" = close ] && SERVERS="$SERVERS legacy:$LEGACY_PORT"
     for s in $SERVERS; do
       set -- ${s/:/ }
       ROWS+="$(run "$1" "$2" "$c" "$mode")"$'\n'
@@ -214,7 +206,7 @@ LOAD_AFTER=$(uptime | sed 's/.*load averages*: //')
   echo "- Date: $(date '+%Y-%m-%d %H:%M %Z'), commit $(git rev-parse --short HEAD)"
   echo "- Machine: $(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) cores; load average before / after: ${LOAD_BEFORE} / ${LOAD_AFTER}"
   echo "- Versions: $(/opt/homebrew/bin/nginx -v 2>&1 | sed 's/nginx version: //'); $(/usr/sbin/httpd -v | head -1 | sed 's/Server version: //') (event MPM); Caddy $(/opt/homebrew/bin/caddy version | awk '{print $1}'); $(/opt/homebrew/bin/lighttpd -v 2>&1 | head -1 | awk '{print $1}'); h2o $(/opt/homebrew/bin/h2o --version 2>&1 | head -1 | awk '{print $3}'); oha $(oha --version | awk '{print $2}')"
-  echo "- Each run: ${DUR}s, 626-byte body, loopback; all servers stay up but are measured one at a time. nginx: worker_processes auto, sendfile, open_file_cache, access log off. Apache: event MPM defaults, unlimited keep-alive requests, sendfile, no access log. Caddy: file_server, admin off, no access log. lighttpd: defaults (single process), keep-alive requests raised. h2o: one thread per core. Legacy SwiftWebServer closes every connection, so it appears in close mode only."
+  echo "- Each run: ${DUR}s, 626-byte body, loopback; all servers stay up but are measured one at a time. nginx: worker_processes auto, sendfile, open_file_cache, access log off. Apache: event MPM defaults, unlimited keep-alive requests, sendfile, no access log. Caddy: file_server, admin off, no access log. lighttpd: defaults (single process), keep-alive requests raised. h2o: one thread per core."
   echo "- New server: \`sws-bench serve --root\` (StaticFiles #0084, default BSD socket transport) serving the same file from disk; small files are cached in memory with pre-rendered headers and revalidated with stat at most once per second."
   echo
   echo "| Server | Connections | Concurrency | req/s | p50 ms | p99 ms | p99.9 ms | 200s | errors |"

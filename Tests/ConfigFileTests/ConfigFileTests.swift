@@ -1,0 +1,313 @@
+import Foundation
+import HTTPCore
+import StaticFiles
+import Testing
+@testable import ConfigFile
+
+/// `http-config.json` parsing (#0086, legacy #0023): every key optional with a documented
+/// default, unknown keys warn, bad values fail naming the key.
+@Suite struct ConfigFileTests {
+    func parse(_ json: String, defaults: ServerSettings = ServerSettings()) throws(ConfigFileError) -> ConfigFile {
+        try ConfigFile.parse(Data(json.utf8), source: "test.json", defaults: defaults)
+    }
+
+    func error(_ json: String) -> ConfigFileError? {
+        do {
+            _ = try parse(json)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
+    /// A temporary directory removed on deinit.
+    final class Directory {
+        let url: URL
+        var path: String { url.path }
+        init() throws {
+            url = FileManager.default.temporaryDirectory
+                .appending(path: "sws-configfile-\(UInt64.random(in: 0...UInt64.max))")
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+        func write(_ text: String, to relative: String) throws {
+            let file = url.appending(path: relative)
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: file)
+        }
+        deinit { try? FileManager.default.removeItem(at: url) }
+    }
+
+    static var packageRoot: URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    }
+
+    // MARK: Defaults
+
+    @Test func emptyObjectGivesTheDocumentedDefaults() throws {
+        let file = try parse("{}")
+        let settings = file.settings
+        #expect(settings == ServerSettings())
+        #expect(file.warnings.isEmpty)
+        #expect(settings.host == "127.0.0.1")
+        #expect(settings.port == 8080)
+        #expect(settings.root == "Public")
+        #expect(settings.index == ["index.html"])
+        #expect(settings.mimeTypes.isEmpty)
+        #expect(settings.defaultMimeType == "application/octet-stream")
+        #expect(settings.blockList == ["http-config.json", ".git", ".DS_Store"])
+        #expect(settings.blockDotfiles)
+        #expect(settings.maxAge == 3600)
+        #expect(settings.maxConnections == 1024)
+        #expect(settings.drainTimeout == .seconds(10))
+        #expect(settings.timeouts.header == .seconds(10))
+        #expect(settings.timeouts.idle == .seconds(5))
+        #expect(settings.timeouts.body == .seconds(30))
+        #expect(settings.timeouts.send == .seconds(30))
+        #expect(settings.timeouts.linger == .seconds(2))
+        #expect(settings.maxBodySize == 10 * 1024 * 1024)
+        #expect(settings.transport == .bsd)
+        #expect(settings.errorPages == .generated)
+    }
+
+    /// #0086 acceptance: `{"port": 0}` is a complete config.
+    @Test func portOnlyKeepsEveryOtherDefault() throws {
+        let file = try parse(#"{"port": 0}"#)
+        var expected = ServerSettings()
+        expected.port = 0
+        #expect(file.settings == expected)
+        #expect(file.keys == ["port"])
+    }
+
+    /// Legacy #0023: removing `enableCompression` (or any key) must not fail.
+    @Test func legacyConfigWithoutEnableCompressionParses() throws {
+        let file = try parse("""
+            {"path": "Public", "port": 8080, "maxConnections": 100, "maxRequestSize": 1024,
+             "keepAliveTimeout": 5, "enableETags": true, "defaultIndex": "index.html",
+             "defaultMimeType": "application/octet-stream", "caching": {"enabled": true, "maxAge": 60},
+             "mimeTypes": [{"contentType": "text/css", "pathExtensions": ["css", "CSS2"]}],
+             "blockList": ["http-config.json"]}
+            """)
+        let settings = file.settings
+        #expect(settings.root == "Public")
+        #expect(settings.maxConnections == 100)
+        #expect(settings.maxBodySize == 1024)
+        #expect(settings.timeouts.idle == .seconds(5))
+        #expect(settings.index == ["index.html"])
+        #expect(settings.maxAge == 60)
+        #expect(settings.mimeTypes == ["css": "text/css", "css2": "text/css"])
+        #expect(settings.blockList == ["http-config.json"])
+        #expect(file.warnings.count == 1)
+        #expect(file.warnings.first?.contains("\"enableETags\" has no effect") == true)
+    }
+
+    /// The legacy `Root/http-config.json` as it shipped before the cut-over still starts.
+    @Test func previousShippedConfigParsesWithWarningsOnly() throws {
+        let legacy = """
+            {"path": "Public", "port": 8080, "maxConnections": 100, "maxRequestSize": 10485760,
+             "keepAliveTimeout": 5, "enableCompression": false, "enableETags": true,
+             "defaultIndex": "index.html", "defaultMimeType": "application/octet-stream",
+             "caching": {"enabled": true, "maxAge": 3600},
+             "mimeTypes": [{"contentType": "text/html", "pathExtensions": ["html", "htm"]}],
+             "blockList": ["http-config.json", ".git", ".DS_Store"]}
+            """
+        let file = try parse(legacy)
+        #expect(file.warnings.count == 2)
+        #expect(file.settings.mimeTypes == ["html": "text/html", "htm": "text/html"])
+    }
+
+    @Test func shippedConfigParsesWithoutWarningsAndBuildsItsHandler() throws {
+        let path = Self.packageRoot.appending(path: "Root/http-config.json").path
+        let file = try ConfigFile.load(path: path)
+        #expect(file.warnings.isEmpty, "\(file.warnings)")
+        #expect(file.settings.port == 8080)
+        #expect(file.settings.host == "127.0.0.1")
+        #expect(file.settings.resolvedRoot == Self.packageRoot.appending(path: "Root/Public").path)
+        #expect(file.settings.errorPages == .files([404: "Custom/404.html", 405: "Custom/405.html"]))
+        _ = try file.settings.makeHandler()
+    }
+
+    // MARK: Keys
+
+    @Test func everyKeyApplies() throws {
+        let settings = try parse("""
+            {"host": "::1", "port": 9000, "root": "/srv/www", "index": ["index.htm", "default.html"],
+             "mimeTypes": {".MD": "text/markdown; charset=utf-8"}, "defaultMimeType": "text/plain",
+             "blockList": [".env"], "blockDotfiles": false, "caching": {"maxAge": 10},
+             "maxConnections": 7, "drainTimeout": 0.25,
+             "timeouts": {"header": 1, "idle": 0, "body": null, "send": 2.5, "linger": 0.001},
+             "maxBodySize": 0, "transport": "nw", "errorPages": false}
+            """).settings
+        #expect(settings.host == "::1")
+        #expect(settings.port == 9000)
+        #expect(settings.resolvedRoot == "/srv/www")
+        #expect(settings.index == ["index.htm", "default.html"])
+        #expect(settings.mimeTypes == ["md": "text/markdown; charset=utf-8"])
+        #expect(settings.defaultMimeType == "text/plain")
+        #expect(settings.blockList == [".env"])
+        #expect(!settings.blockDotfiles)
+        #expect(settings.maxAge == 10)
+        #expect(settings.maxConnections == 7)
+        #expect(settings.drainTimeout == .milliseconds(250))
+        #expect(settings.timeouts.header == .seconds(1))
+        #expect(settings.timeouts.idle == nil)
+        #expect(settings.timeouts.body == nil)
+        #expect(settings.timeouts.send == .milliseconds(2500))
+        #expect(settings.timeouts.linger == .milliseconds(1))
+        #expect(settings.maxBodySize == 0)
+        #expect(settings.transport == .nw)
+        #expect(settings.errorPages == .off)
+    }
+
+    @Test func cachingCanBeTurnedOff() throws {
+        #expect(try parse(#"{"caching": {"enabled": false, "maxAge": 60}}"#).settings.maxAge == nil)
+        #expect(try parse(#"{"caching": false}"#).settings.maxAge == nil)
+        #expect(try parse(#"{"caching": true}"#).settings.maxAge == 3600)
+    }
+
+    @Test func singleIndexStringAndErrorPageFiles() throws {
+        let settings = try parse(#"{"index": "home.html", "errorPages": {"404": "e/404.html"}}"#).settings
+        #expect(settings.index == ["home.html"])
+        #expect(settings.errorPages == .files([404: "e/404.html"]))
+    }
+
+    @Test func drainTimeoutNullWaitsIndefinitely() throws {
+        #expect(try parse(#"{"drainTimeout": null}"#).settings.drainTimeout == nil)
+        #expect(try parse(#"{"drainTimeout": 0}"#).settings.drainTimeout == .zero)
+    }
+
+    @Test func newKeysWinOverLegacyAliases() throws {
+        let file = try parse(#"{"root": "a", "path": "b", "maxBodySize": 1, "maxRequestSize": 2, "timeouts": {"idle": 3}, "keepAliveTimeout": 4}"#)
+        #expect(file.settings.root == "a")
+        #expect(file.settings.maxBodySize == 1)
+        #expect(file.settings.timeouts.idle == .seconds(3))
+        #expect(file.warnings.count == 3)
+    }
+
+    @Test func unknownKeysWarnInsteadOfFailing() throws {
+        let file = try parse(#"{"port": 1, "colour": "blue", "timeouts": {"nap": 1}, "caching": {"etag": true}}"#)
+        #expect(file.settings.port == 1)
+        #expect(file.warnings.count == 3)
+        #expect(file.warnings.contains { $0.contains("unknown key \"colour\"") })
+        #expect(file.warnings.contains { $0.contains("unknown key \"timeouts.nap\"") })
+        #expect(file.warnings.contains { $0.contains("unknown key \"caching.etag\"") })
+    }
+
+    /// TLS (#0087/#0088) and AccessLog (#0090) are not wired here yet; their keys are kept.
+    @Test func reservedKeysPassThroughWithAWarning() throws {
+        let file = try parse(#"{"tls": {"certificate": "c.pem"}, "accessLog": true}"#)
+        #expect(file.reserved["tls"]?.json == #"{"certificate":"c.pem"}"#)
+        #expect(file.reserved["accessLog"]?.json == "true")
+        #expect(file.warnings.count == 2)
+    }
+
+    // MARK: Errors name the key
+
+    @Test(arguments: [
+        (#"{"port": "8080"}"#, "port"),
+        (#"{"port": 65536}"#, "port"),
+        (#"{"port": 1.5}"#, "port"),
+        (#"{"port": true}"#, "port"),
+        (#"{"host": 1}"#, "host"),
+        (#"{"host": ""}"#, "host"),
+        (#"{"root": []}"#, "root"),
+        (#"{"index": [1]}"#, "index"),
+        (#"{"index": ["a/b"]}"#, "index"),
+        (#"{"maxConnections": 0}"#, "maxConnections"),
+        (#"{"maxBodySize": -1}"#, "maxBodySize"),
+        (#"{"blockDotfiles": 1}"#, "blockDotfiles"),
+        (#"{"transport": "udp"}"#, "transport"),
+        (#"{"timeouts": {"idle": -1}}"#, "timeouts.idle"),
+        (#"{"timeouts": {"idle": "5"}}"#, "timeouts.idle"),
+        (#"{"timeouts": 5}"#, "timeouts"),
+        (#"{"caching": {"maxAge": "1h"}}"#, "caching.maxAge"),
+        (#"{"drainTimeout": -1}"#, "drainTimeout"),
+        (#"{"mimeTypes": {"md": 1}}"#, "mimeTypes.md"),
+        (#"{"mimeTypes": "text"}"#, "mimeTypes"),
+        (#"{"errorPages": {"200": "x.html"}}"#, "errorPages.200"),
+        (#"{"errorPages": "yes"}"#, "errorPages"),
+        (#"{"blockList": ".git"}"#, "blockList"),
+    ])
+    func wrongTypeOrRangeNamesTheKey(json: String, key: String) {
+        let failure = error(json)
+        #expect(failure?.key == key, "\(json)")
+        #expect(failure?.description.contains("\"\(key)\"") == true, "\(failure?.description ?? "no error")")
+    }
+
+    @Test func malformedFilesFail() throws {
+        #expect(error("{ not json")?.description.contains("not valid JSON") == true)
+        #expect(error("[1, 2]")?.description.contains("not a JSON object") == true)
+        #expect(throws: ConfigFileError.self) { try ConfigFile.load(path: "/nonexistent/\(UUID().uuidString).json") }
+        do {
+            _ = try ConfigFile.load(path: "/nonexistent/x.json")
+        } catch {
+            #expect(error.description.contains("cannot read config file /nonexistent/x.json"))
+        }
+    }
+
+    // MARK: Files and components
+
+    @Test func relativeRootResolvesAgainstTheConfigFile() throws {
+        let directory = try Directory()
+        try directory.write(#"{"root": "site"}"#, to: "conf/http-config.json")
+        let file = try ConfigFile.load(path: directory.url.appending(path: "conf/http-config.json").path)
+        #expect(file.settings.resolvedRoot == directory.url.appending(path: "conf/site").path)
+    }
+
+    @Test func mapsToComponentConfigurations() throws {
+        let settings = try parse("""
+            {"maxConnections": 5, "drainTimeout": 1, "maxBodySize": 99, "timeouts": {"idle": 0, "header": 3},
+             "index": ["a.html"], "blockList": ["x"], "blockDotfiles": false, "mimeTypes": {"md": "text/markdown"},
+             "defaultMimeType": "text/plain", "caching": {"maxAge": 5}}
+            """).settings
+        #expect(settings.serverConfiguration.maxConnections == 5)
+        #expect(settings.serverConfiguration.drainTimeout == .seconds(1))
+        #expect(settings.http1Configuration.maxBodySize == 99)
+        #expect(settings.http1Configuration.timeouts.idle == nil)
+        #expect(settings.http1Configuration.timeouts.header == .seconds(3))
+        let files = settings.staticFilesConfiguration
+        #expect(files.indexFiles == ["a.html"])
+        #expect(files.blockedNames == ["x"])
+        #expect(!files.blockDotfiles)
+        #expect(files.mimeTypes == ["md": "text/markdown"])
+        #expect(files.defaultMIMEType == "text/plain")
+        #expect(files.effectiveCacheControl == "public, max-age=5")
+    }
+
+    /// Components left out by the config are not in the chain.
+    @Test func errorPagesAreRegisteredOnlyWhenEnabled() throws {
+        let directory = try Directory()
+        try directory.write("<h1>gone</h1>", to: "404.html")
+        func components(_ json: String) throws -> (errorPages: Int, staticFiles: Int) {
+            var defaults = ServerSettings()
+            defaults.root = directory.path
+            let handler = try ConfigFile.parse(Data(json.utf8), defaults: defaults).settings.makeHandler()
+            var counts = (errorPages: 0, staticFiles: 0)
+            MiddlewareChainInspector.visit(handler) { element in
+                if element is ErrorPages { counts.errorPages += 1 }
+                if element is StaticFiles { counts.staticFiles += 1 }
+            }
+            return counts
+        }
+        #expect(try components(#"{"errorPages": false}"#) == (0, 1))
+        #expect(try components("{}") == (1, 1))
+        #expect(try components(#"{"errorPages": {"404": "404.html"}}"#) == (1, 1))
+    }
+
+    @Test func unusableRootOrPageNamesTheKey() throws {
+        var settings = ServerSettings()
+        settings.root = "/nonexistent/\(UUID().uuidString)"
+        #expect(throws: ConfigFileError.self) { _ = try settings.makeHandler() }
+        do { _ = try settings.makeHandler(); Issue.record("no error") } catch {
+            #expect(error.key == "root")
+            #expect(error.description.contains("cannot serve root"))
+        }
+
+        let directory = try Directory()
+        settings.root = directory.path
+        settings.errorPages = .files([404: "missing.html"])
+        do { _ = try settings.makeHandler(); Issue.record("no error") } catch {
+            #expect(error.key == "errorPages.404")
+            #expect(error.description.contains("missing.html"))
+        }
+    }
+}

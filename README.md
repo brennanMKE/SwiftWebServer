@@ -1,0 +1,126 @@
+# SwiftWebServer
+
+A static-file web server written in Swift 6 with Swift Concurrency, with no package
+dependencies. It runs on **macOS 15 or later only**. It uses Darwin and Network.framework
+APIs and is not built or tested on Linux.
+
+The shipped `SwiftWebServer` executable serves cleartext **HTTP/1.1**. The package also holds
+the HTTP/2, HTTP/3 (QUIC), TLS and WebSocket work in progress (see [ROADMAP](docs/ROADMAP.md)).
+None of it is part of the executable yet.
+
+## Features
+
+- **HTTP/1.1**: keep-alive, pipelining, `Content-Length` and chunked request bodies,
+  `Expect: 100-continue`, correct `HEAD`/`204`/`304` framing, `Date` on every response.
+- **Limits and timeouts**: request head size (`431`), body size (`413`), header, idle, body
+  and send timeouts (`408` or close), lingering close, and a connection limit with
+  backpressure.
+- **Static files**: index files, MIME types from a built-in table plus overrides, a block
+  list and dotfile refusal (`403`), percent-decoding done once, containment checked after
+  `realpath` with a symlink policy (traversal answers `403`), and a `301` that adds the
+  trailing `/` to directory paths. Large files go out with `sendfile(2)` from an open
+  descriptor and are never read into memory. Small files are cached with pre-rendered
+  headers.
+- **Caching**: strong metadata ETags (size, mtime and inode; no hashing), `Last-Modified`,
+  `Cache-Control: public, max-age=N`, and conditional requests evaluated in RFC 9110 order
+  (`If-Match`, `If-Unmodified-Since`, `If-None-Match` with lists and `*`,
+  `If-Modified-Since`, `If-Range`), answering `304`/`412`. Single `Range` requests get
+  `206`/`416`.
+- **Methods**: `GET` and `HEAD`. Anything else gets `405` with `Allow: GET, HEAD`.
+- **Error pages**: `4xx`/`5xx` responses without a body get a generated HTML page or a file
+  you configure. `304`, `HEAD` and responses with a body are never touched.
+- **Lifecycle**: SIGINT and SIGTERM stop accepting connections, let open connections finish
+  within a grace period, and exit 0. A bad config, a missing root or a port in use exits 1
+  with a message on stderr.
+- **Transports**: POSIX sockets with kqueue by default, or Network.framework.
+
+## Running
+
+```bash
+swift build -j 2
+swift run SwiftWebServer --config Root/http-config.json      # Root/Public on http://127.0.0.1:8080/
+scripts/run.sh                                                # the same, debug build
+scripts/run.sh --port 9000                                    # flags are passed on
+scripts/sigterm.sh                                            # graceful stop (PORT=9000 for another port)
+```
+
+```
+SwiftWebServer [--config FILE] [--root DIR] [--host HOST] [--port PORT]
+```
+
+- `--config FILE`: the JSON config, described below. Without it, the server reads
+  `$ROOT_PATH/http-config.json` when `ROOT_PATH` is set (the legacy launch), otherwise
+  `./http-config.json` if that file exists, otherwise it uses the defaults.
+- `--root DIR`, `--host HOST`, `--port PORT`: override the config. `--root` is relative to the
+  working directory, and `--port 0` picks a free port.
+- Once bound, the server prints `listening HOST:PORT` on stdout.
+- Exit status: 0 after a graceful stop, 1 on a configuration or startup error, 2 on a usage
+  error.
+
+The default host is `127.0.0.1`, so the server is only reachable from this Mac. Set
+`"host": "0.0.0.0"` (or `::`) to serve the network. macOS may then ask whether to accept
+incoming connections.
+
+## Configuration
+
+`http-config.json` is a JSON object. **Every key is optional**: a missing key keeps its
+default, so `{}` (or no file at all) is a valid configuration. Unknown keys print a warning
+and are ignored. A value of the wrong type or out of range stops the server with exit status
+1 and a message naming the key, such as `"timeouts.idle" must be a number of seconds`.
+Relative paths resolve against the directory that holds the config file.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `host` | `"127.0.0.1"` | Numeric address to bind |
+| `port` | `8080` | TCP port; `0` picks a free one |
+| `root` | `"Public"` | Directory to serve (legacy alias: `path`) |
+| `index` | `["index.html"]` | Index files tried, in order, for a directory; a single string is accepted (legacy alias: `defaultIndex`) |
+| `mimeTypes` | `{}` | Extra or overriding types by extension, e.g. `{"md": "text/markdown; charset=utf-8"}`. The legacy array form `[{"contentType": …, "pathExtensions": […]}]` is accepted |
+| `defaultMimeType` | `"application/octet-stream"` | `Content-Type` for unknown extensions |
+| `blockList` | `["http-config.json", ".git", ".DS_Store"]` | Path components answered with `403` anywhere in the path, case-insensitively |
+| `blockDotfiles` | `true` | Refuse every component that starts with `.` (except `.well-known`) |
+| `caching` | `{"enabled": true, "maxAge": 3600}` | `Cache-Control: public, max-age=N` on files and `304`s; `false` or `"enabled": false` sends none |
+| `maxConnections` | `1024` | Connections served at once; more wait in the listen backlog |
+| `maxBodySize` | `10485760` | Largest request body in bytes; larger gets `413` (legacy alias: `maxRequestSize`) |
+| `timeouts` | `{"header": 10, "idle": 5, "body": 30, "send": 30, "linger": 2}` | Seconds per HTTP/1.1 phase; `0` or `null` turns a limit off (legacy `keepAliveTimeout` sets `idle`) |
+| `drainTimeout` | `10` | Seconds a graceful stop waits for open connections; `null` waits indefinitely |
+| `transport` | `"bsd"` | `"bsd"` (POSIX sockets + kqueue) or `"nw"` (Network.framework) |
+| `errorPages` | `true` | `true`: generated HTML pages; `false`: none; or files by status, e.g. `{"404": "Custom/404.html"}` (relative to `root`) |
+| `tls`, `accessLog` | | Reserved for components still in progress (#0087, #0090). They are accepted with a warning and ignored |
+| `enableETags`, `enableCompression` | | Legacy keys with no effect: ETags are always sent, and compression is not implemented yet. They are accepted with a warning |
+
+A config containing only `{"port": 0}` starts a server with every other default. The shipped
+[`Root/http-config.json`](Root/http-config.json) spells out every default and adds custom
+`404`/`405` pages.
+
+Disabled features are left out of the request path entirely. The config is turned into a
+middleware chain once at startup (`ServerSettings.makeHandler()` in `Sources/ConfigFile`), and
+a component that is turned off is never registered.
+
+## Architecture
+
+The design, the target layout and the milestone plan are in
+[docs/ROADMAP.md](docs/ROADMAP.md). In brief, `Server` (HTTPServer) runs listeners from
+`NetworkTransport` and connection protocols such as `HTTP1`. Requests pass through a
+middleware chain built with a result builder from components such as `StaticFiles` and
+`ErrorPages` (see [docs/MIDDLEWARE.md](docs/MIDDLEWARE.md)). `ConfigFile` maps
+`http-config.json` onto all of these.
+
+- Issues and their workflow: [issues/Issues.md](issues/Issues.md)
+- Milestone status: [docs/PROGRESS.md](docs/PROGRESS.md)
+- Benchmarks: [docs/benchmarks/](docs/benchmarks/README.md), including
+  [M4-cutover.md](docs/benchmarks/M4-cutover.md) (this server against the original
+  baseline)
+- More docs and scripts: [docs/README.md](docs/README.md)
+
+## Development
+
+```bash
+swift build -j 2
+scripts/guarded.sh -t 900 -- swift test -j 2               # all tests
+scripts/guarded.sh -t 600 -- swift test -j 2 --filter ParityTests
+```
+
+`ParityTests` (in `Tests/IntegrationTests`) launch the built `SwiftWebServer` on
+`127.0.0.1:0` and check the behaviour of the original server and the repro steps of its
+bugs (#0003–#0025). Agents working in this repository must follow [AGENTS.md](AGENTS.md).

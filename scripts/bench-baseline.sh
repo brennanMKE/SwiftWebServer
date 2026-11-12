@@ -1,65 +1,64 @@
 #!/bin/bash
-# Records the M0 load baseline for the legacy SwiftWebServer.
+# Load benchmark of the shipped SwiftWebServer, compared with the M0 legacy baseline.
 #
-#   scripts/bench-baseline.sh [output.md]      (default docs/benchmarks/M0-baseline.md)
+#   scripts/bench-baseline.sh [output.md]      (default docs/benchmarks/M4-cutover.md)
 #
-# Builds release, serves a temporary copy of Root/Public (plus a generated large
-# file) from the legacy server on a free port, and measures it with
-# `sws-bench load`, cross-checked by oha. Caddy is measured on the same files as a
-# reference when installed. Nothing is written under Root/.
+# The M0 baseline (docs/benchmarks/M0-baseline.md) was recorded by an earlier version of
+# this script against the legacy server, which was deleted at the M4 cut-over (#0086). That
+# record stays the reference; this script measures the current server with the same files,
+# clients and settings, and adds keep-alive rows and a large-download memory check.
 #
-# Everything binds and connects to 127.0.0.1 only, and every server and client
-# runs under scripts/guarded.sh (timeout + system-prompt watchdog), per AGENTS.md.
+# Builds release, serves a temporary copy of Root/Public (plus a generated large file) with
+# the release SwiftWebServer on a free loopback port, and measures it with `sws-bench load`
+# and oha, keep-alive off (as in M0) and on. Then downloads a sparse LARGE_GB GiB file once
+# and samples the server's RSS while it streams. Nothing is written under Root/.
+#
+# Everything binds and connects to 127.0.0.1 only, and every server and client runs under
+# scripts/guarded.sh (timeout + system-prompt watchdog), per AGENTS.md.
 #
 # Environment: DURATION (seconds per run, default 10), CONNECTIONS (default 16),
-# LARGE_MB (large file size, default 8), OHA, CADDY (tool paths), SKIP_CADDY=1.
+# LARGE_MB (load-test large file, default 8), LARGE_GB (download check, default 1),
+# OHA (tool path).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 REPO=$PWD
-OUT=${1:-docs/benchmarks/M0-baseline.md}
+OUT=${1:-docs/benchmarks/M4-cutover.md}
 DURATION=${DURATION:-10}
 CONNECTIONS=${CONNECTIONS:-16}
 LARGE_MB=${LARGE_MB:-8}
+LARGE_GB=${LARGE_GB:-1}
 OHA=${OHA:-/opt/homebrew/bin/oha}
-CADDY=${CADDY:-/opt/homebrew/bin/caddy}
 PYTHON=${PYTHON:-/usr/bin/python3}
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sws-bench.XXXXXX")
 RESULTS=$WORK/results
 mkdir -p "$RESULTS"
 GUARD=$REPO/scripts/guarded.sh
-PIDS=()
-# Stops a server started under guarded.sh: its child (the server) first, then the guard.
+SERVER_GUARD=""
+# Stops the server started under guarded.sh: its child (the server) first, then the guard.
 stop_server() {
     local guard=$1
     pkill -TERM -P "$guard" 2>/dev/null || true
+    sleep 1
     kill -TERM "$guard" 2>/dev/null || true
 }
 cleanup() {
-    for pid in "${PIDS[@]:-}"; do
-        [ -n "$pid" ] && stop_server "$pid"
-    done
+    [ -n "$SERVER_GUARD" ] && stop_server "$SERVER_GUARD"
     wait 2>/dev/null || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-free_port() {
-    "$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
-}
-
-wait_for_port() {
-    local port=$1
-    for _ in $(seq 1 100); do
-        if curl -s -o /dev/null "http://127.0.0.1:$port/"; then return 0; fi
-        sleep 0.1
+wait_for_time_wait_drain() {
+    # Close-mode runs leave one TIME_WAIT socket per request; on loopback those pin
+    # ephemeral ports for 2 x MSL. Let them drain so one run cannot starve the next.
+    for _ in $(seq 1 90); do
+        [ "$(netstat -an -p tcp 2>/dev/null | grep -c TIME_WAIT)" -lt 500 ] && return 0
+        sleep 1
     done
-    echo "server on port $port did not start" >&2
-    return 1
 }
 
-# Refuses to continue unless the only listener on the port is loopback.
 check_loopback_only() {
     local port=$1 listeners
     listeners=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $9 }' | sort -u)
@@ -69,107 +68,91 @@ check_loopback_only() {
     fi
 }
 
-# Close-mode runs leave one TIME_WAIT socket per request, and on loopback those pin
-# ephemeral ports (16k by default, held 2 x MSL = 30 s). Wait for them to drain before
-# the next run so one run cannot starve the next of ports.
-wait_for_time_wait_drain() {
-    for _ in $(seq 1 90); do
-        [ "$(netstat -an -p tcp 2>/dev/null | grep -c TIME_WAIT)" -lt 500 ] && return 0
-        sleep 1
-    done
-}
-
-# Upper bound for one server's lifetime: every run plus slack.
-SERVER_BUDGET=$(( (DURATION + 100) * 6 + 120 ))
+SERVER_BUDGET=$(( (DURATION + 100) * 8 + 300 ))
 CLIENT_BUDGET=$(( DURATION + 30 ))
+LOAD_BEFORE="$(sysctl -n vm.loadavg | tr -d '{}' | xargs)"
 wait_for_time_wait_drain
 
 echo "==> swift build -c release"
-swift build -c release 2>&1 | tail -1
-swift build -c release --product sws-bench 2>&1 | tail -1
+swift build -c release -j 2 --product SwiftWebServer 2>&1 | tail -1
+swift build -c release -j 2 --product sws-bench 2>&1 | tail -1
 BIN=$(swift build -c release --show-bin-path)
 
-# Fixture: the legacy server reads its port from http-config.json under ROOT_PATH,
-# so serve a temporary root whose config points at a free port. Public is a copy
-# of Root/Public plus the generated large file, so the repository stays untouched.
 cp -R "$REPO/Root/Public" "$WORK/Public"
 dd if=/dev/urandom of="$WORK/Public/large.bin" bs=1048576 count="$LARGE_MB" 2>/dev/null
+# Sparse: no disk space or write time, and the read path is the same.
+dd if=/dev/zero of="$WORK/Public/huge.bin" bs=1048576 count=0 seek=$(( LARGE_GB * 1024 )) 2>/dev/null
 LARGE_BYTES=$(stat -f %z "$WORK/Public/large.bin")
+HUGE_BYTES=$(stat -f %z "$WORK/Public/huge.bin")
 SMALL_BYTES=$(stat -f %z "$WORK/Public/index.html")
+cat > "$WORK/http-config.json" <<EOF
+{ "host": "127.0.0.1", "port": 0, "root": "Public" }
+EOF
 
-# The legacy server degrades as it runs (it leaks per-connection tasks and memory), so
-# every legacy measurement gets a fresh process; its RSS afterwards is recorded.
-LEGACY_GUARD=""
-start_legacy() {
-    LEGACY_PORT=$(free_port)
-    sed -E "s/\"port\": *[0-9]+/\"port\": $LEGACY_PORT/" "$REPO/Root/http-config.json" > "$WORK/http-config.json"
-    "$GUARD" -t "$SERVER_BUDGET" -- env ROOT_PATH="$WORK" LISTEN_HOST=127.0.0.1 "$BIN/SwiftWebServer" \
-        >>"$WORK/legacy.log" 2>&1 &
-    LEGACY_GUARD=$!
-    PIDS+=("$LEGACY_GUARD")
-    wait_for_port "$LEGACY_PORT"
-    check_loopback_only "$LEGACY_PORT"
-}
+echo "==> SwiftWebServer"
+"$GUARD" -t "$SERVER_BUDGET" -- "$BIN/SwiftWebServer" --config "$WORK/http-config.json" \
+    >"$WORK/server.out" 2>"$WORK/server.err" &
+SERVER_GUARD=$!
+for _ in $(seq 1 100); do
+    grep -q '^listening ' "$WORK/server.out" 2>/dev/null && break
+    sleep 0.1
+done
+PORT=$(sed -n 's/^listening .*:\([0-9]*\)$/\1/p' "$WORK/server.out" | head -1)
+[ -n "$PORT" ] || { cat "$WORK/server.err" >&2; exit 1; }
+check_loopback_only "$PORT"
+SERVER_PID=$(pgrep -P "$SERVER_GUARD" | head -1)
+echo "    127.0.0.1:$PORT (pid $SERVER_PID)"
 
-# run_client NAME CLIENT(sws|oha) PORT PATH KEEPALIVE(on|off)
+rss_kb() { ps -o rss= -p "$SERVER_PID" 2>/dev/null | tr -d ' '; }
+
+# run_client NAME CLIENT(sws|oha) PATH KEEPALIVE(on|off)
 run_client() {
-    local name=$1 client=$2 port=$3 path=$4 keepalive=$5
+    local name=$1 client=$2 path=$3 keepalive=$4
     echo "==> $name: $client $path (keep-alive $keepalive)"
     if [ "$client" = sws ]; then
         local flag=--keepalive
         [ "$keepalive" = off ] && flag=--no-keepalive
-        "$GUARD" -t "$CLIENT_BUDGET" -- "$BIN/sws-bench" load --url "http://127.0.0.1:$port$path" \
+        "$GUARD" -t "$CLIENT_BUDGET" -- "$BIN/sws-bench" load --url "http://127.0.0.1:$PORT$path" \
             --connections "$CONNECTIONS" --duration "$DURATION" "$flag" --json > "$RESULTS/$name.sws.json" || true
     else
         local oha_flag=()
         [ "$keepalive" = off ] && oha_flag=(--disable-keepalive)
         "$GUARD" -t "$CLIENT_BUDGET" -- "$OHA" -z "${DURATION}s" -c "$CONNECTIONS" --no-tui --output-format json \
-            ${oha_flag[@]+"${oha_flag[@]}"} "http://127.0.0.1:$port$path" > "$RESULTS/$name.oha.json" || true
+            ${oha_flag[@]+"${oha_flag[@]}"} "http://127.0.0.1:$PORT$path" > "$RESULTS/$name.oha.json" || true
     fi
+    rss_kb > "$RESULTS/$name.$client.rss" || true
     wait_for_time_wait_drain
 }
 
-# legacy_case NAME PATH: each client against its own fresh legacy server.
-legacy_case() {
-    local name=$1 path=$2 client pid
-    for client in sws oha; do
-        start_legacy
-        echo "    legacy SwiftWebServer on 127.0.0.1:$LEGACY_PORT"
-        run_client "$name" "$client" "$LEGACY_PORT" "$path" off
-        pid=$(pgrep -P "$LEGACY_GUARD" | head -1 || true)
-        ps -o rss= -p "${pid:-0}" 2>/dev/null | tr -d ' ' > "$RESULTS/$name.$client.rss" || true
-        stop_server "$LEGACY_GUARD"
-        sleep 1
-    done
-}
+rss_kb > "$RESULTS/start.rss"
+for client in sws oha; do
+    run_client small-close "$client" / off
+    run_client large-close "$client" /large.bin off
+    run_client small-keepalive "$client" / on
+    run_client large-keepalive "$client" /large.bin on
+done
 
-legacy_case legacy-small /
-legacy_case legacy-large /large.bin
+echo "==> ${LARGE_GB} GiB download, sampling RSS"
+rss_kb > "$RESULTS/huge.before.rss"
+"$GUARD" -t 300 -- curl -sS --limit-rate 256M -o /dev/null -w '%{http_code} %{size_download} %{time_total}' \
+    "http://127.0.0.1:$PORT/huge.bin" > "$RESULTS/huge.curl" &
+CURL_GUARD=$!
+PEAK=0
+while kill -0 "$CURL_GUARD" 2>/dev/null; do
+    now=$(rss_kb || echo 0)
+    [ "${now:-0}" -gt "$PEAK" ] && PEAK=$now
+    sleep 0.05
+done
+wait "$CURL_GUARD" || true
+echo "$PEAK" > "$RESULTS/huge.peak.rss"
+rss_kb > "$RESULTS/huge.after.rss"
 
-if [ "${SKIP_CADDY:-0}" != 1 ] && [ -x "$CADDY" ]; then
-    CADDY_PORT=$(free_port)
-    echo "==> caddy file-server on 127.0.0.1:$CADDY_PORT"
-    # --listen with an explicit loopback address (plain HTTP, no automatic HTTPS).
-    "$GUARD" -t "$SERVER_BUDGET" -- "$CADDY" file-server --root "$WORK/Public" \
-        --listen "127.0.0.1:$CADDY_PORT" >"$WORK/caddy.log" 2>&1 &
-    CADDY_GUARD=$!
-    PIDS+=("$CADDY_GUARD")
-    wait_for_port "$CADDY_PORT"
-    check_loopback_only "$CADDY_PORT"
-    for client in sws oha; do
-        run_client caddy-small "$client" "$CADDY_PORT" / off
-        run_client caddy-large "$client" "$CADDY_PORT" /large.bin off
-        run_client caddy-small-keepalive "$client" "$CADDY_PORT" / on
-    done
-    stop_server "$CADDY_GUARD"
-    CADDY_VERSION=$("$CADDY" version | cut -d' ' -f1)
-else
-    CADDY_VERSION=""
-fi
+stop_server "$SERVER_GUARD"
+SERVER_GUARD=""
 
 mkdir -p "$(dirname "$OUT")"
-export RESULTS OUT DURATION CONNECTIONS LARGE_MB LARGE_BYTES SMALL_BYTES CADDY_VERSION
-export PORT_RANGE="$(sysctl -n net.inet.ip.portrange.first)-$(sysctl -n net.inet.ip.portrange.last), MSL $(sysctl -n net.inet.tcp.msl) ms"
+export RESULTS OUT DURATION CONNECTIONS LARGE_MB LARGE_GB LARGE_BYTES HUGE_BYTES SMALL_BYTES LOAD_BEFORE
+export M0="$REPO/docs/benchmarks/M0-baseline.md"
 export LOAD_AVERAGE="$(sysctl -n vm.loadavg | tr -d '{}' | xargs)"
 export SWIFT_VERSION="$(swift --version 2>/dev/null | head -1)"
 export OHA_VERSION="$("$OHA" --version)"
@@ -181,7 +164,7 @@ export COMMIT="$(git rev-parse --short HEAD)"
 export DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 "$PYTHON" - <<'PY'
-import json, os
+import json, os, re
 
 R = os.environ["RESULTS"]
 env = os.environ
@@ -193,52 +176,93 @@ def load(name):
     except (OSError, ValueError):
         return None
 
+def text(name):
+    try:
+        with open(os.path.join(R, name)) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+def kb(name):
+    try:
+        return int(text(name))
+    except ValueError:
+        return None
+
+# M0 legacy rows: (case, client) -> req/s, from the recorded baseline table.
+m0 = {}
+try:
+    for line in open(env["M0"]):
+        m = re.match(r"\| legacy `(/[^`]*)` .*, close \| (sws-bench|oha) \| ([\d,]+) \|", line)
+        if m:
+            case = "small-close" if m.group(1) == "/" else "large-close"
+            m0[(case, m.group(2))] = float(m.group(3).replace(",", ""))
+except OSError:
+    pass
+
+def versus(case, client, rps):
+    base = m0.get((case, client))
+    if not base:
+        return ""
+    return f"{base:,.0f} | {(rps - base) / base * 100:+,.0f}%"
+
 def sws_row(case, label):
     d = load(f"{case}.sws.json")
     if not d:
-        return f"| {label} | sws-bench | failed | | | | |"
+        return f"| {label} | sws-bench | failed | | | | | | |"
     r = d["result"]
     lat = r.get("latencyMilliseconds") or {}
     errs = ", ".join(f"{k} {v}" for k, v in sorted(r["errorsByKind"].items())) or "0"
-    return (f"| {label} | sws-bench | {r['requestsPerSecond']:,.0f} | {lat.get('p50', 0):.3f} | "
-            f"{lat.get('p99', 0):.3f} | {r['bodyMegabytesPerSecond']:,.1f} | {errs} |")
+    rps = r["requestsPerSecond"]
+    return (f"| {label} | sws-bench | {rps:,.0f} | {lat.get('p50', 0):.3f} | {lat.get('p99', 0):.3f} | "
+            f"{r['bodyMegabytesPerSecond']:,.1f} | {errs} | {versus(case, 'sws-bench', rps) or ' | '} |")
 
 def oha_row(case, label):
     d = load(f"{case}.oha.json")
     if not d:
-        return f"| {label} | oha | failed | | | | |"
+        return f"| {label} | oha | failed | | | | | | |"
     s, p = d["summary"], d["latencyPercentiles"]
-    # oha counts in-flight requests cut off at the deadline as errors; report them separately.
-    errs = {k: v for k, v in (d.get("errorDistribution") or {}).items()}
+    errs = dict(d.get("errorDistribution") or {})
     deadline = errs.pop("aborted due to deadline", 0)
-    text = ", ".join(f"{k} {v}" for k, v in sorted(errs.items())) or "0"
+    etext = ", ".join(f"{k} {v}" for k, v in sorted(errs.items())) or "0"
     if deadline:
-        text += f" (+{deadline} cut at deadline)"
+        etext += f" (+{deadline} cut at deadline)"
     mib = (s.get("sizePerSec") or 0) / 1048576
-    return (f"| {label} | oha | {s['requestsPerSec']:,.0f} | {p['p50'] * 1000:.3f} | "
-            f"{p['p99'] * 1000:.3f} | {mib:,.1f} | {text} |")
+    rps = s["requestsPerSec"]
+    return (f"| {label} | oha | {rps:,.0f} | {p['p50'] * 1000:.3f} | {p['p99'] * 1000:.3f} | "
+            f"{mib:,.1f} | {etext} | {versus(case, 'oha', rps) or ' | '} |")
 
 small = int(env["SMALL_BYTES"])
 large_mb = env["LARGE_MB"]
-cases = [("legacy-small", f"legacy `/` ({small} B), close"),
-         ("legacy-large", f"legacy `/large.bin` ({large_mb} MiB), close")]
-reference = []
-if env.get("CADDY_VERSION"):
-    reference = [("caddy-small", f"caddy `/` ({small} B), close"),
-                 ("caddy-large", f"caddy `/large.bin` ({large_mb} MiB), close"),
-                 ("caddy-small-keepalive", f"caddy `/` ({small} B), keep-alive")]
+cases = [("small-close", f"`/` ({small} B), close"),
+         ("large-close", f"`/large.bin` ({large_mb} MiB), close"),
+         ("small-keepalive", f"`/` ({small} B), keep-alive"),
+         ("large-keepalive", f"`/large.bin` ({large_mb} MiB), keep-alive")]
 
-def rss_text():
-    parts = []
-    for case, label in cases:
-        for client, name in (("sws", "sws-bench"), ("oha", "oha")):
-            try:
-                with open(os.path.join(R, f"{case}.{client}.rss")) as f:
-                    kb = int(f.read().strip())
-                parts.append(f"{label} / {name}: {kb // 1024} MiB")
-            except (OSError, ValueError):
-                pass
-    return "; ".join(parts) or "n/a"
+rows = ["| Case | Client | req/s | p50 ms | p99 ms | body MiB/s | errors | M0 legacy req/s | change |",
+        "|---|---|---:|---:|---:|---:|---|---:|---:|"]
+for case, label in cases:
+    rows.append(sws_row(case, label))
+    rows.append(oha_row(case, label))
+
+rss = []
+for case, label in cases:
+    for client, name in (("sws", "sws-bench"), ("oha", "oha")):
+        value = kb(f"{case}.{client}.rss")
+        if value is not None:
+            rss.append(f"| after {label} / {name} | {value / 1024:.1f} |")
+
+curl = text("huge.curl").split()
+huge_gib = int(env["HUGE_BYTES"]) / 1073741824
+if len(curl) == 3:
+    code, size, seconds = curl[0], int(curl[1]), float(curl[2])
+    download = (f"HTTP {code}, {size:,} bytes in {seconds:.2f} s "
+                f"({size / 1048576 / seconds:,.0f} MiB/s)")
+else:
+    download = "failed"
+def mib(name):
+    value = kb(name)
+    return f"{value / 1024:.1f} MiB" if value is not None else "n/a"
 
 def load_warning():
     try:
@@ -246,24 +270,17 @@ def load_warning():
     except (ValueError, IndexError):
         return ""
     cores = int(env["CORES"])
-    if one_minute <= cores:
+    if one_minute <= cores / 2:
         return ""
-    return (f"\n> **Provisional: recorded on a loaded machine** (1-minute load average {one_minute:.0f} on "
-            f"{cores} cores, from other work running in parallel). These numbers are depressed and noisy. "
-            f"Re-run `scripts/bench-baseline.sh` on an idle machine before using them as a gate.\n")
+    return (f"\n> **Recorded on a loaded machine** (1-minute load average {one_minute:.1f} on {cores} cores, "
+            f"from other work running in parallel). Numbers are depressed and noisy; re-run "
+            f"`scripts/bench-baseline.sh` on an idle machine before using them as a gate.\n")
 
-def table(rows):
-    out = ["| Case | Client | req/s | p50 ms | p99 ms | body MiB/s | errors |",
-           "|---|---|---:|---:|---:|---:|---|"]
-    for case, label in rows:
-        out.append(sws_row(case, label))
-        out.append(oha_row(case, label))
-    return "\n".join(out)
-
-doc = f"""# M0 baseline: legacy SwiftWebServer
+doc = f"""# M4 cut-over: shipped SwiftWebServer load and memory
 
 Recorded by `scripts/bench-baseline.sh` on {env['DATE']} at commit `{env['COMMIT']}`.
-This is the reference that later milestones compare against (see [README](README.md)).
+Compared with the M0 legacy baseline ([M0-baseline.md](M0-baseline.md)); the legacy server
+itself was deleted in #0086.
 {load_warning()}
 ## Machine
 
@@ -274,60 +291,35 @@ This is the reference that later milestones compare against (see [README](README
 | OS | {env['OS_VERSION']} |
 | Swift | {env['SWIFT_VERSION']} |
 | Build | `swift build -c release` |
-| Load tools | `sws-bench load`, {env['OHA_VERSION']} |
-| Ephemeral ports | {env['PORT_RANGE']} |
-| Load average at end | {env['LOAD_AVERAGE']} (1, 5, 15 min) |
+| Load tools | `sws-bench load`, {env['OHA_VERSION']}, curl |
+| Load average before / after | {env['LOAD_BEFORE']} / {env['LOAD_AVERAGE']} (1, 5, 15 min) |
 
 ## Method
 
-- Server: the legacy `SwiftWebServer` release binary, `ROOT_PATH` pointing at a temporary
-  root whose `http-config.json` is `Root/http-config.json` with a free port, serving a copy
-  of `Root/Public` plus a generated {large_mb} MiB random `large.bin`. `LISTEN_HOST=127.0.0.1`
-  keeps it on loopback. Each client run gets a fresh server process, because the legacy
-  server slows down and grows as it serves (unbounded per-connection streams and tasks).
-- Each run: {env['CONNECTIONS']} connections, {env['DURATION']} s, client and server on the same
-  machine over loopback. `sws-bench load` then `oha` against the same URL.
-- The legacy server closes the connection after every response, so it is measured with
-  keep-alive off (`--no-keepalive`, `oha --disable-keepalive`); latency then includes the
-  TCP connect.
-- Latency is request start to last response byte. `sws-bench` p50/p99 interpolate between
-  ranks; oha reports its own percentiles.
+- Server: the release `SwiftWebServer` with a config of only `host`, `port: 0` and `root`
+  (every other setting at its default: BSD transport, HTTP/1.1, ErrorPages + StaticFiles,
+  `maxConnections` 1024), serving a copy of `Root/Public` plus a {large_mb} MiB random
+  `large.bin`, as in M0. One server process for the whole run.
+- Each run: {env['CONNECTIONS']} connections, {env['DURATION']} s, loopback, `sws-bench load` then oha.
+  The close rows match the M0 cases (the legacy server closed every connection); the
+  keep-alive rows have no M0 equivalent.
+- Memory: `curl --limit-rate 256M` downloads a sparse {huge_gib:.0f} GiB `huge.bin` once (a client slower than
+  the server, so backpressure is exercised) while the server's RSS
+  is sampled every 50 ms.
 
-## Legacy server
+## Load
 
-{table(cases)}
+{chr(10).join(rows)}
 
-Legacy server RSS after each run (fresh process per run): {rss_text()}.
-"""
-if reference:
-    doc += f"""
-## Reference: Caddy {env['CADDY_VERSION']}
+## Memory
 
-`caddy file-server` on the same files, for scale only. Not a gate.
+| Point | RSS MiB |
+|---|---:|
+| idle, before load | {kb('start.rss') / 1024 if kb('start.rss') else 0:.1f} |
+{chr(10).join(rss)}
 
-{table(reference)}
-"""
-doc += """
-## Notes
-
-- `sws-bench load` opens connections through Network.framework (`NWConnection`), whose
-  per-connection setup is far more expensive than oha's raw sockets. With keep-alive off the
-  client itself caps throughput; the Caddy close rows show that ceiling. When a close-mode
-  server number approaches it, oha's figure is the one that measures the server.
-  With keep-alive on, the two clients are much closer.
-- Close-mode load is limited by ephemeral ports: every request leaves a loopback TIME_WAIT
-  socket for 2 x MSL, so above about 16k / 30 s = 550 new connections per second sustained,
-  a run of more than a few seconds starts failing connects (oha: "Can't assign requested
-  address"; sws-bench: `connect` errors). The script waits for TIME_WAIT to drain between
-  runs, but a fast server in close mode (the Caddy close rows) still hits the limit within
-  one run. Keep-alive numbers do not have this problem.
-- Other work on the machine shows in the load average above; a loaded machine depresses
-  every number. Compare runs only at similar load.
-- oha reports requests in flight at the deadline as errors ("cut at deadline"); they are
-  listed separately and are not failures.
-- Compare a server only against numbers taken with the same client, case and settings.
-- Re-run with `scripts/bench-baseline.sh`; set `DURATION`, `CONNECTIONS`, `LARGE_MB` to change
-  the load. Raw JSON is written to a temporary directory and discarded.
+{huge_gib:.0f} GiB download: {download}. Server RSS before {mib('huge.before.rss')}, peak during
+{mib('huge.peak.rss')}, after {mib('huge.after.rss')}.
 """
 with open(env["OUT"], "w") as f:
     f.write(doc)

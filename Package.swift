@@ -9,10 +9,6 @@ let modernSwiftSettings: [SwiftSetting] = [
     .enableUpcomingFeature("ExistentialAny"),
 ]
 
-/// Legacy code is deleted at the M4 cut-over, so it is left as-is rather than
-/// migrated to `modernSwiftSettings`.
-let legacySwiftSettings: [SwiftSetting] = []
-
 /// A library target with a matching product and a `<Name>Tests` test target.
 struct Library {
     let name: String
@@ -54,11 +50,9 @@ let libraries: [Library] = [
     Library("Auth", dependencies: ["HTTPCore"]),
     Library("AccessLog", dependencies: ["HTTPCore"], testDependencies: ["HTTP1", "HTTPServer", "HTTPTestSupport"]),
     Library("Router", dependencies: ["HTTPCore"]),
-    Library("ConfigFile", dependencies: ["HTTPCore"]),
+    Library("ConfigFile", dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "StaticFiles"]),
     // Test support
     Library("HTTPTestSupport", dependencies: ["HTTPCore", "HTTP1"]),
-    // The shipped server until M4 cut-over
-    Library("Legacy", swiftSettings: legacySwiftSettings),
 ]
 
 func dependencies(_ names: [String]) -> [Target.Dependency] {
@@ -86,11 +80,11 @@ for library in libraries {
 targets += [
     .executableTarget(
         name: "SwiftWebServer",
-        dependencies: ["Legacy"],
-        swiftSettings: legacySwiftSettings),
+        dependencies: ["ConfigFile", "HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport"],
+        swiftSettings: modernSwiftSettings),
     .executableTarget(
         name: "SWSBench",
-        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HeaderCompression", "HTTP2", "HTTP3", "QPACK", "HPACK", "StaticFiles", "AccessLog"],
+        dependencies: ["HTTPCore", "HTTP1", "HTTPServer", "NetworkTransport", "HeaderCompression", "HTTP2", "HTTP3", "QPACK", "HPACK", "StaticFiles", "ConfigFile", "AccessLog"],
         path: "Sources/sws-bench",
         swiftSettings: modernSwiftSettings),
     .testTarget(
