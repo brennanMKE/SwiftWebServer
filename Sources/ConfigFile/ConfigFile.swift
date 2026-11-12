@@ -184,6 +184,8 @@ struct Parser {
                 settings.hosts = try hosts(value, key)
             case "auth":
                 settings.auth = try auth(value, key)
+            case "proxy":
+                settings.proxy = try proxy(value, key)
             case "tls":
                 settings.tls = try tls(value, key)
             case "http3":

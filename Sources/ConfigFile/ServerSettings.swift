@@ -128,6 +128,10 @@ public struct ServerSettings: Sendable, Equatable {
     /// `"auth": [{"paths": ["/admin"], "realm": "Admin", "basic": {"file": "users.htpasswd"}}]`.
     public var auth: [AuthSettings] = []
 
+    /// Reverse-proxy mounts (#0124). Parsed and validated; serving lands with #0121. In the file:
+    /// `"proxy": [{"path": "/api", "upstream": "http://127.0.0.1:9000"}]`.
+    public var proxy: [ProxySettings] = []
+
     /// The TLS listener's identity and port.
     public struct TLSSettings: Sendable, Equatable {
         /// Where the PKCS#12 password comes from.

@@ -95,6 +95,9 @@ extension ServerSettings {
             if let compressor { compressor }
             if let pages { pages }
             if let authenticator { authenticator }
+            // TODO(#0121/#0124): register `proxy.map(\.mount)` here, after auth and before the
+            // static files/error pages terminal, once the `ReverseProxy` component lands.
+            // Nothing is registered yet: `proxy` is parsed and validated only.
             terminal
         }
     }
