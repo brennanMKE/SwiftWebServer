@@ -172,17 +172,44 @@ public struct ConnectionInfo: Sendable, Hashable {
     /// The ALPN protocol agreed in the TLS handshake (`"h2"`, `"http/1.1"`, `"h3"`), or `nil`
     /// for cleartext connections or when the client offered none.
     public var negotiatedALPN: String?
+    /// The TLS version agreed in the handshake, or `nil` for cleartext connections.
+    public var tlsVersion: TLSVersion?
 
     public init(
         localAddress: TransportAddress? = nil,
         remoteAddress: TransportAddress? = nil,
         isSecure: Bool = false,
-        negotiatedALPN: String? = nil
+        negotiatedALPN: String? = nil,
+        tlsVersion: TLSVersion? = nil
     ) {
         self.localAddress = localAddress
         self.remoteAddress = remoteAddress
         self.isSecure = isSecure
         self.negotiatedALPN = negotiatedALPN
+        self.tlsVersion = tlsVersion
+    }
+}
+
+/// A TLS protocol version by its wire value (RFC 8446 §4.2.1: `0x0303` is TLS 1.2, `0x0304`
+/// TLS 1.3).
+public struct TLSVersion: RawRepresentable, Sendable, Hashable, Comparable, CustomStringConvertible {
+    public var rawValue: UInt16
+
+    public init(rawValue: UInt16) {
+        self.rawValue = rawValue
+    }
+
+    public static let v1_2 = TLSVersion(rawValue: 0x0303)
+    public static let v1_3 = TLSVersion(rawValue: 0x0304)
+
+    public static func < (lhs: TLSVersion, rhs: TLSVersion) -> Bool { lhs.rawValue < rhs.rawValue }
+
+    public var description: String {
+        switch self {
+        case .v1_2: "TLSv1.2"
+        case .v1_3: "TLSv1.3"
+        default: "TLS(0x\(String(rawValue, radix: 16)))"
+        }
     }
 }
 
