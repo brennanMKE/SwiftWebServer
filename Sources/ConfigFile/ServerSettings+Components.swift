@@ -7,6 +7,7 @@ public import HTTP1
 public import HTTPCore
 public import HTTPServer
 public import StaticFiles
+import VirtualHosts
 
 // Settings to the server's configuration values and middleware chain (docs/ROADMAP.md §5.2).
 // Components are registered with the middleware builder only when enabled, so a disabled
@@ -42,18 +43,27 @@ extension ServerSettings {
     /// ``resolvedRoot``. `StaticFiles` evaluates conditional requests itself
     /// (`ConditionalRequest`, RFC 9110 order). Throws when the root or an error page file
     /// cannot be used, with a message naming it.
+    ///
+    /// With ``hosts`` set, `VirtualHosts` takes the place of the single `StaticFiles` (#0092)
+    /// and ``root`` is not opened.
     public func makeHandler() throws(ConfigFileError) -> some HTTPHandler {
         let root = resolvedRoot
-        let files: StaticFiles
-        do {
-            files = try StaticFiles(root: root, configuration: staticFilesConfiguration)
-        } catch {
-            switch error {
-            case .rootUnavailable(let code):
-                throw ConfigFileError(key: "root", "cannot serve root \(root): \(String(cString: strerror(code)))")
-            case .rootNotADirectory:
-                throw ConfigFileError(key: "root", "cannot serve root \(root): not a directory")
+        // `StaticFiles` is both a handler and a middleware; as the last element it must be the
+        // handler, so it goes in through `EitherHandler`.
+        let terminal: EitherHandler<VirtualHosts, StaticFiles>
+        if hosts.isEmpty {
+            do {
+                terminal = .second(try StaticFiles(root: root, configuration: staticFilesConfiguration))
+            } catch {
+                switch error {
+                case .rootUnavailable(let code):
+                    throw ConfigFileError(key: "root", "cannot serve root \(root): \(String(cString: strerror(code)))")
+                case .rootNotADirectory:
+                    throw ConfigFileError(key: "root", "cannot serve root \(root): not a directory")
+                }
             }
+        } else {
+            terminal = .first(try makeVirtualHosts())
         }
         let pages: ErrorPages?
         switch errorPages {
@@ -68,9 +78,6 @@ extension ServerSettings {
                 throw Self.describe(error, root: root, pages: map)
             }
         }
-        // `StaticFiles` is both a handler and a middleware; as the last element it must be the
-        // handler, so it goes in as an opaque `some HTTPHandler`.
-        let terminal = Self.handler(files)
         return MiddlewareBuilder.build {
             if let pages { pages }
             terminal

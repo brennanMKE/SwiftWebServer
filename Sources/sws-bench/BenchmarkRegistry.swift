@@ -12,6 +12,7 @@ func registerAllBenchmarks() {
     registerSerializerBenchmarks()   // M1.4: SerializerBench.swift
     registerStaticFilesBenchmarks()   // M4.2: StaticFilesBench.swift
     registerRouterBenchmarks()   // M6: RouterBench.swift
+    registerVirtualHostsBenchmarks()   // M6: VirtualHostsBench.swift
     registerSelfTimedSuites()
 }
 

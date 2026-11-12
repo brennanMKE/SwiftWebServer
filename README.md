@@ -106,6 +106,7 @@ Relative paths resolve against the directory that holds the config file.
 | `errorPages` | `true` | `true`: generated HTML pages; `false`: none; or files by status, e.g. `{"404": "Custom/404.html"}` (relative to `root`) |
 | `tls` | off | HTTPS listener: `{"identity": "server.p12", "password": "…", "port": 8443}`. `identity` is a PKCS#12 file (relative to the config file), loaded in memory only. Use `"passwordEnv": "VAR"` instead of `password` to read it from an environment variable. `port` defaults to `8443`; `0` picks a free one |
 | `http3` | off | HTTP/3 over QUIC; needs `tls`. `true`, or `{"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`. `port` (UDP) defaults to the TLS port number, even when that was `0`. `altSvcMaxAge` is the `ma` of the `Alt-Svc` header on HTTPS responses |
+| `hosts` | `[]` | Virtual hosts: `[{"names": ["a.test", "*.a.test"], "root": "sites/a"}, {"default": true, "root": "Public"}]`. Each site serves its own `root` (the other file keys are shared); `root` at the top level is then unused. Names match `Host`/`:authority` without the port, case-insensitively; `*.a.test` matches any subdomain. An unknown host gets the `default` site, or `421` without one |
 | `accessLog` | | Reserved for a component still in progress (#0090). It is accepted with a warning and ignored |
 | `enableETags`, `enableCompression` | | Legacy keys with no effect: ETags are always sent, and compression is not implemented yet. They are accepted with a warning |
 

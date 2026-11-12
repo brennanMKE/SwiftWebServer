@@ -180,6 +180,8 @@ struct Parser {
                 settings.transport = transport
             case "errorPages":
                 settings.errorPages = try errorPages(value, key)
+            case "hosts":
+                settings.hosts = try hosts(value, key)
             case "tls":
                 settings.tls = try tls(value, key)
             case "http3":

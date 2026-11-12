@@ -143,7 +143,14 @@ enum ServerMain {
                 throw ConfigFileError("\(error)")
             }
             let listeners = try makeListeners(settings, environment: environment)
-            printError("\(name): serving \(settings.resolvedRoot)")
+            if settings.hosts.isEmpty {
+                printError("\(name): serving \(settings.resolvedRoot)")
+            } else {
+                for host in settings.hosts {   // #0092
+                    let names = host.isDefault ? host.names + ["(default)"] : host.names
+                    printError("\(name): serving \(names.joined(separator: ", ")) from \(ServerSettings.resolve(host.root, against: settings.baseDirectory))")
+                }
+            }
             #if HTTP3
             if let http3 = settings.http3 {
                 // #0103: HTTPS responses advertise HTTP/3. Registered only with HTTP/3, so the

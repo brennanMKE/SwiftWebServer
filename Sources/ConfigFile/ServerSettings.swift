@@ -95,6 +95,11 @@ public struct ServerSettings: Sendable, Equatable {
     /// ``tls``. In the file: `"http3": {"enabled": true, "port": 8443, "altSvcMaxAge": 86400}`.
     public var http3: HTTP3Settings?
 
+    /// Virtual hosts (#0092): sites selected by `Host`, each with its own root. Empty (the
+    /// default) serves ``root`` for every host. In the file:
+    /// `"hosts": [{"names": ["a.test"], "root": "sites/a"}, {"default": true, "root": "Public"}]`.
+    public var hosts: [HostSettings] = []
+
     /// The TLS listener's identity and port.
     public struct TLSSettings: Sendable, Equatable {
         /// Where the PKCS#12 password comes from.
