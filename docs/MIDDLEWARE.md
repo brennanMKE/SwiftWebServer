@@ -1,24 +1,94 @@
-# Middleware
+# Middleware and components
 
-## Purpose
+Every feature beyond the core (static files, compression, access log, auth, virtual hosts,
+WebSockets) is an optional component. A component that is not registered is not in the
+compiled request path at all (docs/ROADMAP.md §1.1). This document describes the mechanism
+(#0083). The code is in `Sources/HTTPCore/MiddlewareBuilder.swift`, `RequestContext.swift` and
+`ServerComponent.swift`; `Server` (HTTPServer) consumes them.
 
-This document outlines the architecture and implementation of the middleware system for the SwiftWebServer. Middleware components intercept each HTTP request to:
+## Handlers and middlewares
 
-- Inspect or modify the request
-- Add headers or modify the response
-- Generate a full response (e.g. serve from cache)
-- Take over the connection entirely (e.g. Web Socket upgrade)
+```swift
+public protocol HTTPHandler: Sendable {
+    func handle(_ request: HTTPRequest, context: RequestContext) async throws -> HTTPResponse
+}
+public protocol HTTPMiddleware: Sendable {
+    func handle<Next: HTTPHandler>(_ request: HTTPRequest, context: RequestContext,
+                                   next: Next) async throws -> HTTPResponse
+}
+```
 
-The middleware system must:
+A middleware may inspect or change the request and context before calling `next`, change the
+response after it, answer on its own without calling `next` (short-circuit), or catch an error
+thrown further in. Taking over the connection is a response with a `.tunnel` body.
 
-- Preserve current request-response behavior
-- Be extensible for features like Web Sockets, Caching, JWT/Auth
-- Be testable and composable
+## The builder
 
----
+```swift
+let server = Server(configuration: config, listeners: [listener], protocols: [HTTP1()]) {
+    AccessLog()
+    if config.compression { Compression() }
+    StaticFiles(root: publicURL)
+}
+```
 
-## 🧩 Design Goals
+`@MiddlewareBuilder` turns the block into one nested generic type:
 
-### ✅ Minimal Interface
+| Written | Built |
+|---|---|
+| `A(); B(); H()` | `CompiledChain<MiddlewareChain<A, MiddlewareChain<B, H>>>` |
+| `A(); B()` (no handler) | `CompiledChain<MiddlewareChain<ComposedMiddleware<A, B>, NotFoundHandler>>` (`404`) |
+| `if c { M() }` | `OptionalMiddleware<M>`: absent is one predictable branch |
+| `if c { A() } else { B() }` | `EitherMiddleware<A, B>` (`EitherHandler` for handlers) |
+| `{}` | `PassthroughMiddleware` |
+| `H()` alone | `H` itself |
 
-The interface needs to be defined.
+- Order is onion order: the first middleware sees the request first and the response last.
+- A handler anywhere but last, or a branch mixing a middleware and a handler, does not compile.
+- Up to 10 elements per block; an `if true { … }` groups more. Middlewares in front of a handler
+  nest to the right, built once, so a request walks stored values and nothing is copied per
+  request. A block of middlewares with no handler after it (an `if` body) is a
+  `ComposedMiddleware`, which builds its inner `next` per request (a copy of the rest of the
+  chain), so prefer single components in `if`s on hot paths.
+- No existentials and no arrays inside the chain, and every chain type is `@inlinable`.
+- `CompiledChain` is the boundary: protocol runners are called through `any ConnectionProtocol`
+  and run unspecialized, so the builder (inlined where the chain is written) stores a closure
+  compiled with every type known. The runner makes one indirect async call into it, and inside
+  it the chain's own types inline away. A lone handler skips the wrapper.
+- `Server(…, handler: app)` is the same as a builder with one element.
+- `MiddlewareBuilder.build { … }` runs the builder anywhere else (tests, sub-chains).
+
+Costs, from `sws-bench h1conn` (docs/benchmarks/M4.1-components.md): three no-op middlewares
+cost the same as none once inside a `CompiledChain`; a disabled `if` component costs about
+2 ns; the `CompiledChain` call itself costs one async call (about 15 ns direct, 30 ns inside the
+HTTP/1.1 loop), paid only by chains with at least one middleware.
+
+## RequestContext
+
+Passed by value with every request:
+
+| Member | Contents |
+|---|---|
+| `connection` | `ConnectionInfo`: local and remote address, TLS, negotiated ALPN |
+| `startTime` | `MonotonicInstant?` when the request reached the chain; `nil` unless a component in the chain conforms to `RequestStartTimeConsumer` (the clock read is then paid per request) |
+| `context[Key.self]` | Typed values set by components for those after them (`RequestContextKey`) |
+
+Typed values cost nothing until a component sets one; each set allocates one small immutable
+node. A middleware copies the context, sets a value and passes the copy to `next`, so values
+flow inward only and never leak between requests.
+
+## Server components
+
+```swift
+public protocol ServerComponent: Sendable {
+    func run(server: ServerHandle) async throws
+}
+```
+
+For components with a lifetime of their own (flushing an access log, evicting a cache). The
+server finds them in the `components:` argument and in the builder chain (a middleware that is
+also a `ServerComponent`; one left out by an `if` is not found). They run as child tasks of the
+server once the listeners are bound and are cancelled after the last connection closed, so they
+can flush what the final requests produced. A component that throws (other than
+`CancellationError`) shuts the server down, and `Server.run()` rethrows the error. `ServerHandle`
+gives the bound addresses, the draining signal and `requestShutdown()`.

@@ -644,7 +644,8 @@ where Transport.Stream: ResettableStream {
         let response: HTTPResponse
         if let request {
             isHead = request.method == .head
-            let requestContext = RequestContext(connection: context.info)
+            let requestContext = RequestContext(
+                connection: context.info, startTime: context.recordsRequestStartTime ? .now() : nil)
             do {
                 response = try await handler.handle(request, context: requestContext)
                 storage.endRequest()

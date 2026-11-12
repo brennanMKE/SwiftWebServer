@@ -57,10 +57,15 @@ public struct ConnectionContext: Sendable {
     /// stops reading new requests (HTTP/1.1 `Connection: close`, HTTP/2 `GOAWAY`) and returns.
     /// The server cancels connections that are still running at the drain deadline.
     public var shutdown: ShutdownSignal
+    /// Whether to stamp ``RequestContext/startTime`` on every request. The server sets it when
+    /// the handler chain contains a ``RequestStartTimeConsumer`` (#0083).
+    public var recordsRequestStartTime: Bool
 
-    public init(info: ConnectionInfo, shutdown: ShutdownSignal = ShutdownSignal()) {
+    public init(info: ConnectionInfo, shutdown: ShutdownSignal = ShutdownSignal(),
+                recordsRequestStartTime: Bool = false) {
         self.info = info
         self.shutdown = shutdown
+        self.recordsRequestStartTime = recordsRequestStartTime
     }
 }
 

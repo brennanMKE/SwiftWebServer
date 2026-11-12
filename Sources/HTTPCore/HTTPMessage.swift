@@ -134,19 +134,8 @@ public enum HTTPResponseBody: Sendable {
 
 // MARK: - Handlers (docs/ROADMAP.md §5.2)
 
-/// Per-request information a handler may need besides the request itself.
-///
-/// Minimal for now; #0083 adds the connection and server details (logger, limits, TLS state,
-/// cancellation of the connection).
-public struct RequestContext: Sendable {
-    /// Addresses and security properties of the connection carrying the request.
-    public var connection: ConnectionInfo
-
-    @inlinable
-    public init(connection: ConnectionInfo = ConnectionInfo()) {
-        self.connection = connection
-    }
-}
+// `RequestContext` is in RequestContext.swift; the builder that composes handlers and
+// middlewares is in MiddlewareBuilder.swift (#0083).
 
 /// Turns a request into a response. The request is valid only while this runs (see
 /// ``HTTPRequest``).

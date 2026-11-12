@@ -321,7 +321,9 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
     let transport: Transport
     let handler: Handler
     let shutdown: ShutdownSignal
-    let requestContext: RequestContext
+    /// Passed to every request, with a fresh ``RequestContext/startTime`` when `recordsStartTime`.
+    var requestContext: RequestContext
+    let recordsStartTime: Bool
     let configuration: HTTP1Configuration
     let watchdog: HTTP1Watchdog
     let ticks: HTTP1TimeoutTicks
@@ -352,6 +354,7 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
         self.handler = handler
         self.shutdown = context.shutdown
         self.requestContext = RequestContext(connection: context.info)
+        self.recordsStartTime = context.recordsRequestStartTime
         self.configuration = configuration
         self.watchdog = watchdog
         self.ticks = HTTP1TimeoutTicks(configuration.timeouts)
@@ -464,6 +467,9 @@ struct HTTP1ConnectionDriver<Transport: ByteStreamTransport, Handler: HTTPHandle
                     }
                     request.body = bodyReader.begin(framing: head.framing, expectsContinue: expectsContinue)
                 }
+                // Stamped in place: one call site passing the stored context keeps the
+                // unstamped path as cheap as before #0083.
+                if recordsStartTime { requestContext.startTime = .now() }
                 let response: HTTPResponse
                 do {
                     response = try await handler.handle(request, context: requestContext)
