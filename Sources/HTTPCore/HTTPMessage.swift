@@ -19,6 +19,9 @@ public struct HTTPRequest: Sendable {
     public var path: ByteView
     /// The query without the `?`; empty when absent.
     public var query: ByteView
+    /// The `:protocol` pseudo-header of an extended CONNECT (RFC 8441, RFC 9220), such as
+    /// `websocket`; empty for every other request (#0111).
+    public var connectProtocol: ByteView
     public var headers: HTTPFieldsView
     public var body: HTTPRequestBody
 
@@ -31,10 +34,12 @@ public struct HTTPRequest: Sendable {
         query: ByteView = .empty,
         headers: HTTPFieldsView,
         body: HTTPRequestBody = .empty,
-        version: HTTPVersion = .http1_1
+        version: HTTPVersion = .http1_1,
+        connectProtocol: ByteView = .empty
     ) {
         self.method = method
         self.version = version
+        self.connectProtocol = connectProtocol
         self.scheme = scheme
         self.authority = authority
         self.path = path
@@ -67,7 +72,7 @@ public struct HTTPRequest: Sendable {
     /// returning if it is needed.
     public func snapshot() -> HTTPRequest {
         headers.withFieldStorage { index, arena in
-            var bytes = scheme.length + authority.length + path.length + query.length
+            var bytes = scheme.length + authority.length + path.length + query.length + connectProtocol.length
             for i in 0..<index.count { bytes += index.nameViews[i].length + index.valueViews[i].length }
             let copy = HTTPRequestStorage(bufferCapacity: bytes, fieldCapacity: index.count)
             func move(_ view: ByteView) -> ByteView {
@@ -79,12 +84,14 @@ public struct HTTPRequest: Sendable {
             let authority = move(authority)
             let path = move(path)
             let query = move(query)
+            let connectProtocol = move(connectProtocol)
             for i in 0..<index.count {
                 let field = index[i]
                 copy.fields.append(field.name, nameView: move(field.nameView), valueView: move(field.valueView))
             }
             return HTTPRequest(method: method, scheme: scheme, authority: authority, path: path,
-                               query: query, headers: copy.fieldsView, body: .empty, version: version)
+                               query: query, headers: copy.fieldsView, body: .empty, version: version,
+                               connectProtocol: connectProtocol)
         }
     }
 }

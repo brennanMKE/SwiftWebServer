@@ -1,7 +1,8 @@
 import CryptoKit
 public import HTTPCore
 
-/// The opening handshake of RFC 6455 §4.2 for HTTP/1.1, as pure functions over a request.
+/// The opening handshake of RFC 6455 §4.2 for HTTP/1.1, and its extended CONNECT form for
+/// HTTP/2 and HTTP/3 (RFC 8441 §5, RFC 9220 §3), as pure functions over a request.
 public enum WebSocketHandshake {
     /// Appended to the client's key before hashing (RFC 6455 §1.3).
     public static let guid: StaticString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -21,13 +22,16 @@ public enum WebSocketHandshake {
         /// An HTTP/1.0 request: `Upgrade` is ignored there (RFC 9110 §7.8) and an HTTP/1.0
         /// client must not get `101` (RFC 9110 §15.2); RFC 6455 §4.1 needs HTTP/1.1 (#0117).
         case unsupportedHTTPVersion
+        /// A CONNECT that is not an extended CONNECT with `:protocol websocket`.
+        case notWebSocketConnect
 
         /// The response status: 426 for a missing upgrade or an unsupported version (with
         /// the headers that say what is supported), 400 for the rest.
         public var status: HTTPStatus {
             switch self {
             case .missingUpgrade, .unsupportedVersion: .upgradeRequired
-            case .methodNotGET, .missingConnectionUpgrade, .invalidKey, .unsupportedHTTPVersion: .badRequest
+            case .methodNotGET, .missingConnectionUpgrade, .invalidKey, .unsupportedHTTPVersion, .notWebSocketConnect:
+                .badRequest
             }
         }
 
@@ -48,13 +52,39 @@ public enum WebSocketHandshake {
             }
             return HTTPResponse(status: status, headers: headers)
         }
+
+        /// The error response to an extended CONNECT: `400`, with `Sec-WebSocket-Version: 13`
+        /// for a version mismatch (HTTP/2 and HTTP/3 have no `Upgrade`, so no `426`).
+        public var extendedConnectResponse: HTTPResponse {
+            var headers = HTTPFields()
+            if self == .unsupportedVersion { headers.append(.secWebSocketVersion, "13") }
+            return HTTPResponse(status: .badRequest, headers: headers)
+        }
     }
 
     /// True when the request asks for a WebSocket (`Upgrade: websocket`); whether it is a
     /// valid handshake is ``validate(_:)``'s job. Always false for HTTP/1.0, whose `Upgrade`
     /// field a server must ignore (RFC 9110 §7.8).
     public static func isUpgradeRequest(_ request: HTTPRequest) -> Bool {
-        request.version != .http1_0 && request.headers.containsListElement("websocket", in: .upgrade)
+        if request.method == .connect { return isExtendedConnect(request) }
+        return request.version != .http1_0 && request.headers.containsListElement("websocket", in: .upgrade)
+    }
+
+    /// True for an extended CONNECT with `:protocol websocket` (RFC 8441 §4, RFC 9220 §3).
+    public static func isExtendedConnect(_ request: HTTPRequest) -> Bool {
+        request.method == .connect
+            && request.withSpan(of: request.connectProtocol) { ASCII.equalsCaseInsensitive($0, "websocket") }
+    }
+
+    /// Checks an extended CONNECT opening handshake (RFC 8441 §5, RFC 9220 §3): `:protocol
+    /// websocket` and `Sec-WebSocket-Version: 13`. There is no key and no accept value; the
+    /// answer is `200`. `:scheme`, `:path` and `:authority` were required by the protocol's
+    /// pseudo-header validation (``PseudoHeaderValidator``).
+    public static func validateExtendedConnect(_ request: HTTPRequest) throws(Failure) {
+        guard isExtendedConnect(request) else { throw .notWebSocketConnect }
+        guard request.headers.count(of: .secWebSocketVersion) == 1,
+              let version = request.headers.firstValue(for: .secWebSocketVersion),
+              request.withSpan(of: version, { ASCII.equals($0, "13") }) else { throw .unsupportedVersion }
     }
 
     /// Checks the request line and fields of an opening handshake (RFC 6455 §4.2.1) and

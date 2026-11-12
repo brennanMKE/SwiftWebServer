@@ -24,6 +24,10 @@ public enum H3HeadError: Error, Sendable, Equatable {
 
 /// Decodes a request HEADERS frame into an ``HTTPRequest`` (RFC 9114 §4.1, §4.3.1).
 ///
+/// An extended CONNECT (RFC 9220: `:method CONNECT` with `:protocol`, `:scheme`, `:path` and
+/// `:authority`) keeps its `:protocol` in ``HTTPRequest/connectProtocol``. It is malformed
+/// unless we advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL` (RFC 8441 §3, `allowsExtendedConnect`).
+///
 /// Every field is copied into the stream's ``HTTPRequestStorage`` once and checked by
 /// ``PseudoHeaderValidator`` (`:method`, `:scheme`, `:authority` or `host`, `:path`, lowercase
 /// names, no connection-specific fields, `te: trailers` only). Pseudo-header values become the
@@ -33,7 +37,8 @@ public enum H3HeadError: Error, Sendable, Equatable {
 public enum H3RequestHeadDecoder {
     /// Decodes `section` into `storage` and returns the request.
     public static func decode(
-        _ section: UnsafeRawBufferPointer, decoder: inout QPACKDecoder, storage: HTTPRequestStorage
+        _ section: UnsafeRawBufferPointer, decoder: inout QPACKDecoder, storage: HTTPRequestStorage,
+        allowsExtendedConnect: Bool = false
     ) throws(H3HeadError) -> HTTPRequest {
         var sink = RequestFieldSink(storage: storage)
         do throws(QPACKError) {
@@ -50,6 +55,9 @@ public enum H3RequestHeadDecoder {
         }
         if let violation = sink.violation ?? sink.validator.finish() { throw .malformed(violation) }
         guard let method = sink.validator.method else { throw .malformed(.missingPseudoHeader(.pseudoMethod)) }
+        if sink.validator.hasSeen(.pseudoProtocol) && !allowsExtendedConnect {
+            throw .malformed(.pseudoHeaderNotAllowed(.pseudoProtocol))
+        }
         // Split `:path` into path and query at the first `?`.
         var path = sink.path
         var query = ByteView.empty
@@ -63,7 +71,7 @@ public enum H3RequestHeadDecoder {
         }
         return HTTPRequest(
             method: method, scheme: sink.scheme, authority: sink.authority, path: path, query: query,
-            headers: storage.fieldsView, version: .http3)
+            headers: storage.fieldsView, version: .http3, connectProtocol: sink.connectProtocol)
     }
 
     /// Decodes a trailing HEADERS frame: only regular, well-formed fields are allowed
@@ -92,6 +100,7 @@ struct RequestFieldSink: QPACKFieldSink {
     var scheme = ByteView.empty
     var authority = ByteView.empty
     var path = ByteView.empty
+    var connectProtocol = ByteView.empty
 
     init(storage: HTTPRequestStorage) {
         self.storage = storage
@@ -117,7 +126,8 @@ struct RequestFieldSink: QPACKFieldSink {
         case .pseudoScheme: scheme = valueView
         case .pseudoAuthority: authority = valueView
         case .pseudoPath: path = valueView
-        case .pseudoMethod, .pseudoProtocol: break
+        case .pseudoProtocol: connectProtocol = valueView
+        case .pseudoMethod: break
         default: storage.fields.append(id, nameView: nameView, valueView: valueView)
         }
     }

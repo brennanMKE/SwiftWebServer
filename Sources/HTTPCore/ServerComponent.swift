@@ -90,6 +90,16 @@ public struct ConnectionObservers: Sendable {
     }
 }
 
+/// A chain element that answers extended CONNECT requests (RFC 8441 over HTTP/2, RFC 9220
+/// over HTTP/3) for some `:protocol` values with a `.tunnel` response, such as the WebSocket
+/// component. Protocol runners find it with
+/// ``MiddlewareChainInspector/extendedConnectProtocols(in:)`` and only then advertise
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so a server without one never receives `:protocol`.
+public protocol ExtendedConnectProvider {
+    /// The `:protocol` values served (`["websocket"]`).
+    var extendedConnectProtocols: [String] { get }
+}
+
 /// A builder type that holds other chain elements: every composition type of
 /// ``MiddlewareBuilder`` conforms, so the server can inspect a built chain once at startup
 /// (find its ``ServerComponent``s and whether it has a ``RequestStartTimeConsumer``).
@@ -122,6 +132,15 @@ public enum MiddlewareChainInspector {
         var observers: [any ConnectionObserver] = []
         visit(root) { if let observer = $0 as? any ConnectionObserver { observers.append(observer) } }
         return observers
+    }
+
+    /// The extended CONNECT protocols (RFC 8441 / RFC 9220 `:protocol` values) that elements
+    /// of the chain serve, in chain order. HTTP/3 advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`
+    /// when this is not empty (#0111).
+    public static func extendedConnectProtocols(in root: Any) -> [String] {
+        var protocols: [String] = []
+        visit(root) { if let provider = $0 as? any ExtendedConnectProvider { protocols += provider.extendedConnectProtocols } }
+        return protocols
     }
 
     /// True when an element of the chain reads ``RequestContext/startTime``.
