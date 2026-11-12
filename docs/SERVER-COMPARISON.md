@@ -26,7 +26,7 @@ Run of 2026-11-11, commit `6bd196a` (end of M3.2: HTTP/1.1 keep-alive, pipelinin
 | Caddy | 2.11.1 | `file_server`, admin API off, no access log |
 | lighttpd | 1.4.85 | defaults (single process, event loop), keep-alive requests 65535 |
 | h2o | 2.2.6 | one thread per core |
-| legacy SwiftWebServer | this repo, `Legacy` target | release build; closes every connection |
+| legacy SwiftWebServer | this repo, `Legacy` target (deleted in #0086) | release build; closes every connection |
 
 ## Results
 

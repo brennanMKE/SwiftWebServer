@@ -1,3 +1,10 @@
+> **Historical.** This is the original description of the legacy server, which was deleted at
+> the M4 cut-over (#0086). Several claims below were never true (Linux support, a directory
+> argument, `Connection: close`, the `"enable"` caching key; see #0026). The current server is
+> described in the top-level [README](../README.md), its configuration in the README's
+> "Configuration" section, and the design in [ROADMAP.md](ROADMAP.md). The earlier HTTP/2 plan is
+> [HTTP2.md](HTTP2.md) (also superseded).
+
 ## ✅ Project: SwiftWebServer
 
 A lightweight, standalone HTTP/1.1 web server written in **Swift 6** using **Swift Concurrency** and **Network.framework**, compatible with macOS and Linux.

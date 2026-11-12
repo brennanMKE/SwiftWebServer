@@ -1,3 +1,7 @@
+> **Historical.** The original to-do list of the legacy server (deleted in #0086). Work is tracked
+> in [`issues/`](../issues/Issues.md) and planned in [ROADMAP.md](ROADMAP.md). The "Implemented"
+> list below described the legacy server and was partly wrong (HEAD sent bodies, #0016).
+
 # To Do List
 
 ## ✅ Implemented

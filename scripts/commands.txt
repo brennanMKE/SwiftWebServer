@@ -1,49 +1,42 @@
-lsof -i :8080
-lsof -i :9000
-lsof -i :9001
+# Handy manual checks against a server started with scripts/run.sh (127.0.0.1:8080).
 
-curl http://localhost:8080/
-curl http://localhost:8080/index.html
+lsof -nP -iTCP:8080 -sTCP:LISTEN
 
-# Test HEAD requests
-curl -I http://localhost:8080/
-curl -I http://localhost:8080/index.html
-curl -I http://localhost:8080/swift.png
-curl -I http://localhost:8080/Tab1/index.html
+curl -i http://127.0.0.1:8080/
+curl -i http://127.0.0.1:8080/index.html
 
-# Test ETag support
-# First request to get the ETag
-curl -I http://localhost:8080/index.html
+# HEAD requests (no body)
+curl -I http://127.0.0.1:8080/
+curl -I http://127.0.0.1:8080/swift.png
+curl -I http://127.0.0.1:8080/Tab1/index.html
 
-# Second request using the ETag from the first response
-curl -I http://localhost:8080/index.html \
-  -H "If-None-Match: W/\"423e899f1d200983ffd599936f77473b9cb338f1b8b5c0990885243a1279ac32\""
+# ETag and 304: take the ETag (strong, metadata-based) from the first response
+ET=$(curl -sI http://127.0.0.1:8080/index.html | grep -i '^etag' | cut -d' ' -f2- | tr -d '\r')
+curl -i http://127.0.0.1:8080/index.html -H "If-None-Match: $ET"
 
-# Test both Last-Modified and ETag
-curl -I http://localhost:8080/index.html \
-  -H "If-Modified-Since: Mon, 24 Mar 2025 07:21:01 GMT" \
-  -H "If-None-Match: W/\"423e899f1d200983ffd599936f77473b9cb338f1b8b5c0990885243a1279ac32\""
+# Last-Modified and If-Modified-Since
+LM=$(curl -sI http://127.0.0.1:8080/index.html | grep -i '^last-modified' | cut -d' ' -f2- | tr -d '\r')
+curl -i http://127.0.0.1:8080/index.html -H "If-Modified-Since: $LM"
 
-kill -9 <pid>
-kill -2 <pid>
+# Range request (206)
+curl -i -r 0-99 http://127.0.0.1:8080/swift.png -o /dev/null -D -
 
-swift build -c debug
-swift build -c release
-swift run
-swift run -c release SwiftWebServer
-swift run -c debug SwiftWebServer
-swift build --product YourApp
+# 405 with Allow, 403 for blocked paths and traversal
+curl -i -X POST http://127.0.0.1:8080/
+curl -i http://127.0.0.1:8080/.DS_Store
+curl -i --path-as-is http://127.0.0.1:8080/../http-config.json
 
-swift run -c release --product webserver
+# Stop the server
+scripts/sigterm.sh            # or scripts/sigint.sh; PORT=9000 scripts/sigterm.sh for another port
 
-swift build --target SwiftWebServer
-swift build --target Legacy
-swift build --target SwiftWebServerFunctionalTests
+# Build and run
+swift build -j 2
+swift run -c debug SwiftWebServer --config Root/http-config.json
+swift run -c release SwiftWebServer --config Root/http-config.json --port 9000
+swift build --target ConfigFile
+scripts/guarded.sh -t 900 -- swift test -j 2
+scripts/guarded.sh -t 600 -- swift test -j 2 --filter ParityTests
 
-
-find . -name "*.swift" -print0 | xargs -0 cat | wc -l
-
-curl -I http://localhost:8080/index.html \
-  -H "If-Modified-Since: Wed, 20 Mar 2024 17:00:00 GMT"
+find Sources -name "*.swift" -print0 | xargs -0 cat | wc -l
 
 https://github.com/crossbario/autobahn-testsuite
