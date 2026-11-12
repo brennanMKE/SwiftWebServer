@@ -18,15 +18,24 @@ public struct ReverseProxy: HTTPMiddleware {
 
     public func handle<Next: HTTPHandler>(_ request: HTTPRequest, context: RequestContext,
                                           next: Next) async throws -> HTTPResponse {
-        let rawPath = request.string(of: request.path)
-        guard let decoded = ReverseProxyPath.normalize(rawPath) else {
+        let mount: CompiledMount
+        let decoded: String
+        switch request.withSpan(of: request.path, { lookup(path: $0, request: request) }) {
+        case .miss:
             return try await next.handle(request, context: context)
+        case .hit(let index):
+            // The raw path is already normalized: it is the decoded path.
+            mount = mounts[index]
+            decoded = request.string(of: request.path)
+        case .needsNormalizing:
+            guard let normalized = ReverseProxyPath.normalize(request.string(of: request.path)),
+                  let match = match(path: normalized, host: Self.clientHost(request)) else {
+                return try await next.handle(request, context: context)
+            }
+            mount = match.mount
+            decoded = normalized
         }
         let clientHost = Self.clientHost(request)
-        guard let match = match(path: decoded, host: clientHost) else {
-            return try await next.handle(request, context: context)
-        }
-        let mount = match.mount
         // #0123: upgrades go to the next healthy upstream in round-robin order.
         if let target = mount.balancer.peek().map({ mount.config.upstreams[$0] }),
            let upgraded = try await proxyUpgradeIfRequested(request, decodedPath: decoded, mount: mount, target: target,
@@ -38,6 +47,39 @@ public struct ReverseProxy: HTTPMiddleware {
 
     // MARK: Matching
 
+    enum Lookup: Equatable {
+        case miss
+        case hit(Int)
+        /// The path has percent-escapes, dot segments or non-ASCII bytes: decode and normalize
+        /// it first (the slow path).
+        case needsNormalizing
+    }
+
+    /// Matches a raw request path on its bytes, without allocating: the first (longest) mount
+    /// whose prefix ends on a segment boundary and whose hosts (if any) include the request's.
+    /// A path that is not already in normal form is left to the slow path, so `/%61pi` and
+    /// `/x/../api` match exactly as their normalized forms do.
+    func lookup(path: Span<UInt8>, request: HTTPRequest) -> Lookup {
+        guard ReverseProxyPath.isNormalized(path) else { return .needsNormalizing }
+        for (i, mount) in mounts.enumerated() where mount.matches(path) {
+            if mount.hostBytes.isEmpty || hostMatches(mount, request) { return .hit(i) }
+        }
+        return .miss
+    }
+
+    /// Whether the request's host (`:authority` or `Host`, port removed) is one of `mount`'s.
+    func hostMatches(_ mount: CompiledMount, _ request: HTTPRequest) -> Bool {
+        func check(_ host: Span<UInt8>) -> Bool {
+            let name = host.extracting(0..<ReverseProxyPath.hostLengthWithoutPort(host))
+            return mount.hostBytes.contains { candidate in
+                candidate.withUnsafeBufferPointer { ReverseProxyHeaders.equalsCaseInsensitive(name, $0.span) }
+            }
+        }
+        if request.authority.length > 0 { return request.withSpan(of: request.authority, check) }
+        guard let host = request.headers.firstValue(for: .host) else { return false }
+        return request.headers.withSpan(of: host, check)
+    }
+
     func match(path: String, host: String?) -> (mount: CompiledMount, remainder: Substring)? {
         for mount in mounts {
             if !mount.hosts.isEmpty {
@@ -46,6 +88,20 @@ public struct ReverseProxy: HTTPMiddleware {
             if let remainder = mount.remainder(of: path) { return (mount, remainder) }
         }
         return nil
+    }
+
+    /// For `sws-bench`: whether the byte-level lookup matches a mount (no allocation).
+    @_spi(Benchmark) public func benchLookup(_ request: HTTPRequest) -> Bool {
+        if case .hit = request.withSpan(of: request.path, { lookup(path: $0, request: request) }) { return true }
+        return false
+    }
+
+    /// For `sws-bench`: the upstream request for `request` under the first mount, if it matches.
+    @_spi(Benchmark) public func benchUpstreamRequest(_ request: HTTPRequest, context: RequestContext) -> UpstreamRequest? {
+        guard case .hit(let i) = request.withSpan(of: request.path, { lookup(path: $0, request: request) }),
+              let target = mounts[i].config.upstreams.first else { return nil }
+        return makeUpstreamRequest(request, decodedPath: request.string(of: request.path), mount: mounts[i],
+                                   target: target, clientHost: Self.clientHost(request), context: context)
     }
 
     // MARK: Request
@@ -88,6 +144,9 @@ public struct ReverseProxy: HTTPMiddleware {
             headers = ReverseProxyLocation.rewrite(headers, mount: mount.config, target: target,
                                                    clientHost: clientHost, secure: secure)
         }
+        if mount.config.rewriteCookiePath, headers.contains(.setCookie) {
+            headers = ReverseProxyLocation.rewriteCookiePaths(headers, mount: mount.config, target: target)
+        }
         let body = upstream.body
         let responseBody: HTTPResponseBody
         if body.knownLength == 0 {
@@ -114,6 +173,9 @@ struct CompiledMount: Sendable {
     /// The mount path without a trailing slash; empty for "/".
     let prefix: String
     let hosts: [String]
+    /// `prefix` and `hosts` as bytes, for matching without strings.
+    let prefixBytes: [UInt8]
+    let hostBytes: [[UInt8]]
     /// Round-robin choice and health of `config.upstreams` (#0122).
     let balancer: UpstreamBalancer
 
@@ -125,6 +187,16 @@ struct CompiledMount: Sendable {
         if !prefix.isEmpty, !prefix.hasPrefix("/") { prefix = "/" + prefix }
         self.prefix = prefix
         self.hosts = config.hosts.map { $0.lowercased() }
+        self.prefixBytes = Array(prefix.utf8)
+        self.hostBytes = hosts.map { Array($0.utf8) }
+    }
+
+    /// Whether the normalized `path` is under this mount on a segment boundary.
+    func matches(_ path: Span<UInt8>) -> Bool {
+        let n = prefixBytes.count
+        guard path.count >= n else { return false }
+        for i in 0..<n where path[i] != prefixBytes[i] { return false }
+        return path.count == n || path[n] == UInt8(ascii: "/")
     }
 
     /// The part of `path` after the prefix when `path` is under this mount on a
@@ -140,6 +212,42 @@ struct CompiledMount: Sendable {
 }
 
 enum ReverseProxyPath {
+    /// Whether `path` is already what ``normalize(_:)`` would return: absolute, ASCII, with no
+    /// percent-escape, NUL or dot segment. Such a path can be matched as it is.
+    static func isNormalized(_ path: Span<UInt8>) -> Bool {
+        guard !path.isEmpty, path[0] == UInt8(ascii: "/") else { return false }
+        var segmentStart = 1
+        var dots = 0
+        for i in 1..<path.count {
+            let b = path[i]
+            if b == UInt8(ascii: "/") {
+                if dots > 0 && dots == i - segmentStart { return false }
+                segmentStart = i + 1
+                dots = 0
+            } else if b == UInt8(ascii: ".") {
+                dots += 1
+                if dots > 2 { dots = Int.min / 2 }
+            } else if b == UInt8(ascii: "%") || b == 0 || b >= 0x80 {
+                return false
+            }
+        }
+        return !(dots > 0 && dots == path.count - segmentStart)
+    }
+
+    /// The length of `host` without a `:port` (an IPv6 literal keeps its brackets).
+    static func hostLengthWithoutPort(_ host: Span<UInt8>) -> Int {
+        if !host.isEmpty, host[0] == UInt8(ascii: "[") {
+            for i in 0..<host.count where host[i] == UInt8(ascii: "]") { return i + 1 }
+            return host.count
+        }
+        var i = host.count
+        while i > 0 {
+            i -= 1
+            if host[i] == UInt8(ascii: ":") { return i }
+        }
+        return host.count
+    }
+
     /// Percent-decodes `path` and resolves dot segments. Returns nil for a path
     /// that is malformed, not absolute, contains NUL, or climbs above the root.
     static func normalize(_ path: String) -> String? {

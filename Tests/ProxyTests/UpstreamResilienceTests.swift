@@ -366,11 +366,11 @@ struct ProxyHandler: HTTPHandler {
         #expect(try await collect(client.send(request(.get), body: .empty, to: target).body) == "ok")
         #expect(client.connectionsOpened == 2)
 
+        // #0120: the liveness check before reuse sees that the upstream closed the pooled
+        // connection, so a POST (never retried) goes out on a fresh one instead of failing.
         try await Task.sleep(for: .milliseconds(100))
-        await #expect(throws: UpstreamError.closedEarly) {
-            _ = try await client.send(request(.post), body: .empty, to: target)
-        }
-        #expect(client.connectionsOpened == 2)
+        #expect(try await collect(client.send(request(.post), body: .empty, to: target).body) == "ok")
+        #expect(client.connectionsOpened == 3)
         await client.shutdown()
         await upstream.stop()
     }
@@ -446,8 +446,13 @@ struct ProxyHandler: HTTPHandler {
             group.cancelAll()
         }
         #expect(upstream.counters.accepted.load(ordering: .relaxed) >= 2)
-        // A proxy with no check path returns at once.
-        try await ReverseProxy(mounts: [mount([target(1)])], client: client).run(server: handle)
+        // A proxy with no check path still runs the idle sweep (#0120) until cancelled, then
+        // closes the idle connections.
+        await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await ReverseProxy(mounts: [mount([target(1)])], client: client).run(server: handle) }
+            try? await Task.sleep(for: .milliseconds(50))
+            group.cancelAll()
+        }
         await client.shutdown()
         await upstream.stop()
     }

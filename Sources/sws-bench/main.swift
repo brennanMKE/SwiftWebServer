@@ -11,6 +11,7 @@ let usage = """
       serve    run the new-stack HTTP/1.1 server with a built-in hello handler
       h1conn   ns and allocations per request of the HTTP/1.1 connection loop
       accept   new-connection rate, per-phase latency and allocations per connection
+      proxy    reverse-proxy cost per request over a warm upstream pool (in-process upstream)
       router   Router match microbenchmarks (same as `micro --filter Router`)
       hash-password  print an auth credential line (PBKDF2) for a password read from stdin
 
@@ -34,6 +35,8 @@ do {
         status = try await H1ConnBench.run(rest)
     case "accept":
         status = try await AcceptBench.run(rest)
+    case "proxy":
+        status = try await ProxyBench.run(rest)
     case "router":
         status = try MicroCommand.run(["--filter", "Router"] + rest)
     case "hash-password":

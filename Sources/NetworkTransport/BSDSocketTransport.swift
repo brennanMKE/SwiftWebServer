@@ -254,6 +254,21 @@ public final class BSDSocketTransport: ByteStreamTransport {
         }
     }
 
+    /// Whether an idle connection can still be used: nothing is waiting to be read and the
+    /// peer has not closed or reset it. One non-blocking `recv(MSG_PEEK)`, no suspension. For
+    /// a pooled client connection before reuse (#0120): an upstream that closed a keep-alive
+    /// connection while it sat idle has left a FIN (or stray bytes) in the receive buffer.
+    public var isIdleAndOpen: Bool {
+        let open = core.state.withLock { state in
+            !state.closedLocally && !state.inputEnded && state.inputError == nil && !state.receiving
+        }
+        guard open, let fd = core.acquire() else { return false }
+        defer { core.release() }
+        var byte: UInt8 = 0
+        let n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
+        return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)
+    }
+
     public func close(_ reason: CloseReason) async {
         let first = core.state.withLock { state -> Bool in
             defer { state.closeCalled = true; state.closedLocally = true }

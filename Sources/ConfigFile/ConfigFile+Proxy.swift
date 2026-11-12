@@ -36,6 +36,12 @@ extension ServerSettings {
         public var retries = 1
         /// Passive and active upstream health (#0122).
         public var health = UpstreamHealthPolicy()
+        /// Connection limits, the wait queue and idle eviction per upstream (#0120).
+        public var pool = UpstreamPoolPolicy()
+        /// Peers (IPs or CIDR ranges) whose forwarded headers are kept and extended (#0121).
+        public var trustedProxies: [IPAddressRange] = []
+        /// Rewrite the `Path` of upstream cookies into the client's path space (#0121).
+        public var rewriteCookiePath = false
 
         public init() {}
 
@@ -47,7 +53,7 @@ extension ServerSettings {
                                           idle: timeouts.idle ?? defaults.idle,
                                           total: timeouts.total)
             return UpstreamPolicy(timeouts: limits, retries: retries, health: health,
-                                  tunnelIdleTimeout: timeouts.idle)
+                                  tunnelIdleTimeout: timeouts.idle, pool: pool)
         }
 
         /// The mount for the `ReverseProxy` component.
@@ -56,6 +62,8 @@ extension ServerSettings {
                                    preserveHost: preserveHost, forwardedHeaders: forwardedHeaders,
                                    rewriteLocation: rewriteLocation, websocket: websocket)
             mount.policy = policy
+            mount.trustedProxies = trustedProxies
+            mount.rewriteCookiePath = rewriteCookiePath
             return mount
         }
     }
@@ -68,8 +76,10 @@ extension Parser {
     /// `"proxy": [{"path": "/api", "upstream": "http://127.0.0.1:9000", "stripPrefix": false,
     /// "preserveHost": false, "forwardedHeaders": "x-forwarded", "rewriteLocation": true,
     /// "websocket": false, "timeouts": {"connect": 2, "response": 30, "idle": 60, "total": 120},
-    /// "retries": 1, "health": {"failures": 3, "cooldown": 10, "path": "/health", "interval": 10}}]`;
-    /// a single object is accepted too.
+    /// "retries": 1, "health": {"failures": 3, "cooldown": 10, "path": "/health", "interval": 10},
+    /// "pool": {"maxConnections": 64, "maxIdle": 16, "queue": 256, "queueTimeout": 10, "idleTimeout": 60},
+    /// "trustedProxies": ["10.0.0.0/8", "::1"], "rewriteCookiePath": false}]`; a single object is
+    /// accepted too.
     mutating func proxy(_ value: Any, _ key: String) throws(ConfigFileError) -> [ServerSettings.ProxySettings] {
         let elements: [Any]
         if let array = value as? [Any] { elements = array } else { elements = [try dictionary(value, key, expectation: "must be an object or an array of objects")] }
@@ -135,6 +145,17 @@ extension Parser {
                     }
                 case "retries": mount.retries = try integer(item, field, in: 0...10)
                 case "health": mount.health = try health(item, field)
+                case "pool": mount.pool = try pool(item, field)
+                case "trustedProxies":
+                    let entries = try strings(item, field)
+                    mount.trustedProxies = []
+                    for (index, entry) in entries.enumerated() {
+                        guard let range = IPAddressRange(entry) else {
+                            throw fail("\(field)[\(index)]", "must be an IP address or CIDR range like 10.0.0.0/8 or ::1")
+                        }
+                        mount.trustedProxies.append(range)
+                    }
+                case "rewriteCookiePath": mount.rewriteCookiePath = try bool(item, field)
                 default:
                     warn("unknown key \"\(field)\" ignored")
                 }
@@ -172,6 +193,32 @@ extension Parser {
             case "interval":
                 guard let interval = try seconds(item, field) else { throw fail(field, "must be a positive number of seconds") }
                 policy.checkInterval = interval
+            default: warn("unknown key \"\(field)\" ignored")
+            }
+        }
+        return policy
+    }
+
+    /// `{"maxConnections": 64, "maxIdle": 16, "queue": 256, "queueTimeout": 10, "idleTimeout": 60}`
+    /// (#0120): at most `maxConnections` open per upstream (`0` or absent: no limit), with up to
+    /// `queue` requests waiting `queueTimeout` seconds for one before `503`; up to `maxIdle`
+    /// kept-alive connections, each closed after `idleTimeout` idle seconds (`0` keeps them).
+    mutating func pool(_ value: Any, _ key: String) throws(ConfigFileError) -> UpstreamPoolPolicy {
+        let object = try dictionary(value, key)
+        var policy = UpstreamPoolPolicy()
+        for name in object.keys.sorted() {
+            let field = "\(key).\(name)"
+            let item = object[name]!
+            switch name {
+            case "maxConnections":
+                let n = try integer(item, field, in: 0...100_000)
+                policy.maxConnections = n == 0 ? nil : n
+            case "maxIdle": policy.maxIdle = try integer(item, field, in: 0...10_000)
+            case "queue": policy.maxQueue = try integer(item, field, in: 0...100_000)
+            case "queueTimeout":
+                guard let timeout = try seconds(item, field) else { throw fail(field, "must be a positive number of seconds") }
+                policy.queueTimeout = timeout
+            case "idleTimeout": policy.idleTimeout = try seconds(item, field)
             default: warn("unknown key \"\(field)\" ignored")
             }
         }

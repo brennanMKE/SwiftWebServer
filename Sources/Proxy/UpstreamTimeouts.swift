@@ -63,13 +63,17 @@ public struct UpstreamPolicy: Sendable, Hashable {
     /// connections; `nil` keeps the proxy-wide value. Config sets it from an explicit
     /// `timeouts.idle`.
     public var tunnelIdleTimeout: Duration?
+    /// Connection limits, the wait queue and idle eviction (#0120).
+    public var pool: UpstreamPoolPolicy
 
     public init(timeouts: UpstreamTimeouts = UpstreamTimeouts(), retries: Int = 1,
-                health: UpstreamHealthPolicy = UpstreamHealthPolicy(), tunnelIdleTimeout: Duration? = nil) {
+                health: UpstreamHealthPolicy = UpstreamHealthPolicy(), tunnelIdleTimeout: Duration? = nil,
+                pool: UpstreamPoolPolicy = UpstreamPoolPolicy()) {
         self.timeouts = timeouts
         self.retries = max(0, retries)
         self.health = health
         self.tunnelIdleTimeout = tunnelIdleTimeout
+        self.pool = pool
     }
 }
 
@@ -81,12 +85,15 @@ public struct UpstreamSendOptions: Sendable {
     /// Whether the client may resend the request on a fresh connection when a pooled one turns
     /// out to be closed before any response byte. Only ever true for idempotent methods.
     public var retriesStaleConnection: Bool
+    /// Connection limits and idle eviction for the target's pool (#0120).
+    public var pool: UpstreamPoolPolicy
 
     public init(timeouts: UpstreamTimeouts = UpstreamTimeouts(), deadline: ContinuousClock.Instant? = nil,
-                retriesStaleConnection: Bool = true) {
+                retriesStaleConnection: Bool = true, pool: UpstreamPoolPolicy = UpstreamPoolPolicy()) {
         self.timeouts = timeouts
         self.deadline = deadline
         self.retriesStaleConnection = retriesStaleConnection
+        self.pool = pool
     }
 }
 
@@ -106,7 +113,7 @@ extension UpstreamError {
     /// Nothing reached the upstream, so the request can be sent again elsewhere.
     var isConnectFailure: Bool {
         switch self {
-        case .connectFailed, .connectTimeout: true
+        case .connectFailed, .connectTimeout, .poolExhausted: true
         default: false
         }
     }
