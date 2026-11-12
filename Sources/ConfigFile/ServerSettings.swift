@@ -132,6 +132,11 @@ public struct ServerSettings: Sendable, Equatable {
     /// `"proxy": [{"path": "/api", "upstream": "http://127.0.0.1:9000"}]`.
     public var proxy: [ProxySettings] = []
 
+    /// The access log (#0125): `AccessLog` outermost in the chain, so it records the final
+    /// status of every response. `nil` (the default) logs nothing. In the file:
+    /// `"accessLog": {"path": "logs/access.log", "format": "combined", "metrics": "/metrics"}`.
+    public var accessLog: AccessLogSettings?
+
     /// The TLS listener's identity and port.
     public struct TLSSettings: Sendable, Equatable {
         /// Where the PKCS#12 password comes from.
