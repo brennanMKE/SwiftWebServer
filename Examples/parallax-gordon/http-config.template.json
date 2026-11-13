@@ -6,7 +6,7 @@
   "accessLog": { "path": "logs/access.log", "format": "combined", "metrics": "/metrics" },
   "auth": [
     {
-      "paths": ["/laya/predict", "/laya/stats", "/decision/v1", "/decision/predict"],
+      "paths": ["/laya/predict", "/laya/stats", "/decision/v1", "/decision/predict", "/decision/stats"],
       "realm": "System 1",
       "tokens": [{ "name": "parallax", "sha256": "@TOKEN_SHA256@" }]
     }
