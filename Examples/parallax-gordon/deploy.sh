@@ -19,11 +19,13 @@
 #                      `tailscale serve --tcp` forwards the tailnet's port 80 to it
 #   LAYA_GO            laya-go checkout to build laya-server from
 #                      (default: ../laya-go next to this repo)
+#   LAYA_SWIFT         laya-swift checkout to build the /decision server from
+#                      (default: ../laya-swift next to this repo)
 #   SYSTEM1_KEY_FILE   the shared bearer key, created if missing
 #                      (default: ~/.config/parallax-gordon/system1-key)
 #
 # Only the key's SHA-256 is sent to the server. Everything installs under
-# SYSTEM1_DIR and two user LaunchAgents; nothing needs sudo.
+# SYSTEM1_DIR and three user LaunchAgents; nothing needs sudo.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -35,6 +37,7 @@ PUBLIC_PORT="${SYSTEM1_PUBLIC_PORT:-80}"
 LAYA_PORT="${SYSTEM1_LAYA_PORT:-8799}"
 DECISION_PORT="${SYSTEM1_DECISION_PORT:-8790}"
 LAYA_GO="${LAYA_GO:-$REPO/../laya-go}"
+LAYA_SWIFT="${LAYA_SWIFT:-$REPO/../laya-swift}"
 KEY_FILE="${SYSTEM1_KEY_FILE:-$HOME/.config/parallax-gordon/system1-key}"
 LABEL_PREFIX="com.github.swiftwebserver.system1"
 TAILSCALE_CLI=/Applications/Tailscale.app/Contents/MacOS/Tailscale
@@ -54,17 +57,19 @@ ts_serve() { remote "TS=\$(command -v tailscale || echo $TAILSCALE_CLI); \$TS se
 check() {
   echo "== $SSH_DEST ($base_url)"
   remote "launchctl print gui/$uid/$LABEL_PREFIX.laya 2>/dev/null | grep -E '^\s+(state|pid) =' | sed 's/^/laya:  /'; \
+          launchctl print gui/$uid/$LABEL_PREFIX.decision 2>/dev/null | grep -E '^\s+(state|pid) =' | sed 's/^/decision: /'; \
           launchctl print gui/$uid/$LABEL_PREFIX.proxy 2>/dev/null | grep -E '^\s+(state|pid) =' | sed 's/^/proxy: /'" || true
   printf 'GET /             -> '; curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 "$base_url/" || echo unreachable
   printf 'GET /laya/health  -> '; curl -s --max-time 5 "$base_url/laya/health" || echo unreachable; echo
+  printf 'GET /decision/health -> '; curl -s --max-time 5 "$base_url/decision/health" || echo unreachable; echo
   printf 'GET /laya/stats   -> '
   curl -s --max-time 5 -H "Authorization: Bearer $(cat "$KEY_FILE")" "$base_url/laya/stats" | head -c 300 || echo unreachable
   echo
 }
 
 stop() {
-  remote "launchctl bootout gui/$uid/$LABEL_PREFIX.proxy 2>/dev/null; launchctl bootout gui/$uid/$LABEL_PREFIX.laya 2>/dev/null; true"
-  echo "Stopped both services on $SSH_DEST."
+  remote "launchctl bootout gui/$uid/$LABEL_PREFIX.proxy 2>/dev/null; launchctl bootout gui/$uid/$LABEL_PREFIX.laya 2>/dev/null; launchctl bootout gui/$uid/$LABEL_PREFIX.decision 2>/dev/null; true"
+  echo "Stopped all three services on $SSH_DEST."
 }
 
 case "${1:-}" in
@@ -89,13 +94,16 @@ echo "Building SwiftWebServer (release)…"
 (cd "$REPO" && swift build -c release -j 2 --product SwiftWebServer >/dev/null)
 echo "Building laya-server from ${LAYA_GO}…"
 (cd "$LAYA_GO" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o "$stage/bin/laya-server" ./cmd/laya-server)
+echo "Building laya-swift (release) from ${LAYA_SWIFT}…"
+(cd "$LAYA_SWIFT" && swift build -c release -j 2 --arch arm64 --product laya-swift >/dev/null \
+   && cp "$(swift build -c release --arch arm64 --show-bin-path)/laya-swift" "$stage/bin/")
 cp "$REPO/.build/release/SwiftWebServer" "$stage/bin/"
 cp -R "$HERE/Public" "$stage/"
 sed -e "s|@BIND_ADDR@|$bind_addr|" -e "s|@PORT@|$PORT|" -e "s|@LAYA_PORT@|$LAYA_PORT|" -e "s|@DECISION_PORT@|$DECISION_PORT|" \
     -e "s|@TOKEN_SHA256@|$token_sha|" "$HERE/http-config.template.json" > "$stage/http-config.json"
 mkdir -p "$stage/launchd"
-for svc in laya proxy; do
-  sed -e "s|@DIR@|$DIR|g" -e "s|@LAYA_PORT@|$LAYA_PORT|g" -e "s|@LABEL_PREFIX@|$LABEL_PREFIX|g" \
+for svc in laya decision proxy; do
+  sed -e "s|@DIR@|$DIR|g" -e "s|@LAYA_PORT@|$LAYA_PORT|g" -e "s|@DECISION_PORT@|$DECISION_PORT|g" -e "s|@LABEL_PREFIX@|$LABEL_PREFIX|g" \
       "$HERE/launchd/$svc.plist.template" > "$stage/launchd/$LABEL_PREFIX.$svc.plist"
 done
 
@@ -105,7 +113,7 @@ rsync -a --delete --exclude logs "$stage/" "$SSH_DEST:$DIR/"
 
 echo "Restarting the LaunchAgents…"
 remote "set -e
-  for svc in laya proxy; do
+  for svc in laya decision proxy; do
     plist=~/Library/LaunchAgents/$LABEL_PREFIX.\$svc.plist
     cp '$DIR/launchd/$LABEL_PREFIX.'\$svc.plist \"\$plist\"
     launchctl bootout gui/$uid/$LABEL_PREFIX.\$svc 2>/dev/null || true
@@ -124,4 +132,5 @@ for _ in $(seq 120); do
   curl -fs --max-time 2 "$base_url/laya/health" >/dev/null && break
   sleep 5
 done
+for _ in $(seq 24); do curl -fs --max-time 2 "$base_url/decision/health" >/dev/null && break; sleep 5; done
 check

@@ -43,7 +43,7 @@
   <div class="grid">
     <div class="card"><h3>This page</h3><p>StaticFiles from <code>Public/</code>, compressed, with ETags.</p></div>
     <div class="card"><h3><code>/laya</code> → laya-go <span id="s-laya" class="status wait">…</span></h3><p>Laya on the M2 GPU (Metal), Laya's own <code>{state, questions}</code> API.</p></div>
-    <div class="card"><h3><code>/decision</code> → laya-swift <span id="s-decision" class="status wait">…</span></h3><p>OpenAI Decisions-style <code>POST /v1/decisions</code>, served by LayaKit (Swift + Metal) when it's ready.</p></div>
+    <div class="card"><h3><code>/decision</code> → laya-swift <span id="s-decision" class="status wait">…</span></h3><p>OpenAI Decisions-style <code>POST /v1/decisions</code>, served by laya-swift (Swift + Metal).</p></div>
     <div class="card"><h3><a href="/metrics">/metrics</a></h3><p>Prometheus counters from the access log.</p></div>
   </div>
 
@@ -61,7 +61,7 @@
   <h2>Try it</h2>
   <div class="tabs" role="group">
     <button id="t-laya" aria-pressed="true">Laya API (<code>/laya</code>)</button>
-    <button id="t-decision" aria-pressed="false">Decisions API (<code>/decision</code>, not running yet)</button>
+    <button id="t-decision" aria-pressed="false">Decisions API (<code>/decision</code>)</button>
   </div>
   <label for="key">Bearer key (<code>~/.config/parallax-gordon/system1-key</code>; kept in this tab only)</label>
   <input id="key" type="password" autocomplete="off" placeholder="paste the key">

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>@LABEL_PREFIX@.decision</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@DIR@/bin/laya-swift</string>
+    <string>serve</string>
+    <string>--host</string><string>127.0.0.1</string>
+    <string>--port</string><string>@DECISION_PORT@</string>
+  </array>
+  <key>WorkingDirectory</key><string>@DIR@</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>@DIR@/logs/decision.log</string>
+  <key>StandardErrorPath</key><string>@DIR@/logs/decision.log</string>
+</dict>
+</plist>
