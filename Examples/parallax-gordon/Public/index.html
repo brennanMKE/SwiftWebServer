@@ -60,8 +60,8 @@
 
   <h2>Try it</h2>
   <div class="tabs" role="group">
-    <button id="t-decision" aria-pressed="true">Decisions API (<code>/decision</code>)</button>
-    <button id="t-laya" aria-pressed="false">Laya API (<code>/laya</code>)</button>
+    <button id="t-laya" aria-pressed="true">Laya API (<code>/laya</code>)</button>
+    <button id="t-decision" aria-pressed="false">Decisions API (<code>/decision</code>, not running yet)</button>
   </div>
   <label for="key">Bearer key (<code>~/.config/parallax-gordon/system1-key</code>; kept in this tab only)</label>
   <input id="key" type="password" autocomplete="off" placeholder="paste the key">
@@ -89,7 +89,7 @@ const samples = {
       send: { type: "noul", instructions: "Should we send the fleet?" }
     } } }
 };
-let current = "decision";
+let current = "laya";
 const $ = id => document.getElementById(id);
 function select(name) {
   current = name;
@@ -109,7 +109,9 @@ $("run").onclick = async () => {
     const r = await fetch(samples[current].url, { method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + $("key").value.trim() },
       body: $("body").value });
-    const text = await r.text();
+    let text = await r.text();
+    if (r.status === 401) text = "401: the key was not accepted. Paste the whole 64-character key from ~/.config/parallax-gordon/system1-key (try: pbcopy < ~/.config/parallax-gordon/system1-key).";
+    if (r.status === 502 || r.status === 503) text = r.status + ": the key was accepted, but the backend behind " + samples[current].url.split("/")[1] + " isn't running. /decision waits on laya-swift; use the Laya tab.";
     $("timing").textContent = r.status + " " + r.statusText + " · " + Math.round(performance.now() - started) + " ms";
     try { $("out").textContent = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { $("out").textContent = text; }
   } catch (e) { $("out").textContent = String(e); }
@@ -123,6 +125,6 @@ async function health(path, id) {
   } catch (e) { el.textContent = "down"; el.className = "status down"; }
 }
 function refresh() { health("/laya/health", "s-laya"); health("/decision/health", "s-decision"); }
-select("decision"); refresh(); setInterval(refresh, 10000);
+select("laya"); refresh(); setInterval(refresh, 10000);
 </script>
 </html>
