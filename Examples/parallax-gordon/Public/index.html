@@ -2,25 +2,127 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>System 1 on gordon</title>
+<title>SwiftWebServer on gordon</title>
 <style>
-  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; }
-  code { background: #f2f2f2; padding: 0 .25rem; border-radius: 3px; }
-  #health { font-weight: 600; }
-  @media (prefers-color-scheme: dark) { body { background: #111; color: #ddd; } code { background: #222; } }
+  :root { --bg: #fafaf8; --fg: #1d1d1f; --muted: #6e6e73; --card: #fff; --line: #e3e3e0; --accent: #0a6cff; --ok: #1a7f37; --bad: #c62828; --code: #f2f2ef; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111113; --fg: #ececf0; --muted: #9a9aa2; --card: #1a1a1d; --line: #2c2c31; --accent: #5aa0ff; --ok: #4cc26a; --bad: #ff6b6b; --code: #222226; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 -apple-system, system-ui, sans-serif; }
+  main { max-width: 56rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.9rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  h2 { font-size: 1.15rem; margin: 2.25rem 0 .75rem; }
+  p.lead { color: var(--muted); margin: 0 0 1.5rem; max-width: 44rem; }
+  code, pre, textarea, input { font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code { background: var(--code); padding: .05rem .3rem; border-radius: 4px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .75rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: .9rem 1rem; }
+  .card h3 { margin: 0 0 .2rem; font-size: .95rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .9rem; }
+  .status { font-weight: 600; }
+  .up { color: var(--ok); } .down { color: var(--bad); } .wait { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  .tabs { display: flex; gap: .4rem; margin-bottom: .6rem; flex-wrap: wrap; }
+  .tabs button, .run { border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 7px; padding: .35rem .8rem; font: inherit; cursor: pointer; }
+  .tabs button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  .run { background: var(--accent); border-color: var(--accent); color: #fff; }
+  textarea { width: 100%; min-height: 14rem; padding: .6rem; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); }
+  input[type=password] { width: 100%; padding: .45rem .6rem; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--fg); }
+  pre { background: var(--code); border-radius: 8px; padding: .75rem; overflow-x: auto; margin: .6rem 0 0; min-height: 3rem; }
+  .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin: .6rem 0; }
+  .meta { color: var(--muted); font-size: .85rem; }
+  label { font-size: .85rem; color: var(--muted); }
 </style>
-<h1>System 1 decision server</h1>
-<p>SwiftWebServer on this Mac reverse-proxies <code>/laya</code> to Laya
-(<code>laya-server</code>, running on the GPU with Metal) on <code>127.0.0.1</code>.</p>
-<p>Laya: <span id="health">checking…</span></p>
-<ul>
-  <li><code>GET /laya/health</code> — open</li>
-  <li><code>POST /laya/predict</code> — needs <code>Authorization: Bearer &lt;key&gt;</code></li>
-  <li><code>GET /laya/stats</code> — needs the same key</li>
-</ul>
+<main>
+  <h1>SwiftWebServer on gordon</h1>
+  <p class="lead">A dependency-free Swift HTTP server serving this page from disk and reverse-proxying two
+    <strong>System 1 decision models</strong> on this Mac mini's loopback. It is the only process on the tailnet:
+    it checks the bearer key, forwards, health-checks the backends and logs every request.</p>
+
+  <div class="grid">
+    <div class="card"><h3>This page</h3><p>StaticFiles from <code>Public/</code>, compressed, with ETags.</p></div>
+    <div class="card"><h3><code>/laya</code> → laya-go <span id="s-laya" class="status wait">…</span></h3><p>Laya on the M2 GPU (Metal), Laya's own <code>{state, questions}</code> API.</p></div>
+    <div class="card"><h3><code>/decision</code> → laya-swift <span id="s-decision" class="status wait">…</span></h3><p>OpenAI Decisions-style <code>POST /v1/decisions</code>, served by LayaKit (Swift + Metal) when it's ready.</p></div>
+    <div class="card"><h3><a href="/metrics">/metrics</a></h3><p>Prometheus counters from the access log.</p></div>
+  </div>
+
+  <h2>Routes</h2>
+  <table>
+    <tr><th>Path</th><th>Goes to</th><th>Key</th></tr>
+    <tr><td><code>GET /</code></td><td>this page, from disk</td><td>—</td></tr>
+    <tr><td><code>GET /laya/health</code></td><td>laya-go <code>/health</code></td><td>—</td></tr>
+    <tr><td><code>POST /laya/predict</code></td><td>laya-go <code>/predict</code></td><td>Bearer</td></tr>
+    <tr><td><code>GET /decision/health</code></td><td>laya-swift <code>/health</code></td><td>—</td></tr>
+    <tr><td><code>POST /decision/v1/decisions</code></td><td>laya-swift <code>/v1/decisions</code></td><td>Bearer</td></tr>
+    <tr><td><code>GET /metrics</code></td><td>SwiftWebServer itself</td><td>—</td></tr>
+  </table>
+
+  <h2>Try it</h2>
+  <div class="tabs" role="group">
+    <button id="t-decision" aria-pressed="true">Decisions API (<code>/decision</code>)</button>
+    <button id="t-laya" aria-pressed="false">Laya API (<code>/laya</code>)</button>
+  </div>
+  <label for="key">Bearer key (<code>~/.config/parallax-gordon/system1-key</code>; kept in this tab only)</label>
+  <input id="key" type="password" autocomplete="off" placeholder="paste the key">
+  <div class="row"><span class="meta" id="endpoint"></span></div>
+  <textarea id="body" spellcheck="false"></textarea>
+  <div class="row"><button class="run" id="run">Send</button><span class="meta" id="timing"></span></div>
+  <pre id="out">The response appears here.</pre>
+</main>
 <script>
-fetch("/laya/health").then(r => r.ok ? r.json() : Promise.reject(r.status))
-  .then(j => { document.getElementById("health").textContent = j.ok ? "up" : "not ready"; })
-  .catch(e => { document.getElementById("health").textContent = "down (" + e + ")"; });
+const samples = {
+  decision: { url: "/decision/v1/decisions", body: {
+    model: "laya",
+    input: "Our attack on D is a bad bet: it would probably lose. Planet F is in danger: enemy ships nearby would probably capture it.",
+    questions: [
+      { type: "choice", name: "attack", instructions: "Is the attack on D a good bet or a bad bet?",
+        choices: [{ value: "good", description: "a good bet" }, { value: "bad", description: "a bad bet" }] },
+      { type: "predicate", name: "danger", instructions: "Is planet F in danger?" },
+      { type: "score", name: "urgency", instructions: "How urgent is defending F?",
+        levels: [{ label: "1", description: "not urgent" }, { label: "2", description: "somewhat urgent" }, { label: "3", description: "very urgent" }] }
+    ] } },
+  laya: { url: "/laya/predict", body: {
+    state: "Our attack on D is a bad bet: it would probably lose.",
+    questions: {
+      attack: { type: "choice", instructions: "Is this attack a good bet or a bad bet?", criteria: { good: "a good bet", bad: "a bad bet" } },
+      send: { type: "noul", instructions: "Should we send the fleet?" }
+    } } }
+};
+let current = "decision";
+const $ = id => document.getElementById(id);
+function select(name) {
+  current = name;
+  $("t-decision").setAttribute("aria-pressed", name === "decision");
+  $("t-laya").setAttribute("aria-pressed", name === "laya");
+  $("endpoint").textContent = "POST " + samples[name].url;
+  $("body").value = JSON.stringify(samples[name].body, null, 2);
+}
+$("t-decision").onclick = () => select("decision");
+$("t-laya").onclick = () => select("laya");
+try { $("key").value = sessionStorage.getItem("system1-key") || ""; } catch (e) {}
+$("key").oninput = () => { try { sessionStorage.setItem("system1-key", $("key").value); } catch (e) {} };
+$("run").onclick = async () => {
+  const started = performance.now();
+  $("out").textContent = "…";
+  try {
+    const r = await fetch(samples[current].url, { method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + $("key").value.trim() },
+      body: $("body").value });
+    const text = await r.text();
+    $("timing").textContent = r.status + " " + r.statusText + " · " + Math.round(performance.now() - started) + " ms";
+    try { $("out").textContent = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { $("out").textContent = text; }
+  } catch (e) { $("out").textContent = String(e); }
+};
+async function health(path, id) {
+  const el = $(id);
+  try {
+    const r = await fetch(path, { cache: "no-store" });
+    el.textContent = r.ok ? "up" : (r.status === 502 || r.status === 503 ? "not running" : String(r.status));
+    el.className = "status " + (r.ok ? "up" : "down");
+  } catch (e) { el.textContent = "down"; el.className = "status down"; }
+}
+function refresh() { health("/laya/health", "s-laya"); health("/decision/health", "s-decision"); }
+select("decision"); refresh(); setInterval(refresh, 10000);
 </script>
 </html>

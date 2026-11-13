@@ -2,10 +2,11 @@
   "host": "@BIND_ADDR@",
   "port": @PORT@,
   "root": "Public",
-  "accessLog": { "path": "logs/access.log", "format": "combined" },
+  "compression": true,
+  "accessLog": { "path": "logs/access.log", "format": "combined", "metrics": "/metrics" },
   "auth": [
     {
-      "paths": ["/laya/predict", "/laya/stats"],
+      "paths": ["/laya/predict", "/laya/stats", "/decision/v1", "/decision/predict"],
       "realm": "System 1",
       "tokens": [{ "name": "parallax", "sha256": "@TOKEN_SHA256@" }]
     }
@@ -17,6 +18,15 @@
       "stripPrefix": true,
       "forwardedHeaders": "x-forwarded",
       "timeouts": { "connect": 2, "response": 20, "idle": 60 },
+      "retries": 0,
+      "health": { "failures": 3, "cooldown": 5, "path": "/health", "interval": 10 }
+    },
+    {
+      "path": "/decision",
+      "upstream": "http://127.0.0.1:@DECISION_PORT@",
+      "stripPrefix": true,
+      "forwardedHeaders": "x-forwarded",
+      "timeouts": { "connect": 2, "response": 30, "idle": 60 },
       "retries": 0,
       "health": { "failures": 3, "cooldown": 5, "path": "/health", "interval": 10 }
     }

@@ -10,10 +10,13 @@
 # Settings (environment):
 #   SYSTEM1_SSH        ssh destination of the server Mac   (default: gordon)
 #   SYSTEM1_DIR        install folder on that Mac          (default: ~/Services/system1)
-#   SYSTEM1_PORT       port SwiftWebServer listens on      (default: 8080)
+#   SYSTEM1_PORT       loopback port SwiftWebServer listens on (default: 8080)
+#   SYSTEM1_PUBLIC_PORT  tailnet port Tailscale forwards to it (default: 80)
+#   SYSTEM1_DECISION_PORT  loopback port of the laya-swift decisions server (default: 8790)
 #   SYSTEM1_LAYA_PORT  laya-server's loopback port there   (default: 8799)
-#   SYSTEM1_BIND       address to bind (default: the Mac's Tailscale IPv4, so
-#                      only tailnet devices can connect)
+#   SYSTEM1_BIND       address SwiftWebServer binds (default: 127.0.0.1). macOS lets
+#                      a non-root process bind a port below 1024 only on 0.0.0.0, so
+#                      `tailscale serve --tcp` forwards the tailnet's port 80 to it
 #   LAYA_GO            laya-go checkout to build laya-server from
 #                      (default: ../laya-go next to this repo)
 #   SYSTEM1_KEY_FILE   the shared bearer key, created if missing
@@ -28,7 +31,9 @@ REPO="$(cd "$HERE/../.." && pwd)"
 SSH_DEST="${SYSTEM1_SSH:-gordon}"
 REMOTE_DIR="${SYSTEM1_DIR:-Services/system1}"   # relative to the remote home
 PORT="${SYSTEM1_PORT:-8080}"
+PUBLIC_PORT="${SYSTEM1_PUBLIC_PORT:-80}"
 LAYA_PORT="${SYSTEM1_LAYA_PORT:-8799}"
+DECISION_PORT="${SYSTEM1_DECISION_PORT:-8790}"
 LAYA_GO="${LAYA_GO:-$REPO/../laya-go}"
 KEY_FILE="${SYSTEM1_KEY_FILE:-$HOME/.config/parallax-gordon/system1-key}"
 LABEL_PREFIX="com.github.swiftwebserver.system1"
@@ -40,12 +45,11 @@ remote_home="$(remote 'echo $HOME')"
 DIR="$remote_home/${REMOTE_DIR#\~/}"
 uid="$(remote 'id -u')"
 
-bind_addr="${SYSTEM1_BIND:-}"
-if [[ -z "$bind_addr" ]]; then
-  bind_addr="$(remote "command -v tailscale >/dev/null && tailscale ip -4 || $TAILSCALE_CLI ip -4" | head -1)"
-fi
-[[ -n "$bind_addr" ]] || { echo "Couldn't find the Tailscale address of $SSH_DEST; set SYSTEM1_BIND." >&2; exit 1; }
-base_url="http://$bind_addr:$PORT"
+bind_addr="${SYSTEM1_BIND:-127.0.0.1}"
+ts_ip="$(remote "command -v tailscale >/dev/null && tailscale ip -4 || $TAILSCALE_CLI ip -4" | head -1)"
+[[ -n "$ts_ip" ]] || { echo "Couldn't find the Tailscale address of $SSH_DEST." >&2; exit 1; }
+if [[ "$PUBLIC_PORT" == 80 ]]; then base_url="http://$ts_ip"; else base_url="http://$ts_ip:$PUBLIC_PORT"; fi
+ts_serve() { remote "TS=\$(command -v tailscale || echo $TAILSCALE_CLI); \$TS serve --bg --tcp $PUBLIC_PORT tcp://$bind_addr:$PORT >/dev/null && \$TS serve status | grep -A1 ':$PUBLIC_PORT' | head -2"; }
 
 check() {
   echo "== $SSH_DEST ($base_url)"
@@ -87,7 +91,7 @@ echo "Building laya-server from ${LAYA_GO}…"
 (cd "$LAYA_GO" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o "$stage/bin/laya-server" ./cmd/laya-server)
 cp "$REPO/.build/release/SwiftWebServer" "$stage/bin/"
 cp -R "$HERE/Public" "$stage/"
-sed -e "s|@BIND_ADDR@|$bind_addr|" -e "s|@PORT@|$PORT|" -e "s|@LAYA_PORT@|$LAYA_PORT|" \
+sed -e "s|@BIND_ADDR@|$bind_addr|" -e "s|@PORT@|$PORT|" -e "s|@LAYA_PORT@|$LAYA_PORT|" -e "s|@DECISION_PORT@|$DECISION_PORT|" \
     -e "s|@TOKEN_SHA256@|$token_sha|" "$HERE/http-config.template.json" > "$stage/http-config.json"
 mkdir -p "$stage/launchd"
 for svc in laya proxy; do
@@ -105,8 +109,14 @@ remote "set -e
     plist=~/Library/LaunchAgents/$LABEL_PREFIX.\$svc.plist
     cp '$DIR/launchd/$LABEL_PREFIX.'\$svc.plist \"\$plist\"
     launchctl bootout gui/$uid/$LABEL_PREFIX.\$svc 2>/dev/null || true
-    launchctl bootstrap gui/$uid \"\$plist\"
+    # bootout returns before the job is gone; bootstrap fails with error 5 until it is.
+    for i in \$(seq 50); do launchctl print gui/$uid/$LABEL_PREFIX.\$svc >/dev/null 2>&1 || break; sleep 0.2; done
+    for i in 1 2 3 4 5; do launchctl bootstrap gui/$uid \"\$plist\" 2>/dev/null && break; sleep 1; done
+    launchctl print gui/$uid/$LABEL_PREFIX.\$svc >/dev/null
   done"
+
+echo "Forwarding tailnet port $PUBLIC_PORT to $bind_addr:$PORT with tailscale serve…"
+ts_serve
 
 # laya-server loads (and on first run downloads, ~843 MB) the model before it listens.
 echo "Waiting for Laya to answer (first run downloads the model)…"
